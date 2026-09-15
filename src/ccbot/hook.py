@@ -146,8 +146,9 @@ def _find_pane_key(
                 "list-panes",
                 "-a",
                 "-F",
-                "#{session_name}:#{window_id}\x1f#{window_name}"
-                "\x1f#{pane_current_path}\x1f#{pane_current_command}",
+                # printable separator: tmux ≤3.5 escapes control chars in -F output
+                "#{session_name}:#{window_id}\u241e#{window_name}"
+                "\u241e#{pane_current_path}\u241e#{pane_current_command}",
             ],
             capture_output=True,
             text=True,
@@ -158,7 +159,7 @@ def _find_pane_key(
         return None
     matches: list[tuple[str, str]] = []
     for line in out.splitlines():
-        parts = line.split("\x1f")
+        parts = line.split("\u241e")
         if len(parts) != 4:
             continue
         key, wname, pane_cwd, pane_cmd = parts

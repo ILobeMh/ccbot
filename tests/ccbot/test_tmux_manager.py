@@ -26,10 +26,10 @@ class TestListWindows:
     async def test_parses_active_panes_and_skips_main(self, mgr, monkeypatch):
         out = "\n".join(
             [
-                "@0\x1f__main__\x1f/home/mh\x1fzsh\x1f1",
-                "@1\x1fproj\x1f/home/mh/proj\x1fclaude\x1f1",
-                "@1\x1fproj\x1f/home/mh/proj\x1fzsh\x1f0",  # inactive split
-                "@2\x1fname with\x1fsp aces\x1f/tmp\x1fzsh\x1f1",  # 6 fields: ignored
+                "@0\u241e__main__\u241e/home/mh\u241ezsh\u241e1",
+                "@1\u241eproj\u241e/home/mh/proj\u241eclaude\u241e1",
+                "@1\u241eproj\u241e/home/mh/proj\u241ezsh\u241e0",  # inactive split
+                "@2\u241ename with\u241esp aces\u241e/tmp\u241ezsh\u241e1",  # 6 fields: ignored
             ]
         )
         monkeypatch.setattr(tm.subprocess, "run", lambda *a, **k: _completed(out))
@@ -45,7 +45,7 @@ class TestListWindows:
         def fake_run(*a, **k):
             nonlocal calls
             calls += 1
-            return _completed("@1\x1fproj\x1f/p\x1fclaude\x1f1")
+            return _completed("@1\u241eproj\u241e/p\u241eclaude\u241e1")
 
         monkeypatch.setattr(tm.subprocess, "run", fake_run)
         await mgr.list_windows()
@@ -77,7 +77,7 @@ class TestListWindows:
         def fake_run(*a, **k):
             nonlocal calls
             calls += 1
-            return _completed("@0\x1f__main__\x1f/h\x1fzsh\x1f1")
+            return _completed("@0\u241e__main__\u241e/h\u241ezsh\u241e1")
 
         monkeypatch.setattr(tm.subprocess, "run", fake_run)
         assert await mgr.list_windows() == []

@@ -178,7 +178,10 @@ class TmuxManager:
     # every send/capture, so it is cached briefly and done with a single
     # tmux fork instead of libtmux's per-window list-panes calls.
     _LIST_WINDOWS_TTL = 0.5
-    _LIST_FORMAT = "\x1f".join(
+    # tmux ≤3.5 escapes control characters in -F output ("\037"), so the
+    # separator must be printable; ␞ (U+241E) is what libtmux uses too.
+    _LIST_SEP = "\u241e"
+    _LIST_FORMAT = _LIST_SEP.join(
         [
             "#{window_id}",
             "#{window_name}",
@@ -253,7 +256,7 @@ class TmuxManager:
         windows: list[TmuxWindow] = []
         seen: set[str] = set()
         for line in result.stdout.splitlines():
-            parts = line.split("\x1f")
+            parts = line.split(self._LIST_SEP)
             if len(parts) != 5:
                 continue
             window_id, name, cwd, pane_cmd, active = parts

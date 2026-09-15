@@ -283,9 +283,9 @@ class TestHookMainMapping:
             )
         )
         panes = (
-            "ccbot:@0\x1f__main__\x1f/home\x1fzsh\n"
-            "ccbot:@2\x1fw\x1f/proj\x1fclaude\n"
-            "ccbot:@5\x1fx\x1f/other\x1fclaude\n"
+            "ccbot:@0\u241e__main__\u241e/home\u241ezsh\n"
+            "ccbot:@2\u241ew\u241e/proj\u241eclaude\n"
+            "ccbot:@5\u241ex\u241e/other\u241eclaude\n"
         )
         monkeypatch.setattr(
             hook_mod.subprocess,
