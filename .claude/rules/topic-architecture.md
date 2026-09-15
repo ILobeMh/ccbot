@@ -58,7 +58,9 @@ SessionMonitor reads new message (session_id = "uuid-xxx")
   → Deliver message to user in the correct topic (thread_id)
 ```
 
-**New topic flow**: First message in an unbound topic → directory browser → select directory → session picker (if existing sessions found) or create window → bind topic → forward pending message.
+**New topic flow**: First message in an unbound topic → directory browser (skipped when the message is an absolute path) → select directory → session picker (if existing sessions found) → mode picker → `ensure_trusted_directory` → create window → bind topic → `wait_for_claude_ready` (answers startup dialogs) → `wait_for_session_map_entry` → forward pending message (only if Claude is ready; a path-only first message is never forwarded).
+
+**Restart flow** (`/restart [mode]`, or the 🔄 button from health notifications): `stop_claude` (Escape + Ctrl-C×2, `respawn-pane -k` fallback) → `start_claude(build_claude_command(mode, resume=<session_id>))` → same ready/hook wait → `override_session_map_entry`. Window id is preserved.
 
 **Resume session flow**: When selecting a directory with existing Claude sessions, a session picker UI is shown. Choosing a session runs `claude --resume <session_id>`. Note: messages continue writing to the original JSONL file, and current Claude Code reports the original session_id in the SessionStart hook (`source: "resume"`), so state stays consistent. As a safety net for hook timeout or older Claude Code versions that report a different session_id, the bot forces both window_state and session_map.json (via `override_session_map_entry`, under the hook's flock) to the resumed session_id.
 

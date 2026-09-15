@@ -23,6 +23,8 @@ ccbot hook --install                  # Auto-install Claude Code SessionStart ho
 - **Hook-based session tracking** — `SessionStart` hook writes `session_map.json`; monitor polls it to detect session changes.
 - **Message queue per user** — FIFO ordering, message merging (3800 char limit), tool_use/tool_result pairing.
 - **Rate limiting** — `AIORateLimiter(max_retries=5)` on the Application (30/s global). On restart, the global bucket is pre-filled to avoid burst against Telegram's server-side counter.
+- **Never type into a dialog** — `send_to_window` refuses when the pane runs a shell (Claude exited) or an unknown modal is open; startup dialogs are auto-answered by moving the `❯` cursor (never by typing digits — option order changes between Claude Code versions).
+- **Terminal fixtures** — `tests/ccbot/fixtures/panes/*.txt` are real `tmux capture-pane` outputs; add a capture there when adapting `terminal_parser.py` to a new Claude Code version.
 
 ## Code Conventions
 
