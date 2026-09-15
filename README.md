@@ -98,17 +98,25 @@ ALLOWED_USERS=your_telegram_user_id
 | `CCBOT_SHOW_USER_MESSAGES` | `true` | Mirror your own prompts (👤) into the topic |
 | `CCBOT_SHOW_TOOL_CALLS` | `true` | Show tool_use / tool_result messages |
 | `CCBOT_SHOW_THINKING` | `true` | Show thinking blocks as collapsed expandable quotes |
+| `CLAUDE_PERMISSION_MODE` | `default` | Initial launch mode offered first in the mode picker (`default`, `acceptEdits`, `plan`, `bypassPermissions`) |
+| `CCBOT_AUTO_TRUST_DIRS` | `true` | Pre-trust the project in `~/.claude.json` before launching `claude` (skips the "Quick safety check" dialog) |
+| `CCBOT_DEFAULT_DIR` | _(bot cwd)_ | Directory the directory browser opens at |
+| `CCBOT_SCREENSHOT_FONT` | _(bundled MesloLGS NF)_ | TTF/OTF used as the primary `/screenshot` font |
+| `CCBOT_SCREENSHOT_FONT_SIZE` | `28` | `/screenshot` font size in px |
 | `OPENAI_API_KEY` | _(none)_ | OpenAI API key for voice message transcription |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI API base URL (for proxies or compatible APIs) |
 
 Message formatting is always HTML via `chatgpt-md-converter` (`chatgpt_md_converter` package).
 There is no runtime formatter switch to MarkdownV2.
 
-> If running on a VPS where there's no interactive terminal to approve permissions, consider:
->
-> ```
-> CLAUDE_COMMAND=IS_SANDBOX=1 claude --dangerously-skip-permissions
-> ```
+> Permission mode is chosen per session in the mode picker (Normal / Accept edits / Plan /
+> Skip permissions) and can be switched later with `/mode` or `/restart <mode>`.
+> `--dangerously-skip-permissions` requires Claude Code's one-time acceptance dialog to have
+> been answered once on that machine (the bot answers it, or set
+> `"skipDangerousModePermissionPrompt": true` in `~/.claude/settings.json`); it is refused as root.
+
+Screenshots use MesloLGS NF (Latin, box drawing, Nerd Font icons) with Vazirmatn for
+Persian/Arabic, Noto Sans Mono CJK and Symbola as fallbacks — all bundled.
 
 ## Hook Setup (Recommended)
 
@@ -152,8 +160,14 @@ uv run ccbot
 | ------------- | ------------------------------- |
 | `/start`      | Show welcome message            |
 | `/history`    | Message history for this topic  |
-| `/screenshot` | Capture terminal screenshot     |
+| `/screenshot` | Capture terminal screenshot (with control keys incl. ⇧⇥ Mode) |
 | `/esc`        | Send Escape to interrupt Claude |
+| `/mode [m]`   | Show the permission mode, or switch it via Shift+Tab (`normal`, `accept`, `plan`, `bypass`) |
+| `/restart [m]`| Restart Claude Code in the same window, resuming the session (optionally in mode `m`) — e.g. to apply a Claude Code update |
+| `/info`       | tmux attach command, window/session ids, launch command, transcript path, versions |
+| `/kill`       | Kill the tmux window and forget the session |
+| `/unbind`     | Unbind the topic, keep the window running |
+| `/usage`      | Claude Code usage remaining |
 
 **Claude Code commands (forwarded via tmux):**
 
@@ -174,10 +188,11 @@ Any unrecognized `/command` is also forwarded to Claude Code as-is (e.g. `/revie
 **Creating a new session:**
 
 1. Create a new topic in the Telegram group
-2. Send any message in the topic
+2. Send any message in the topic — or send a full path (e.g. `/home/me/project`) to skip the browser
 3. A directory browser appears — select the project directory
 4. If the directory has existing Claude sessions, a session picker appears — choose one to resume or start fresh
-5. A tmux window is created, `claude` starts (with `--resume` if resuming), and your pending message is forwarded
+5. A mode picker appears — Normal / Accept edits / Plan / Skip permissions (your last choice is listed first)
+6. A tmux window is created, `claude` starts (with `--resume` if resuming), the trust dialog is handled automatically, and once Claude's input box is ready your pending message is forwarded
 
 **Sending messages:**
 

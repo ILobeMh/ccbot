@@ -2,48 +2,105 @@
 
 Converts captured tmux pane text (with optional ANSI color codes) into a
 dark-background PNG image. Supports full ANSI color parsing (16/256/RGB)
-and a three-tier font fallback chain:
-  1. JetBrains Mono — Latin, symbols, box-drawing
-  2. Noto Sans Mono CJK SC — CJK characters
-  3. Symbola — remaining special symbols
+and a font fallback chain matched to the user's terminal setup:
+  1. MesloLGS NF — Latin, box-drawing, powerline / Nerd Font icons
+     (override with CCBOT_SCREENSHOT_FONT=/path/to/font.ttf)
+  2. Vazirmatn — Arabic script (Persian); shaped by Pillow's raqm layout
+  3. Noto Sans Mono CJK SC — CJK characters
+  4. Symbola — remaining special symbols
+
+Glyph coverage is read from each font's cmap (fontTools) so characters are
+routed to the first font that actually has them. Text is drawn per run of
+same-font characters, advanced in whole terminal cells so columns and box
+drawing stay aligned.
 
 Key function: text_to_image(text, font_size, with_ansi) → PNG bytes.
 """
 
 import asyncio
+import functools
 import io
 import logging
+import math
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from fontTools.ttLib import TTFont
 from PIL import Image, ImageDraw, ImageFont
 
 logger = logging.getLogger(__name__)
 
 _FONTS_DIR = Path(__file__).parent / "fonts"
 
-# Font fallback chain (highest priority first):
-#   1. JetBrains Mono (OFL-1.1) — Latin, symbols, box-drawing, blocks
-#   2. Noto Sans Mono CJK SC (OFL-1.1) — CJK, additional symbols
-#   3. Symbola (free license) — remaining miscellaneous symbols, dingbats
-_FONT_PATHS: list[Path] = [
-    _FONTS_DIR / "JetBrainsMono-Regular.ttf",
-    _FONTS_DIR / "NotoSansMonoCJKsc-Regular.otf",
-    _FONTS_DIR / "Symbola.ttf",
+# Font fallback chain (highest priority first). Tier 0 can be replaced via
+# CCBOT_SCREENSHOT_FONT; the rest stay as fallbacks.
+_DEFAULT_FONT_PATHS: list[Path] = [
+    _FONTS_DIR / "MesloLGSNF-Regular.ttf",  # Apache-2.0 + Nerd Fonts (MIT)
+    _FONTS_DIR / "Vazirmatn-Variable.ttf",  # OFL-1.1
+    _FONTS_DIR / "NotoSansMonoCJKsc-Regular.otf",  # OFL-1.1
+    _FONTS_DIR / "Symbola.ttf",  # free license
 ]
 
-# Pre-computed codepoint sets for characters NOT in JetBrains Mono.
-# Tier 2: present in Noto Sans Mono CJK SC (CJK ideographs, fullwidth punctuation, etc.)
-_NOTO_CODEPOINTS: set[int] = {
-    0x23BF,  # ⎿ DENTISTRY SYMBOL LIGHT VERTICAL AND BOTTOM RIGHT
-}
-# Tier 3: only in Symbola (misc symbols not in either JB or Noto)
-_SYMBOLA_CODEPOINTS: set[int] = {
-    0x23F5,  # ⏵ BLACK MEDIUM RIGHT-POINTING TRIANGLE
-    0x2714,  # ✔ HEAVY CHECK MARK
-    0x274C,  # ❌ CROSS MARK
-}
+
+def _font_paths() -> list[Path]:
+    override = os.environ.get("CCBOT_SCREENSHOT_FONT", "").strip()
+    paths = list(_DEFAULT_FONT_PATHS)
+    if override:
+        custom = Path(override).expanduser()
+        if custom.is_file():
+            paths.insert(0, custom)
+        else:
+            logger.warning("CCBOT_SCREENSHOT_FONT not found: %s", custom)
+    return paths
+
+
+def _default_font_size() -> int:
+    raw = os.environ.get("CCBOT_SCREENSHOT_FONT_SIZE", "").strip()
+    if raw.isdigit() and 8 <= int(raw) <= 96:
+        return int(raw)
+    return 28
+
+
+@functools.lru_cache(maxsize=8)
+def _coverage(path: Path) -> frozenset[int]:
+    """Codepoints a font file has glyphs for (from its cmap)."""
+    try:
+        with TTFont(str(path), lazy=True) as tt:
+            cmap = tt.getBestCmap() or {}
+            return frozenset(cmap.keys())
+    except Exception as e:
+        logger.warning("Cannot read cmap of %s: %s", path, e)
+        return frozenset()
+
+
+# Codepoint → tier cache (per font chain)
+_tier_cache: dict[tuple[tuple[Path, ...], int], int] = {}
+
+
+def _font_tier(ch: str, paths: tuple[Path, ...] | None = None) -> int:
+    """Index of the first font in the chain that has a glyph for ``ch``.
+
+    Whitespace and control characters stay in tier 0 so they don't split
+    runs; unknown characters fall back to tier 0 (rendered as .notdef).
+    """
+    if paths is None:
+        paths = tuple(_font_paths())
+    cp = ord(ch)
+    key = (paths, cp)
+    cached = _tier_cache.get(key)
+    if cached is not None:
+        return cached
+    tier = 0
+    if cp > 0x20 and not ch.isspace():
+        for i, path in enumerate(paths):
+            if cp in _coverage(path):
+                tier = i
+                break
+    _tier_cache[key] = tier
+    return tier
+
 
 # ANSI color mapping (basic 16 colors)
 _ANSI_COLORS: dict[int, tuple[int, int, int]] = {
@@ -96,29 +153,6 @@ def _load_font(path: Path, size: int) -> ImageFont.FreeTypeFont | ImageFont.Imag
     except OSError:
         logger.warning("Failed to load font %s, using Pillow default", path)
         return ImageFont.load_default()
-
-
-def _font_tier(ch: str) -> int:
-    """Return 0 (JetBrains), 1 (Noto CJK), or 2 (Symbola) for a character."""
-    cp = ord(ch)
-    if cp in _SYMBOLA_CODEPOINTS:
-        return 2
-    # CJK Unified Ideographs + CJK compat + fullwidth forms + Hangul + known Noto-only codepoints
-    if (
-        cp in _NOTO_CODEPOINTS
-        or cp >= 0x1100
-        and (
-            cp <= 0x11FF  # Hangul Jamo
-            or 0x2E80 <= cp <= 0x9FFF  # CJK radicals, kangxi, ideographs
-            or 0xAC00 <= cp <= 0xD7AF  # Hangul Syllables
-            or 0xF900 <= cp <= 0xFAFF  # CJK compat ideographs
-            or 0xFE30 <= cp <= 0xFE4F  # CJK compat forms
-            or 0xFF00 <= cp <= 0xFFEF  # fullwidth forms
-            or 0x20000 <= cp <= 0x2FA1F  # CJK extension B+
-        )
-    ):
-        return 1
-    return 0
 
 
 def _parse_ansi_line(line: str) -> list[StyledSegment]:
@@ -257,21 +291,23 @@ def _split_line_segments_plain(line: str) -> list[tuple[str, int]]:
 
 
 async def text_to_image(
-    text: str, font_size: int = 28, with_ansi: bool = True
+    text: str, font_size: int | None = None, with_ansi: bool = True
 ) -> bytes:
     """Render monospace text onto a dark-background image and return PNG bytes.
 
     Args:
         text: The text to render (may contain ANSI color codes)
-        font_size: Font size in pixels
+        font_size: Font size in pixels (default: CCBOT_SCREENSHOT_FONT_SIZE or 28)
         with_ansi: If True, parse and render ANSI color codes
 
     Returns:
         PNG image bytes
     """
+    size = font_size or _default_font_size()
 
     def _render_image() -> bytes:
-        fonts = [_load_font(p, font_size) for p in _FONT_PATHS]
+        paths = _font_paths()
+        fonts = [_load_font(p, size) for p in paths]
 
         lines = text.split("\n")
         padding = 16
@@ -290,17 +326,30 @@ async def text_to_image(
                 for segments in line_segments_plain
             ]
 
-        # Measure text size
-        dummy = Image.new("RGB", (1, 1))
-        draw = ImageDraw.Draw(dummy)
-        line_height = int(font_size * 1.4)
-        max_width = 0
+        # Terminal cell geometry from the primary (monospace) font
+        primary = fonts[0]
+        cell_w = max(1.0, float(primary.getlength("M")))
+        line_height = int(size * 1.4)
+        ascent = (
+            primary.getmetrics()[0]
+            if isinstance(primary, ImageFont.FreeTypeFont)
+            else size
+        )
+        baseline_offset = (line_height - size) // 2 + ascent
+
+        def advance(seg: StyledSegment) -> float:
+            """Width a segment occupies, snapped to whole terminal cells."""
+            if not seg.text:
+                return 0.0
+            f = fonts[seg.font_tier]
+            if seg.font_tier == 0:
+                return len(seg.text) * cell_w
+            measured = float(f.getlength(seg.text))
+            return max(1, math.ceil(measured / cell_w - 0.05)) * cell_w
+
+        max_width = 0.0
         for segments in line_segments:
-            w = 0
-            for seg in segments:
-                bbox = draw.textbbox((0, 0), seg.text, font=fonts[seg.font_tier])
-                w += bbox[2] - bbox[0]
-            max_width = max(max_width, w)
+            max_width = max(max_width, sum(advance(seg) for seg in segments))
 
         img_width = int(max_width) + padding * 2
         img_height = line_height * len(lines) + padding * 2
@@ -310,22 +359,28 @@ async def text_to_image(
 
         y = padding
         for segments in line_segments:
-            x = padding
+            x = float(padding)
             for seg in segments:
+                if not seg.text:
+                    continue
                 f = fonts[seg.font_tier]
+                width = advance(seg)
 
                 # Draw background if specified
                 if seg.style.bg_color:
-                    bbox = draw.textbbox((x, y), seg.text, font=f)
                     draw.rectangle(
-                        [bbox[0], y, bbox[2], y + line_height], fill=seg.style.bg_color
+                        [x, y, x + width, y + line_height], fill=seg.style.bg_color
                     )
 
-                # Draw text with foreground color
-                draw.text((x, y), seg.text, fill=seg.style.fg_color, font=f)
-
-                bbox = draw.textbbox((0, 0), seg.text, font=f)
-                x += bbox[2] - bbox[0]
+                # Baseline-anchored so fallback fonts line up with the primary
+                draw.text(
+                    (x, y + baseline_offset),
+                    seg.text,
+                    fill=seg.style.fg_color,
+                    font=f,
+                    anchor="ls",
+                )
+                x += width
             y += line_height
 
         buf = io.BytesIO()
