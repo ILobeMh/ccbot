@@ -130,11 +130,14 @@ def _render_expandable_quote(m: re.Match[str]) -> str:
     inner = m.group(1)
     escaped = _escape_mdv2(inner)
     lines = escaped.split("\n")
-    # Build quoted lines, truncating if needed to stay within budget
+    # Build quoted lines, truncating if needed to stay within budget.
+    # Telegram's expandable blockquote syntax requires the *first* line to
+    # start with "**>" (plain ">" lines are a regular, non-collapsible
+    # quote and the trailing "||" then fails to parse).
     built: list[str] = []
     total_len = 0
     suffix = "\n>… \\(truncated\\)||"
-    budget = _EXPQUOTE_MAX_RENDERED - len(suffix)
+    budget = _EXPQUOTE_MAX_RENDERED - len(suffix) - 2  # -2 for the "**"
     truncated = False
     for line in lines:
         # +1 for ">" prefix, +1 for "\n" separator
@@ -148,6 +151,9 @@ def _render_expandable_quote(m: re.Match[str]) -> str:
             break
         built.append(f">{line}")
         total_len += line_cost
+    if not built:
+        built.append(">")
+    built[0] = "**" + built[0]
     if truncated:
         return "\n".join(built) + suffix
     return "\n".join(built) + "||"

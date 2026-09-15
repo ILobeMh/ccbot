@@ -499,7 +499,6 @@ class TranscriptParser:
 
             if msg_type == "assistant":
                 # Process content blocks
-                has_text = False
                 for block in content:
                     if not isinstance(block, dict):
                         continue
@@ -516,7 +515,6 @@ class TranscriptParser:
                                     timestamp=entry_timestamp,
                                 )
                             )
-                            has_text = True
 
                     elif btype == "tool_use":
                         tool_id = block.get("id", "")
@@ -573,6 +571,9 @@ class TranscriptParser:
                             )
 
                     elif btype == "thinking":
+                        # Empty thinking blocks (redacted / summary-only)
+                        # are skipped: a "(thinking)" placeholder per turn
+                        # is pure noise in the chat.
                         thinking_text = block.get("thinking", "")
                         if thinking_text:
                             quoted = cls._format_expandable_quote(thinking_text)
@@ -580,15 +581,6 @@ class TranscriptParser:
                                 ParsedEntry(
                                     role="assistant",
                                     text=quoted,
-                                    content_type="thinking",
-                                    timestamp=entry_timestamp,
-                                )
-                            )
-                        elif not has_text:
-                            result.append(
-                                ParsedEntry(
-                                    role="assistant",
-                                    text="(thinking)",
                                     content_type="thinking",
                                     timestamp=entry_timestamp,
                                 )

@@ -389,6 +389,13 @@ class TestParseEntries:
         assert EXPQUOTE_END in result[0].text
         assert "reasoning here" in result[0].text
 
+    def test_empty_thinking_block_is_skipped(
+        self, make_jsonl_entry, make_thinking_block
+    ):
+        entries = [make_jsonl_entry("assistant", [make_thinking_block("")])]
+        result, pending = TranscriptParser.parse_entries(entries)
+        assert result == []
+
     def test_local_command_with_stdout(self, make_jsonl_entry, make_text_block):
         xml = (
             "<command-name>/status</command-name>"

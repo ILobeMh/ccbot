@@ -96,6 +96,9 @@ class Config:
             os.getenv("CCBOT_SHOW_TOOL_CALLS", "true").lower() != "false"
         )
 
+        # Show Claude's thinking blocks (as collapsed expandable quotes)
+        self.show_thinking = os.getenv("CCBOT_SHOW_THINKING", "true").lower() != "false"
+
         # Show hidden (dot) directories in directory browser
         self.show_hidden_dirs = (
             os.getenv("CCBOT_SHOW_HIDDEN_DIRS", "").lower() == "true"

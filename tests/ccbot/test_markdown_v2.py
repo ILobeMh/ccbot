@@ -46,13 +46,26 @@ class TestConvertMarkdown:
         result = convert_markdown(text)
         assert EXP_START not in result
         assert EXP_END not in result
-        assert ">quoted content||" in result
+        assert "**>quoted content||" in result
 
     def test_mixed_text_and_expandable_quote(self) -> None:
         text = f"before {EXP_START}inside quote{EXP_END} after"
         result = convert_markdown(text)
         assert EXP_START not in result
         assert EXP_END not in result
-        assert ">inside quote||" in result
+        assert "**>inside quote||" in result
         assert "before" in result
         assert "after" in result
+
+    def test_expandable_quote_multiline_prefix_only_first_line(self) -> None:
+        text = f"{EXP_START}line one\nline two{EXP_END}"
+        result = convert_markdown(text)
+        assert "**>line one\n>line two||" in result
+        assert result.count("**>") == 1
+
+    def test_expandable_quote_truncated_keeps_prefix(self) -> None:
+        text = f"{EXP_START}{'x' * 5000}{EXP_END}"
+        result = convert_markdown(text)
+        assert result.startswith("**>")
+        assert result.endswith("\\(truncated\\)||")
+        assert len(result) <= 3800

@@ -1791,6 +1791,10 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
         ):
             continue
 
+        # Skip thinking blocks when CCBOT_SHOW_THINKING=false
+        if not config.show_thinking and msg.content_type == "thinking":
+            continue
+
         parts = build_response_parts(
             msg.text,
             msg.is_complete,
