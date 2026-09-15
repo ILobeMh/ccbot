@@ -84,6 +84,9 @@ class SessionMonitor:
         self._last_session_map: dict[str, str] = {}  # window_key -> session_id
         # In-memory mtime cache for quick file change detection (not persisted)
         self._file_mtimes: dict[str, float] = {}  # session_id -> last_seen_mtime
+        # Sessions that entered session_map while running, before their JSONL
+        # existed: every byte is new, so they are tracked from offset 0.
+        self._fresh_sessions: set[str] = set()
 
     def set_message_callback(
         self, callback: Callable[[NewMessage], Awaitable[None]]
@@ -301,7 +304,10 @@ class SessionMonitor:
 
                 if tracked is None:
                     # For new sessions, initialize offset to end of file
-                    # to avoid re-processing old messages
+                    # to avoid re-processing old messages — unless the session
+                    # was created while we were watching, when all of it is new.
+                    fresh = session_info.session_id in self._fresh_sessions
+                    self._fresh_sessions.discard(session_info.session_id)
                     try:
                         file_size = session_info.file_path.stat().st_size
                         current_mtime = session_info.file_path.stat().st_mtime
@@ -311,7 +317,7 @@ class SessionMonitor:
                     tracked = TrackedSession(
                         session_id=session_info.session_id,
                         file_path=str(session_info.file_path),
-                        last_byte_offset=file_size,
+                        last_byte_offset=0 if fresh else file_size,
                     )
                     self.state.update_session(tracked)
                     self._file_mtimes[session_info.session_id] = current_mtime
@@ -466,11 +472,24 @@ class SessionMonitor:
             )
             sessions_to_remove.add(old_session_id)
 
+        # A session that appears while we're running and has no transcript yet
+        # is brand new: nothing it writes has been seen, so track it from byte 0
+        # rather than from wherever EOF happens to be when a poll first finds
+        # the file. Sessions whose file already exists (e.g. --resume) still
+        # start at EOF so their history isn't replayed.
+        known_session_ids = set(self._last_session_map.values())
+        for session_id in set(current_map.values()) - known_session_ids:
+            if self.state.get_session(session_id) is None and not any(
+                self.projects_path.glob(f"*/{session_id}.jsonl")
+            ):
+                self._fresh_sessions.add(session_id)
+
         # Perform cleanup
         if sessions_to_remove:
             for session_id in sessions_to_remove:
                 self.state.remove_session(session_id)
                 self._file_mtimes.pop(session_id, None)
+                self._fresh_sessions.discard(session_id)
             self.state.save_if_dirty()
 
         # Update last known map

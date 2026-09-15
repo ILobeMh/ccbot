@@ -342,3 +342,42 @@ class TestLoadSessionMapMigration:
 
         await mgr.load_session_map()
         assert mgr.get_window_state("@4").session_id == "sid-1"
+
+
+class TestResolveSessionFileForWindow:
+    """resolve_session_file_for_window returns the JSONL path without reading it."""
+
+    def test_direct_path(self, mgr: SessionManager, monkeypatch, tmp_path) -> None:
+        projects = tmp_path / "projects"
+        monkeypatch.setattr(session_mod.config, "claude_projects_path", projects)
+        cwd = "/home/user/proj"
+        jsonl = projects / SessionManager._encode_cwd(cwd) / "sid-1.jsonl"
+        jsonl.parent.mkdir(parents=True)
+        jsonl.write_text("not even json\n")  # never parsed
+
+        state = mgr.get_window_state("@1")
+        state.session_id = "sid-1"
+        state.cwd = cwd
+
+        assert mgr.resolve_session_file_for_window("@1") == jsonl
+
+    def test_glob_fallback_when_cwd_drifted(
+        self, mgr: SessionManager, monkeypatch, tmp_path
+    ) -> None:
+        projects = tmp_path / "projects"
+        monkeypatch.setattr(session_mod.config, "claude_projects_path", projects)
+        jsonl = projects / "-elsewhere" / "sid-2.jsonl"
+        jsonl.parent.mkdir(parents=True)
+        jsonl.write_text("")
+
+        state = mgr.get_window_state("@2")
+        state.session_id = "sid-2"
+        state.cwd = "/home/user/other"
+
+        assert mgr.resolve_session_file_for_window("@2") == jsonl
+
+    def test_no_session_returns_none(
+        self, mgr: SessionManager, monkeypatch, tmp_path
+    ) -> None:
+        monkeypatch.setattr(session_mod.config, "claude_projects_path", tmp_path)
+        assert mgr.resolve_session_file_for_window("@9") is None

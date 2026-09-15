@@ -822,6 +822,23 @@ class SessionManager:
         self._save_state()
         return None
 
+    def resolve_session_file_for_window(self, window_id: str) -> Path | None:
+        """Return the JSONL path of a window's session without reading it.
+
+        resolve_session_for_window() parses the whole transcript to build a
+        summary. Callers that only need the path (e.g. to stat its size for
+        every delivered message) must not pay that O(file size) cost — on a
+        large transcript it stalls the monitor loop for seconds per message.
+        """
+        state = self.get_window_state(window_id)
+        if not state.session_id:
+            return None
+        file_path = self._build_session_file_path(state.session_id, state.cwd)
+        if file_path and file_path.exists():
+            return file_path
+        matches = list(config.claude_projects_path.glob(f"*/{state.session_id}.jsonl"))
+        return matches[0] if matches else None
+
     # --- User window offset management ---
 
     def update_user_window_offset(

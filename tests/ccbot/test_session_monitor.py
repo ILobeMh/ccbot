@@ -146,3 +146,96 @@ class TestReadNewLinesOffsetRecovery:
         # Should reset offset to 0 and read the line
         assert session.last_byte_offset == jsonl_file.stat().st_size
         assert len(result) == 1
+
+
+class TestFreshSessionTracking:
+    """Sessions created while the monitor runs are tracked from byte 0."""
+
+    @pytest.fixture
+    def monitor(self, tmp_path, monkeypatch):
+        from ccbot import session_monitor as sm
+
+        projects = tmp_path / "projects"
+        projects.mkdir()
+        monkeypatch.setattr(
+            sm.config, "session_map_file", tmp_path / "session_map.json"
+        )
+        monkeypatch.setattr(sm.config, "tmux_session_name", "ccbot")
+        return sm.SessionMonitor(
+            projects_path=projects,
+            state_file=tmp_path / "monitor_state.json",
+        )
+
+    @staticmethod
+    def _write_map(path, entries: dict[str, str]) -> None:
+        path.write_text(
+            json.dumps(
+                {
+                    f"ccbot:{wid}": {"session_id": sid, "cwd": "/proj"}
+                    for wid, sid in entries.items()
+                }
+            )
+        )
+
+    @pytest.mark.asyncio
+    async def test_new_session_without_file_starts_at_zero(
+        self, monitor, tmp_path, make_jsonl_entry
+    ):
+        from ccbot import session_monitor as sm
+
+        map_file = tmp_path / "session_map.json"
+        self._write_map(map_file, {})
+        await monitor._detect_and_cleanup_changes()
+
+        # Hook fires before Claude writes the transcript
+        self._write_map(map_file, {"@1": "fresh-sid"})
+        await monitor._detect_and_cleanup_changes()
+        assert "fresh-sid" in monitor._fresh_sessions
+
+        # Transcript appears with content between polls
+        jsonl = monitor.projects_path / "-proj" / "fresh-sid.jsonl"
+        jsonl.parent.mkdir()
+        jsonl.write_text(
+            json.dumps(make_jsonl_entry(msg_type="assistant", content="hi")) + "\n"
+        )
+
+        async def fake_scan():
+            return [sm.SessionInfo(session_id="fresh-sid", file_path=jsonl)]
+
+        monitor.scan_projects = fake_scan  # type: ignore[method-assign]
+        await monitor.check_for_updates({"fresh-sid"})
+
+        tracked = monitor.state.get_session("fresh-sid")
+        assert tracked is not None
+        assert tracked.last_byte_offset == 0
+        assert "fresh-sid" not in monitor._fresh_sessions
+
+    @pytest.mark.asyncio
+    async def test_existing_file_starts_at_eof(
+        self, monitor, tmp_path, make_jsonl_entry
+    ):
+        from ccbot import session_monitor as sm
+
+        map_file = tmp_path / "session_map.json"
+        self._write_map(map_file, {})
+        await monitor._detect_and_cleanup_changes()
+
+        # Resumed session: transcript already exists when the hook fires
+        jsonl = monitor.projects_path / "-proj" / "old-sid.jsonl"
+        jsonl.parent.mkdir()
+        jsonl.write_text(
+            json.dumps(make_jsonl_entry(msg_type="assistant", content="old")) + "\n"
+        )
+        self._write_map(map_file, {"@1": "old-sid"})
+        await monitor._detect_and_cleanup_changes()
+        assert "old-sid" not in monitor._fresh_sessions
+
+        async def fake_scan():
+            return [sm.SessionInfo(session_id="old-sid", file_path=jsonl)]
+
+        monitor.scan_projects = fake_scan  # type: ignore[method-assign]
+        await monitor.check_for_updates({"old-sid"})
+
+        tracked = monitor.state.get_session("old-sid")
+        assert tracked is not None
+        assert tracked.last_byte_offset == jsonl.stat().st_size
