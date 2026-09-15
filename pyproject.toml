@@ -40,6 +40,11 @@ target-version = ["py312"]
 [tool.ruff]
 target-version = "py312"
 
+[tool.ruff.lint]
+# Pin the rule set: ruff >=0.16 widened its defaults, which would flag ~100
+# pre-existing style issues. Keep the classic defaults plus import sorting.
+select = ["E4", "E7", "E9", "F", "I"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
