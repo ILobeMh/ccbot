@@ -56,6 +56,122 @@ def _find_ccbot_path() -> str:
     return "ccbot"
 
 
+_NON_INTERACTIVE_FLAGS = ("-p", "--print", "--bg", "--background", "--remote-control")
+_CONTINUATION_SOURCES = frozenset({"resume", "clear", "compact", "fork"})
+
+
+def _process_chain(pid: int, max_depth: int = 12) -> list[str]:
+    """Return command lines of ``pid``'s ancestors (nearest first).
+
+    Uses ``ps`` so it works on both macOS and Linux without psutil.
+    """
+    chain: list[str] = []
+    for _ in range(max_depth):
+        if pid <= 1:
+            break
+        try:
+            out = subprocess.run(
+                ["ps", "-o", "ppid=,command=", "-p", str(pid)],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            ).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            break
+        if not out:
+            break
+        ppid_str, _, command = out.partition(" ")
+        try:
+            pid = int(ppid_str)
+        except ValueError:
+            break
+        chain.append(command.strip())
+    return chain
+
+
+def _is_claude_command(command: str) -> bool:
+    argv0 = command.split(" ", 1)[0]
+    return os.path.basename(argv0) == "claude" or argv0.endswith("/claude")
+
+
+def _should_skip_nested(env: dict[str, str], chain: list[str]) -> str | None:
+    """Reason to ignore this SessionStart, or None to proceed.
+
+    A Claude Code session spawned *by* the tracked session (Bash tool
+    running ``claude -p``, SDK, ``--bg`` workers) fires the same hook inside
+    the same tmux pane and would overwrite the window's mapping.
+    """
+    entrypoint = env.get("CLAUDE_CODE_ENTRYPOINT", "")
+    if entrypoint.startswith("sdk-"):
+        return f"CLAUDE_CODE_ENTRYPOINT={entrypoint}"
+    claude_ancestors = [c for c in chain if _is_claude_command(c)]
+    if not claude_ancestors:
+        return None
+    nearest = claude_ancestors[0]
+    args = nearest.split()[1:]
+    for flag in _NON_INTERACTIVE_FLAGS:
+        if flag in args:
+            return f"non-interactive claude ({flag})"
+    if len(claude_ancestors) >= 2:
+        return "nested claude (spawned by another claude)"
+    return None
+
+
+def _valid_transcript_path(transcript_path: str, session_id: str) -> str:
+    """Return ``transcript_path`` if it is absolute and named after the session."""
+    if not transcript_path or not os.path.isabs(transcript_path):
+        return ""
+    if Path(transcript_path).stem != session_id:
+        return ""
+    return transcript_path
+
+
+def _find_pane_key(
+    session_id: str, cwd: str, session_map: dict
+) -> tuple[str, str] | None:
+    """Fallback when TMUX_PANE is missing (claude --bg-pty-host strips it).
+
+    1. The session is already mapped → keep its window (compact/resume).
+    2. Exactly one pane with a ``claude`` process runs in ``cwd`` → that one.
+    Returns ``(session_window_key, window_name)`` or None.
+    """
+    for key, info in session_map.items():
+        if isinstance(info, dict) and info.get("session_id") == session_id:
+            return key, info.get("window_name", "")
+    try:
+        out = subprocess.run(
+            [
+                "tmux",
+                "list-panes",
+                "-a",
+                "-F",
+                "#{session_name}:#{window_id}\x1f#{window_name}"
+                "\x1f#{pane_current_path}\x1f#{pane_current_command}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    matches: list[tuple[str, str]] = []
+    for line in out.splitlines():
+        parts = line.split("\x1f")
+        if len(parts) != 4:
+            continue
+        key, wname, pane_cwd, pane_cmd = parts
+        if pane_cmd == "claude" and cwd and pane_cwd == cwd:
+            matches.append((key, wname))
+    if len(matches) == 1:
+        return matches[0]
+    logger.warning(
+        "TMUX_PANE unset and %d panes run claude in %s — cannot map", len(matches), cwd
+    )
+    return None
+
+
 def _is_hook_installed(settings: dict) -> bool:
     """Check if ccbot hook is already installed in the settings.
 
@@ -186,45 +302,62 @@ def hook_main() -> None:
         logger.debug("Ignoring non-SessionStart event: %s", event)
         return
 
+    skip_reason = _should_skip_nested(dict(os.environ), _process_chain(os.getpid()))
+    if skip_reason:
+        logger.info("Ignoring SessionStart from %s", skip_reason)
+        return
+
+    source = payload.get("source", "")
+    transcript_path = _valid_transcript_path(
+        str(payload.get("transcript_path", "")), session_id
+    )
+
     # Get tmux session:window key for the pane running this hook.
-    # TMUX_PANE is set by tmux for every process inside a pane.
+    # TMUX_PANE is set by tmux for every process inside a pane — except
+    # when Claude Code's --bg-pty-host supervisor re-execs the hook after
+    # /clear, /compact or --resume, in which case we fall back below.
+    session_window_key = ""
+    window_name = ""
+    tmux_session_name = ""
     pane_id = os.environ.get("TMUX_PANE", "")
-    if not pane_id:
+    if pane_id:
+        result = subprocess.run(
+            [
+                "tmux",
+                "display-message",
+                "-t",
+                pane_id,
+                "-p",
+                "#{session_name}:#{window_id}:#{window_name}",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        raw_output = result.stdout.strip()
+        # Expected format: "session_name:@id:window_name"
+        parts = raw_output.split(":", 2)
+        if len(parts) < 3:
+            logger.warning(
+                "Failed to parse session:window_id:window_name from tmux "
+                "(pane=%s, output=%s)",
+                pane_id,
+                raw_output,
+            )
+            return
+        tmux_session_name, window_id, window_name = parts
+        # Key uses window_id for uniqueness
+        session_window_key = f"{tmux_session_name}:{window_id}"
+    elif source not in _CONTINUATION_SOURCES:
         logger.warning("TMUX_PANE not set, cannot determine window")
         return
 
-    result = subprocess.run(
-        [
-            "tmux",
-            "display-message",
-            "-t",
-            pane_id,
-            "-p",
-            "#{session_name}:#{window_id}:#{window_name}",
-        ],
-        capture_output=True,
-        text=True,
-    )
-    raw_output = result.stdout.strip()
-    # Expected format: "session_name:@id:window_name"
-    parts = raw_output.split(":", 2)
-    if len(parts) < 3:
-        logger.warning(
-            "Failed to parse session:window_id:window_name from tmux (pane=%s, output=%s)",
-            pane_id,
-            raw_output,
-        )
-        return
-    tmux_session_name, window_id, window_name = parts
-    # Key uses window_id for uniqueness
-    session_window_key = f"{tmux_session_name}:{window_id}"
-
     logger.debug(
-        "tmux key=%s, window_name=%s, session_id=%s, cwd=%s",
-        session_window_key,
+        "tmux key=%s, window_name=%s, session_id=%s, cwd=%s, source=%s",
+        session_window_key or "<fallback>",
         window_name,
         session_id,
         cwd,
+        source,
     )
 
     # Read-modify-write with file locking to prevent concurrent hook races
@@ -248,11 +381,30 @@ def hook_main() -> None:
                             "Failed to read existing session_map, starting fresh"
                         )
 
-                session_map[session_window_key] = {
+                if not session_window_key:
+                    found = _find_pane_key(session_id, cwd, session_map)
+                    if found is None:
+                        return
+                    session_window_key, window_name = found
+                    tmux_session_name = session_window_key.split(":", 1)[0]
+                    logger.info(
+                        "TMUX_PANE unset (source=%s); mapped via fallback to %s",
+                        source,
+                        session_window_key,
+                    )
+
+                entry: dict[str, str] = {
                     "session_id": session_id,
                     "cwd": cwd,
                     "window_name": window_name,
                 }
+                previous = session_map.get(session_window_key) or {}
+                if not transcript_path and previous.get("session_id") == session_id:
+                    # e.g. compact re-fires without transcript_path
+                    transcript_path = previous.get("transcript_path", "")
+                if transcript_path:
+                    entry["transcript_path"] = transcript_path
+                session_map[session_window_key] = entry
 
                 # Clean up old-format key ("session:window_name") if it exists.
                 # Previous versions keyed by window_name instead of window_id.

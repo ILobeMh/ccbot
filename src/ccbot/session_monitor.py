@@ -93,6 +93,32 @@ class SessionMonitor:
     ) -> None:
         self._message_callback = callback
 
+    @staticmethod
+    def _add_hook_reported_sessions(
+        sessions: list[SessionInfo], active_session_ids: set[str]
+    ) -> list[SessionInfo]:
+        """Add sessions whose JSONL the hook told us about directly.
+
+        scan_projects() matches project dirs by the pane's current cwd, which
+        misses transcripts after `cd` / `/cd` or when the project dir was
+        renamed. transcript_path from the SessionStart hook is authoritative.
+        """
+        # Deferred import to avoid circular dependency
+        from .session import session_manager
+
+        known = {s.session_id for s in sessions}
+        for state in session_manager.window_states.values():
+            sid = state.session_id
+            if not sid or sid in known or sid not in active_session_ids:
+                continue
+            if not state.transcript_path:
+                continue
+            path = Path(state.transcript_path)
+            if path.exists():
+                sessions.append(SessionInfo(session_id=sid, file_path=path))
+                known.add(sid)
+        return sessions
+
     async def _get_active_cwds(self) -> set[str]:
         """Get normalized cwds of all active tmux windows."""
         cwds = set()
@@ -296,6 +322,7 @@ class SessionMonitor:
 
         # Scan projects to get available session files
         sessions = await self.scan_projects()
+        sessions = self._add_hook_reported_sessions(sessions, active_session_ids)
 
         # Only process sessions that are in session_map
         for session_info in sessions:

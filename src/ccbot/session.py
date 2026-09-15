@@ -49,11 +49,14 @@ class WindowState:
         session_id: Associated Claude session ID (empty if not yet detected)
         cwd: Working directory for direct file path construction
         window_name: Display name of the window
+        transcript_path: JSONL path reported by the SessionStart hook
+            (authoritative — the hook's cwd drifts after `cd`)
     """
 
     session_id: str = ""
     cwd: str = ""
     window_name: str = ""
+    transcript_path: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -62,6 +65,8 @@ class WindowState:
         }
         if self.window_name:
             d["window_name"] = self.window_name
+        if self.transcript_path:
+            d["transcript_path"] = self.transcript_path
         return d
 
     @classmethod
@@ -70,6 +75,7 @@ class WindowState:
             session_id=data.get("session_id", ""),
             cwd=data.get("cwd", ""),
             window_name=data.get("window_name", ""),
+            transcript_path=data.get("transcript_path", ""),
         )
 
 
@@ -642,6 +648,7 @@ class SessionManager:
             new_sid = info.get("session_id", "")
             new_cwd = info.get("cwd", "")
             new_wname = info.get("window_name", "")
+            new_tpath = info.get("transcript_path", "")
             if not new_sid:
                 continue
             state = self.get_window_state(window_id)
@@ -654,6 +661,9 @@ class SessionManager:
                 )
                 state.session_id = new_sid
                 state.cwd = new_cwd
+                changed = True
+            if state.transcript_path != new_tpath:
+                state.transcript_path = new_tpath
                 changed = True
             # Update display name
             if new_wname:
@@ -835,6 +845,10 @@ class SessionManager:
         state = self.get_window_state(window_id)
         if not state.session_id:
             return None
+        if state.transcript_path:
+            hook_path = Path(state.transcript_path)
+            if hook_path.exists():
+                return hook_path
         file_path = self._build_session_file_path(state.session_id, state.cwd)
         if file_path and file_path.exists():
             return file_path

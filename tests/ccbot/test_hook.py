@@ -2,11 +2,19 @@
 
 import io
 import json
+import subprocess
 import sys
 
 import pytest
 
-from ccbot.hook import _UUID_RE, _is_hook_installed, hook_main
+import ccbot.hook as hook_mod
+from ccbot.hook import (
+    _UUID_RE,
+    _is_hook_installed,
+    _should_skip_nested,
+    _valid_transcript_path,
+    hook_main,
+)
 
 
 class TestUuidRegex:
@@ -93,6 +101,7 @@ class TestHookMainValidation:
             monkeypatch.setenv("TMUX_PANE", tmux_pane)
         else:
             monkeypatch.delenv("TMUX_PANE", raising=False)
+        monkeypatch.setattr(hook_mod, "_process_chain", lambda pid: [])
         hook_main()
 
     def test_missing_session_id(
@@ -144,3 +153,153 @@ class TestHookMainValidation:
             },
         )
         assert not (tmp_path / "session_map.json").exists()
+
+
+SID = "550e8400-e29b-41d4-a716-446655440000"
+
+
+class TestNestedGuard:
+    def test_plain_session_not_skipped(self) -> None:
+        chain = ["ccbot hook", "claude --dangerously-skip-permissions", "-zsh"]
+        assert _should_skip_nested({}, chain) is None
+
+    def test_print_mode_child_skipped(self) -> None:
+        chain = [
+            "ccbot hook",
+            "claude -p summarise this",
+            "/bin/zsh -c claude -p summarise this",
+            "claude --resume abc",
+        ]
+        assert _should_skip_nested({}, chain) is not None
+
+    def test_two_claude_ancestors_skipped(self) -> None:
+        chain = ["ccbot hook", "claude", "/bin/bash", "claude --permission-mode plan"]
+        assert _should_skip_nested({}, chain) is not None
+
+    def test_sdk_entrypoint_skipped(self) -> None:
+        assert _should_skip_nested({"CLAUDE_CODE_ENTRYPOINT": "sdk-py"}, []) is not None
+
+    def test_bg_worker_skipped(self) -> None:
+        assert _should_skip_nested({}, ["ccbot hook", "claude --bg"]) is not None
+
+
+class TestTranscriptPath:
+    def test_valid(self) -> None:
+        p = f"/home/u/.claude/projects/-x/{SID}.jsonl"
+        assert _valid_transcript_path(p, SID) == p
+
+    @pytest.mark.parametrize(
+        "path",
+        ["relative.jsonl", f"/x/other-{SID}.jsonl", ""],
+    )
+    def test_invalid(self, path: str) -> None:
+        assert _valid_transcript_path(path, SID) == ""
+
+
+class TestHookMainMapping:
+    def _run(self, monkeypatch, payload, *, tmux_pane: str = "") -> None:
+        monkeypatch.setattr(sys, "argv", ["ccbot", "hook"])
+        monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+        if tmux_pane:
+            monkeypatch.setenv("TMUX_PANE", tmux_pane)
+        else:
+            monkeypatch.delenv("TMUX_PANE", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_ENTRYPOINT", raising=False)
+        monkeypatch.setattr(hook_mod, "_process_chain", lambda pid: [])
+        hook_main()
+
+    def test_writes_entry_with_transcript_path(self, monkeypatch, tmp_path) -> None:
+        monkeypatch.setenv("CCBOT_DIR", str(tmp_path))
+        monkeypatch.setattr(
+            hook_mod.subprocess,
+            "run",
+            lambda *a, **k: subprocess.CompletedProcess(
+                a, 0, stdout="ccbot:@7:proj\n", stderr=""
+            ),
+        )
+        transcript = f"/home/u/.claude/projects/-proj/{SID}.jsonl"
+        self._run(
+            monkeypatch,
+            {
+                "session_id": SID,
+                "cwd": "/proj",
+                "hook_event_name": "SessionStart",
+                "source": "startup",
+                "transcript_path": transcript,
+            },
+            tmux_pane="%3",
+        )
+        data = json.loads((tmp_path / "session_map.json").read_text())
+        assert data["ccbot:@7"] == {
+            "session_id": SID,
+            "cwd": "/proj",
+            "window_name": "proj",
+            "transcript_path": transcript,
+        }
+
+    def test_no_tmux_pane_startup_ignored(self, monkeypatch, tmp_path) -> None:
+        monkeypatch.setenv("CCBOT_DIR", str(tmp_path))
+        self._run(
+            monkeypatch,
+            {
+                "session_id": SID,
+                "cwd": "/proj",
+                "hook_event_name": "SessionStart",
+                "source": "startup",
+            },
+        )
+        assert not (tmp_path / "session_map.json").exists()
+
+    def test_no_tmux_pane_compact_keeps_existing_window(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        monkeypatch.setenv("CCBOT_DIR", str(tmp_path))
+        (tmp_path / "session_map.json").write_text(
+            json.dumps(
+                {"ccbot:@2": {"session_id": SID, "cwd": "/old", "window_name": "w"}}
+            )
+        )
+        self._run(
+            monkeypatch,
+            {
+                "session_id": SID,
+                "cwd": "/proj/sub",
+                "hook_event_name": "SessionStart",
+                "source": "compact",
+            },
+        )
+        data = json.loads((tmp_path / "session_map.json").read_text())
+        assert list(data) == ["ccbot:@2"]
+        assert data["ccbot:@2"]["cwd"] == "/proj/sub"
+
+    def test_no_tmux_pane_clear_maps_by_unique_pane(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        monkeypatch.setenv("CCBOT_DIR", str(tmp_path))
+        other = "11111111-2222-3333-4444-555555555555"
+        (tmp_path / "session_map.json").write_text(
+            json.dumps(
+                {"ccbot:@2": {"session_id": other, "cwd": "/proj", "window_name": "w"}}
+            )
+        )
+        panes = (
+            "ccbot:@0\x1f__main__\x1f/home\x1fzsh\n"
+            "ccbot:@2\x1fw\x1f/proj\x1fclaude\n"
+            "ccbot:@5\x1fx\x1f/other\x1fclaude\n"
+        )
+        monkeypatch.setattr(
+            hook_mod.subprocess,
+            "run",
+            lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout=panes, stderr=""),
+        )
+        self._run(
+            monkeypatch,
+            {
+                "session_id": SID,
+                "cwd": "/proj",
+                "hook_event_name": "SessionStart",
+                "source": "clear",
+            },
+        )
+        data = json.loads((tmp_path / "session_map.json").read_text())
+        assert data["ccbot:@2"]["session_id"] == SID
