@@ -242,12 +242,46 @@ def build_directory_browser(
     buttons.append(action_row)
 
     display_path = str(path).replace(str(Path.home()), "~")
+    hint = "Tap a folder to enter, select the current directory, or send a full path."
     if not subdirs:
-        text = f"*Select Working Directory*\n\nCurrent: `{display_path}`\n\n_(No subdirectories)_"
+        text = f"*Select Working Directory*\n\nCurrent: `{display_path}`\n\n_(No subdirectories)_\n{hint}"
     else:
-        text = f"*Select Working Directory*\n\nCurrent: `{display_path}`\n\nTap a folder to enter, or select current directory"
+        text = f"*Select Working Directory*\n\nCurrent: `{display_path}`\n\n{hint}"
 
     return text, InlineKeyboardMarkup(buttons), subdirs
+
+
+def as_directory(text: str) -> str | None:
+    """Interpret a message as a directory path.
+
+    Accepts absolute paths and ``~``-relative ones (single line, no extra
+    words). Returns the resolved path when it is an existing directory.
+    """
+    candidate = text.strip().strip("'\"")
+    if not candidate or "\n" in candidate:
+        return None
+    if not (candidate.startswith("/") or candidate.startswith("~")):
+        return None
+    try:
+        path = Path(candidate).expanduser()
+        if not path.is_absolute():
+            return None
+        resolved = path.resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if not resolved.is_dir():
+        return None
+    return str(resolved)
+
+
+def browser_start_path() -> str:
+    """Directory the browser opens at (CCBOT_DEFAULT_DIR, else the bot's cwd)."""
+    default = config.default_dir
+    if default:
+        path = Path(default).expanduser()
+        if path.is_dir():
+            return str(path.resolve())
+    return str(Path.cwd())
 
 
 def _relative_time(file_path: str) -> str:

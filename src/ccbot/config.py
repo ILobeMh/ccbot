@@ -100,6 +100,9 @@ class Config:
         # remembered choice: default | acceptEdits | plan | bypassPermissions
         self.claude_permission_mode = os.getenv("CLAUDE_PERMISSION_MODE", "default")
 
+        # Directory the directory browser opens at (default: bot's cwd)
+        self.default_dir = os.getenv("CCBOT_DEFAULT_DIR", "")
+
         # Pre-trust directories in ~/.claude.json before launching claude
         self.auto_trust_dirs = (
             os.getenv("CCBOT_AUTO_TRUST_DIRS", "true").lower() != "false"

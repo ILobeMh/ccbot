@@ -106,6 +106,8 @@ from .handlers.directory_browser import (
     STATE_SELECTING_SESSION,
     STATE_SELECTING_WINDOW,
     UNBOUND_WINDOWS_KEY,
+    as_directory,
+    browser_start_path,
     build_directory_browser,
     build_mode_picker,
     build_session_picker,
@@ -958,16 +960,23 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         context.user_data.pop("_pending_thread_id", None)
         context.user_data.pop("_pending_thread_text", None)
 
-    # Ignore text in directory browsing mode (only for the same thread)
+    # Text while browsing: an absolute path selects that directory directly;
+    # anything else is ignored (only for the same thread)
     if (
         context.user_data
         and context.user_data.get(STATE_KEY) == STATE_BROWSING_DIRECTORY
     ):
         pending_tid = context.user_data.get("_pending_thread_id")
         if pending_tid == thread_id:
+            typed_dir = as_directory(text)
+            if typed_dir:
+                clear_browse_state(context.user_data)
+                await _on_directory_chosen(update, context, typed_dir)
+                return
             await safe_reply(
                 update.message,
-                "Please use the directory browser above, or tap Cancel.",
+                "Please use the directory browser above, send a full path "
+                "(e.g. `/home/me/project`), or tap Cancel.",
             )
             return
         # Stale browsing state from a different thread — clear it
@@ -1016,7 +1025,22 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     wid = session_manager.get_window_for_thread(user.id, thread_id)
     if wid is None:
-        # Unbound topic — check for unbound windows first
+        # Unbound topic — a typed path skips the browser entirely
+        typed_dir = as_directory(text)
+        if typed_dir:
+            logger.info(
+                "Unbound topic: path given directly (%s, user=%d, thread=%d)",
+                typed_dir,
+                user.id,
+                thread_id,
+            )
+            if context.user_data is not None:
+                context.user_data["_pending_thread_id"] = thread_id
+                context.user_data.pop("_pending_thread_text", None)
+            await _on_directory_chosen(update, context, typed_dir)
+            return
+
+        # Check for unbound windows first
         all_windows = await tmux_manager.list_windows()
         bound_ids = {wid for _, _, wid in session_manager.iter_thread_bindings()}
         unbound = [
@@ -1054,7 +1078,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             user.id,
             thread_id,
         )
-        start_path = str(Path.cwd())
+        start_path = browser_start_path()
         msg_text, keyboard, subdirs = build_directory_browser(start_path)
         if context.user_data is not None:
             context.user_data[STATE_KEY] = STATE_BROWSING_DIRECTORY
@@ -1758,7 +1782,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             return
         # Preserve pending thread info, clear only picker state
         clear_window_picker_state(context.user_data)
-        start_path = str(Path.cwd())
+        start_path = browser_start_path()
         msg_text, keyboard, subdirs = build_directory_browser(start_path)
         if context.user_data is not None:
             context.user_data[STATE_KEY] = STATE_BROWSING_DIRECTORY
