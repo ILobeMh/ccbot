@@ -6,6 +6,7 @@ import pytest
 
 from ccbot.terminal_parser import (
     AUTO_ANSWER_DIALOGS,
+    _is_chrome_separator,
     extract_interactive_content,
     find_menu_option,
     has_update_pending,
@@ -55,6 +56,8 @@ class TestReadyPrompt:
         [
             ("ready_bypass.txt", "bypassPermissions"),
             ("ready_manual_mode.txt", "default"),
+            # named session: "──── royal-vpn-main ─" separator (mh-de, 2.1.272)
+            ("ready_labelled_separator.txt", "acceptEdits"),
         ],
     )
     def test_prompt_ready_and_mode(self, name: str, mode: str):
@@ -133,3 +136,23 @@ class TestMisc:
         assert parse_status_line(pane) == "Thinking… (2s)"
         assert is_prompt_ready(pane)
         assert parse_permission_mode(pane) == "auto"
+
+
+class TestSeparators:
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "─" * 40,
+            "──────────────── ultracode ─────────────────────",
+            "─" * 120 + " royal-vpn-main ─",
+        ],
+    )
+    def test_is_separator(self, line):
+        assert _is_chrome_separator(line)
+
+    @pytest.mark.parametrize(
+        "line",
+        ["──── short", "text with ─── dashes in the middle ─", "─" * 10],
+    )
+    def test_not_separator(self, line):
+        assert not _is_chrome_separator(line)

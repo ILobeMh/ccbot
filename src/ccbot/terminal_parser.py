@@ -328,9 +328,12 @@ STATUS_SPINNERS = frozenset(["·", "✻", "✽", "✶", "✳", "✢"])
 _RE_STATUS_SKIPPABLE = re.compile(r"^\s*[⎿⏵]|^\s{2,}\S")
 _STATUS_SCAN_LINES = 16
 
-# Labelled separators such as "──── ultracode ────" (2.1.2xx) still count
-# as chrome; require mostly ─ characters and a minimum width.
-_RE_SEPARATOR_LABEL = re.compile(r"^─{8,}(\s*[\w /:+.-]{0,40}\s*─{4,})?$")
+# Separators may carry a label: "──── ultracode ────" (2.1.2xx) or the
+# session name right-aligned with a single trailing dash
+# ("────────── royal-vpn-main ─") when the session was named via
+# --resume <name> / --name / /rename.
+_SEPARATOR_MIN_DASH_RATIO = 0.6
+
 
 # "· done 1:47 PM", "· 1 shell still running", elapsed timers etc. change
 # every second; strip them so identical statuses dedupe at the send layer.
@@ -341,11 +344,14 @@ _RE_STATUS_NOISE = re.compile(
 
 def _is_chrome_separator(line: str) -> bool:
     stripped = line.strip()
-    if len(stripped) < 20:
+    if len(stripped) < 20 or not stripped.startswith("────"):
         return False
-    if all(c == "─" for c in stripped):
-        return True
-    return bool(_RE_SEPARATOR_LABEL.match(stripped))
+    if not stripped.endswith("─"):
+        return False
+    dashes = stripped.count("─")
+    return (
+        dashes == len(stripped) or dashes / len(stripped) >= _SEPARATOR_MIN_DASH_RATIO
+    )
 
 
 def _find_chrome_separator(lines: list[str], window: int = 10) -> int | None:
