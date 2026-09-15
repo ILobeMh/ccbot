@@ -24,6 +24,18 @@ from pathlib import Path
 import libtmux
 
 from .config import SENSITIVE_ENV_VARS, config
+from .terminal_parser import (
+    AUTO_ANSWER_DIALOGS,
+    extract_interactive_content,
+    find_menu_option,
+    is_blocking_dialog,
+    is_prompt_ready,
+)
+
+# pane_current_command values meaning "Claude Code is not running here"
+SHELL_COMMANDS = frozenset(
+    {"zsh", "bash", "fish", "sh", "dash", "tcsh", "ksh", "nu", "login"}
+)
 
 logger = logging.getLogger(__name__)
 
@@ -287,6 +299,117 @@ class TmuxManager:
                 return None
 
         return await asyncio.to_thread(_sync_capture)
+
+    async def send_key(self, window_id: str, key: str) -> bool:
+        """Send a single tmux key name (``Down``, ``Enter``, ``Escape``, ``BTab``)."""
+        return await self.send_keys(window_id, key, enter=False, literal=False)
+
+    async def auto_answer_dialog(self, window_id: str, pane_text: str) -> str | None:
+        """Answer a startup dialog the bot handles itself (trust folder, …).
+
+        Moves the ``❯`` cursor onto the wanted option with Up/Down, verifies
+        it landed there, then presses Enter. Never blind-types a digit —
+        option order has changed between Claude Code versions.
+
+        Returns the dialog name when one was answered, else None.
+        """
+        ui = extract_interactive_content(pane_text)
+        if ui is None or ui.name not in AUTO_ANSWER_DIALOGS:
+            return None
+        needle = AUTO_ANSWER_DIALOGS[ui.name]
+        if needle is None:
+            await self.send_key(window_id, "Escape")
+            logger.info("Dismissed %s in %s", ui.name, window_id)
+            return ui.name
+
+        offsets = find_menu_option(pane_text, needle)
+        if offsets is None:
+            logger.warning("%s in %s: option %r not found", ui.name, window_id, needle)
+            return None
+        cursor, target = offsets
+        steps = target - cursor
+        key = "Down" if steps > 0 else "Up"
+        for _ in range(abs(steps)):
+            await self.send_key(window_id, key)
+            await asyncio.sleep(0.15)
+        if steps:
+            await asyncio.sleep(0.3)
+            pane = await self.capture_pane(window_id)
+            check = find_menu_option(pane or "", needle)
+            if check is None or check[0] != check[1]:
+                logger.warning(
+                    "%s in %s: cursor did not land on %r, not confirming",
+                    ui.name,
+                    window_id,
+                    needle,
+                )
+                return None
+        await self.send_key(window_id, "Enter")
+        logger.info("Answered %s in %s with %r", ui.name, window_id, needle)
+        return ui.name
+
+    async def wait_for_claude_ready(
+        self, window_id: str, timeout: float = 30.0
+    ) -> tuple[bool, str]:
+        """Wait until Claude Code shows its input prompt, answering startup dialogs.
+
+        Returns ``(ready, note)`` where note lists dialogs answered on the way
+        or the reason for giving up.
+        """
+        deadline = time.monotonic() + timeout
+        answered: list[str] = []
+        shell_seen = 0
+        while time.monotonic() < deadline:
+            pane = await self.capture_pane(window_id)
+            if pane:
+                if is_prompt_ready(pane):
+                    note = ", ".join(answered) if answered else "ready"
+                    return True, note
+                handled = await self.auto_answer_dialog(window_id, pane)
+                if handled:
+                    answered.append(handled)
+                    await asyncio.sleep(1.0)
+                    continue
+            window = await self.find_window_by_id(window_id)
+            if window is None:
+                return False, "window closed"
+            if window.pane_current_command in SHELL_COMMANDS:
+                # Claude may not have started yet; give it a few polls
+                shell_seen += 1
+                if shell_seen >= 8:
+                    return False, "Claude Code is not running (shell prompt)"
+            else:
+                shell_seen = 0
+            await asyncio.sleep(0.5)
+        return False, f"timed out after {timeout:.0f}s"
+
+    async def clear_blocking_dialog(self, window_id: str) -> tuple[bool, str]:
+        """Make the pane safe to type into.
+
+        Answers known startup dialogs, escapes unknown modals (up to 3×).
+        Returns ``(ok, reason)``; on failure the reason is user-facing.
+        """
+        pane = await self.capture_pane(window_id)
+        if not pane:
+            return True, ""
+        handled = await self.auto_answer_dialog(window_id, pane)
+        if handled:
+            await asyncio.sleep(1.0)
+            pane = await self.capture_pane(window_id) or ""
+        ui = extract_interactive_content(pane)
+        if ui is None or ui.name != "Modal":
+            return True, ""
+        for _ in range(3):
+            await self.send_key(window_id, "Escape")
+            await asyncio.sleep(0.3)
+            pane = await self.capture_pane(window_id) or ""
+            if not is_blocking_dialog(pane):
+                return True, ""
+        return (
+            False,
+            "Claude Code is showing a dialog the bot can't handle — "
+            "check /screenshot and answer it there.",
+        )
 
     async def send_keys(
         self, window_id: str, text: str, enter: bool = True, literal: bool = True

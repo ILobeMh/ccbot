@@ -34,7 +34,7 @@ from typing import Any
 import aiofiles
 
 from .config import config
-from .tmux_manager import tmux_manager
+from .tmux_manager import SHELL_COMMANDS, tmux_manager
 from .transcript_parser import TranscriptParser
 from .utils import atomic_write_json
 
@@ -960,6 +960,15 @@ class SessionManager:
         window = await tmux_manager.find_window_by_id(window_id)
         if not window:
             return False, "Window not found (may have been closed)"
+        if window.pane_current_command in SHELL_COMMANDS:
+            return (
+                False,
+                "Claude Code is not running in this window "
+                "(text would go to the shell). Use /restart to relaunch it.",
+            )
+        ok, reason = await tmux_manager.clear_blocking_dialog(window.window_id)
+        if not ok:
+            return False, reason
         success = await tmux_manager.send_keys(window.window_id, text)
         if success:
             return True, f"Sent to {display}"

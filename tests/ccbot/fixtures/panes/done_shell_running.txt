@@ -1,0 +1,24 @@
+  28
+  29
+  30
+
+✻ Worked for 3s · done 1:46 PM · 1 shell still running
+
+❯ Run this bash command and wait for it: sleep 25 && echo done
+
+  Thought for 2s, ran 1 shell command
+
+⏺ The harness blocks foreground sleep in Bash. I'll run it in the background
+  instead and wait for it to finish.
+
+  Ran 1 shell command
+
+⏺ The command is running in the background (task bk1xof30l). I'll report the
+  output as soon as it completes — it should take about 25 seconds.
+
+✻ Churned for 8s · done 1:47 PM · 1 shell still running
+
+────────────────────────────────────────────────────────────────────────────────
+❯ check if it's done yet
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on · 1 shell · ← for agents · ↓ to manage

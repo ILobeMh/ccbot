@@ -39,6 +39,17 @@ from .message_sender import (
 logger = logging.getLogger(__name__)
 
 
+def _is_working_status(status_text: str) -> bool:
+    """Heuristic: Claude is still busy.
+
+    Newer Claude Code moved "esc to interrupt" from the status line to the
+    footer; an in-progress status now reads like "Moseying… (7s · ↓ 337
+    tokens)" while a finished one reads "Worked for 3s".
+    """
+    lower = status_text.lower()
+    return "esc to interrupt" in lower or "…" in status_text
+
+
 # Merge limit for content messages
 MERGE_MAX_LENGTH = 3800  # Leave room for markdown conversion overhead
 
@@ -458,7 +469,7 @@ async def _process_status_update_task(
         else:
             # Same window, text changed - edit in place
             # Send typing indicator when Claude is working
-            if "esc to interrupt" in status_text.lower():
+            if _is_working_status(status_text):
                 try:
                     await bot.send_chat_action(
                         chat_id=chat_id, action=ChatAction.TYPING
@@ -498,7 +509,7 @@ async def _do_send_status_message(
         except Exception:
             pass
     # Send typing indicator when Claude is working
-    if "esc to interrupt" in text.lower():
+    if _is_working_status(text):
         try:
             await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
         except RetryAfter:
