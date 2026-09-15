@@ -47,6 +47,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ChatAction
+from telegram.error import Conflict, NetworkError, RetryAfter, TimedOut
 from telegram.ext import (
     AIORateLimiter,
     Application,
@@ -56,6 +57,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from telegram.request import HTTPXRequest
 
 from .config import config
 from .handlers.callback_data import (
@@ -1904,15 +1906,44 @@ async def post_shutdown(application: Application) -> None:
     await close_transcribe_client()
 
 
+async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Application-level error handler.
+
+    Without one, PTB logs "No error handlers are registered" and a burst of
+    transient httpx errors in the getUpdates loop can leave the bot deaf
+    while the monitor keeps running. Transport errors are expected noise;
+    anything else is a real bug and gets the traceback.
+    """
+    err = context.error
+    if isinstance(err, (NetworkError, TimedOut, RetryAfter, Conflict)):
+        logger.warning("Telegram transport error: %s: %s", type(err).__name__, err)
+        return
+    logger.error("Unhandled error while processing %r", update, exc_info=err)
+
+
 def create_bot() -> Application:
+    # Explicit timeouts: PTB's default pool_timeout of 1s makes concurrent
+    # sends fail spuriously under load; reads need headroom for long polls.
+    def _request() -> HTTPXRequest:
+        return HTTPXRequest(
+            connection_pool_size=16,
+            connect_timeout=10.0,
+            read_timeout=30.0,
+            write_timeout=30.0,
+            pool_timeout=10.0,
+        )
+
     application = (
         Application.builder()
         .token(config.telegram_bot_token)
+        .request(_request())
+        .get_updates_request(_request())
         .rate_limiter(AIORateLimiter(max_retries=5))
         .post_init(post_init)
         .post_shutdown(post_shutdown)
         .build()
     )
+    application.add_error_handler(_error_handler)
 
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("history", history_command))

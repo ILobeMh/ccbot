@@ -724,7 +724,9 @@ class SessionManager:
         last_user_msg = ""
         message_count = 0
         try:
-            async with aiofiles.open(file_path, "r", encoding="utf-8") as f:
+            async with aiofiles.open(
+                file_path, "r", encoding="utf-8", errors="replace"
+            ) as f:
                 async for line in f:
                     line = line.strip()
                     if not line:
@@ -989,7 +991,9 @@ class SessionManager:
         # Read JSONL entries (optionally filtered by byte range)
         entries: list[dict] = []
         try:
-            async with aiofiles.open(file_path, "r", encoding="utf-8") as f:
+            async with aiofiles.open(
+                file_path, "r", encoding="utf-8", errors="replace"
+            ) as f:
                 if start_byte > 0:
                     await f.seek(start_byte)
 

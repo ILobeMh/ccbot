@@ -11,6 +11,14 @@ Functions:
   - safe_reply: Reply with formatting, fallback to plain text
   - safe_edit: Edit message with formatting, fallback to plain text
   - safe_send: Send message with formatting, fallback to plain text
+  - edit_with_fallback: Edit by (chat_id, message_id), returns success bool
+  - run_with_fallback: The shared policy behind all of the above
+
+Fallback policy (see run_with_fallback): only a BadRequest (i.e. the
+MarkdownV2 parser rejected the text) triggers the plain-text retry.
+TimedOut / NetworkError usually mean the request *was* delivered and the
+response got lost, so retrying would duplicate the message — those are
+logged and treated as failure without a resend.
 
 Rate limiting is handled globally by AIORateLimiter on the Application.
 RetryAfter exceptions are re-raised so callers (queue worker) can handle them.
@@ -18,15 +26,18 @@ RetryAfter exceptions are re-raised so callers (queue worker) can handle them.
 
 import io
 import logging
-from typing import Any
+from collections.abc import Awaitable, Callable
+from typing import Any, TypeVar
 
 from telegram import Bot, InputMediaPhoto, LinkPreviewOptions, Message
-from telegram.error import RetryAfter
+from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 
 from ..markdown_v2 import convert_markdown
 from ..transcript_parser import TranscriptParser
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
 
 
 def strip_sentinels(text: str) -> str:
@@ -50,6 +61,65 @@ PARSE_MODE = "MarkdownV2"
 # Disable link previews in all messages to reduce visual noise
 NO_LINK_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
+_NOT_MODIFIED = "message is not modified"
+
+
+def _is_not_modified(e: BadRequest) -> bool:
+    return _NOT_MODIFIED in str(e).lower()
+
+
+async def run_with_fallback(
+    primary: Callable[[], Awaitable[T]],
+    fallback: Callable[[], Awaitable[T]],
+    what: str,
+    *,
+    raise_on_failure: bool = False,
+) -> T | None:
+    """Run ``primary``; on a BadRequest run ``fallback`` (plain text).
+
+    - BadRequest → the formatted text was rejected → try ``fallback``.
+    - "Message is not modified" (edits) → treated as success, returns None.
+    - TimedOut / NetworkError → logged, returns None. Not retried: the
+      request has usually reached Telegram already and a resend duplicates.
+    - RetryAfter → re-raised for the queue worker.
+    - Anything else → logged (re-raised when ``raise_on_failure``).
+    """
+    try:
+        return await primary()
+    except RetryAfter:
+        raise
+    except BadRequest as e:
+        if _is_not_modified(e):
+            return None
+        logger.warning("%s: MarkdownV2 rejected, falling back to plain: %s", what, e)
+    except (TimedOut, NetworkError) as e:
+        logger.warning("%s: transport error, not retrying: %s", what, e)
+        if raise_on_failure:
+            raise
+        return None
+    except Exception as e:
+        logger.error("%s failed: %s", what, e)
+        if raise_on_failure:
+            raise
+        return None
+
+    try:
+        return await fallback()
+    except RetryAfter:
+        raise
+    except BadRequest as e:
+        if _is_not_modified(e):
+            return None
+        logger.error("%s: plain-text fallback rejected too: %s", what, e)
+        if raise_on_failure:
+            raise
+        return None
+    except Exception as e:
+        logger.error("%s: plain-text fallback failed: %s", what, e)
+        if raise_on_failure:
+            raise
+        return None
+
 
 async def send_with_fallback(
     bot: Bot,
@@ -63,25 +133,16 @@ async def send_with_fallback(
     RetryAfter is re-raised for caller handling.
     """
     kwargs.setdefault("link_preview_options", NO_LINK_PREVIEW)
-    try:
-        return await bot.send_message(
+    return await run_with_fallback(
+        lambda: bot.send_message(
             chat_id=chat_id,
             text=_ensure_formatted(text),
             parse_mode=PARSE_MODE,
             **kwargs,
-        )
-    except RetryAfter:
-        raise
-    except Exception:
-        try:
-            return await bot.send_message(
-                chat_id=chat_id, text=strip_sentinels(text), **kwargs
-            )
-        except RetryAfter:
-            raise
-        except Exception as e:
-            logger.error(f"Failed to send message to {chat_id}: {e}")
-            return None
+        ),
+        lambda: bot.send_message(chat_id=chat_id, text=strip_sentinels(text), **kwargs),
+        f"send_message({chat_id})",
+    )
 
 
 async def send_photo(
@@ -129,42 +190,95 @@ async def send_photo(
 async def safe_reply(message: Message, text: str, **kwargs: Any) -> Message:
     """Reply with formatting, falling back to plain text on failure."""
     kwargs.setdefault("link_preview_options", NO_LINK_PREVIEW)
-    try:
-        return await message.reply_text(
+    sent = await run_with_fallback(
+        lambda: message.reply_text(
             _ensure_formatted(text),
             parse_mode=PARSE_MODE,
             **kwargs,
-        )
-    except RetryAfter:
-        raise
-    except Exception:
-        try:
-            return await message.reply_text(strip_sentinels(text), **kwargs)
-        except RetryAfter:
-            raise
-        except Exception as e:
-            logger.error(f"Failed to reply: {e}")
-            raise
+        ),
+        lambda: message.reply_text(strip_sentinels(text), **kwargs),
+        "reply_text",
+        raise_on_failure=True,
+    )
+    if sent is None:  # only reachable via "not modified", impossible for replies
+        raise RuntimeError("reply_text returned no message")
+    return sent
 
 
 async def safe_edit(target: Any, text: str, **kwargs: Any) -> None:
     """Edit message with formatting, falling back to plain text on failure."""
     kwargs.setdefault("link_preview_options", NO_LINK_PREVIEW)
-    try:
-        await target.edit_message_text(
+    await run_with_fallback(
+        lambda: target.edit_message_text(
             _ensure_formatted(text),
             parse_mode=PARSE_MODE,
             **kwargs,
+        ),
+        lambda: target.edit_message_text(strip_sentinels(text), **kwargs),
+        "edit_message_text",
+    )
+
+
+async def edit_with_fallback(
+    bot: Bot,
+    chat_id: int,
+    message_id: int,
+    text: str,
+    **kwargs: Any,
+) -> bool:
+    """Edit a message by id with formatting → plain-text fallback.
+
+    Returns True when the edit succeeded, the text was already identical,
+    or the outcome is unknown (transport error — assume delivered so the
+    caller doesn't send a duplicate). Returns False when Telegram rejected
+    the edit (message deleted / too old / both renderings invalid) so the
+    caller can send a fresh message instead.
+    """
+    kwargs.setdefault("link_preview_options", NO_LINK_PREVIEW)
+    what = f"edit_message({message_id})"
+    try:
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=_ensure_formatted(text),
+            parse_mode=PARSE_MODE,
+            **kwargs,
         )
+        return True
     except RetryAfter:
         raise
-    except Exception:
-        try:
-            await target.edit_message_text(strip_sentinels(text), **kwargs)
-        except RetryAfter:
-            raise
-        except Exception as e:
-            logger.error("Failed to edit message: %s", e)
+    except BadRequest as e:
+        if _is_not_modified(e):
+            return True
+        logger.warning("%s: MarkdownV2 rejected, falling back to plain: %s", what, e)
+    except (TimedOut, NetworkError) as e:
+        logger.warning("%s: transport error, not retrying: %s", what, e)
+        return True
+    except Exception as e:
+        logger.error("%s failed: %s", what, e)
+        return False
+
+    try:
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=strip_sentinels(text),
+            **kwargs,
+        )
+        return True
+    except RetryAfter:
+        raise
+    except BadRequest as e:
+        if _is_not_modified(e):
+            return True
+        logger.debug("%s: plain-text fallback rejected: %s", what, e)
+        return False
+    except (TimedOut, NetworkError) as e:
+        logger.warning("%s: transport error on fallback, not retrying: %s", what, e)
+        return True
+    except Exception as e:
+        logger.error("%s: plain-text fallback failed: %s", what, e)
+        return False
 
 
 async def safe_send(
@@ -178,21 +292,13 @@ async def safe_send(
     kwargs.setdefault("link_preview_options", NO_LINK_PREVIEW)
     if message_thread_id is not None:
         kwargs.setdefault("message_thread_id", message_thread_id)
-    try:
-        await bot.send_message(
+    await run_with_fallback(
+        lambda: bot.send_message(
             chat_id=chat_id,
             text=_ensure_formatted(text),
             parse_mode=PARSE_MODE,
             **kwargs,
-        )
-    except RetryAfter:
-        raise
-    except Exception:
-        try:
-            await bot.send_message(
-                chat_id=chat_id, text=strip_sentinels(text), **kwargs
-            )
-        except RetryAfter:
-            raise
-        except Exception as e:
-            logger.error(f"Failed to send message to {chat_id}: {e}")
+        ),
+        lambda: bot.send_message(chat_id=chat_id, text=strip_sentinels(text), **kwargs),
+        f"send_message({chat_id})",
+    )

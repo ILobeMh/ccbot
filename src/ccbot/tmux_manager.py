@@ -16,6 +16,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -52,6 +54,9 @@ class TmuxManager:
         """
         self.session_name = session_name or config.tmux_session_name
         self._server: libtmux.Server | None = None
+        self._list_lock = asyncio.Lock()
+        self._windows_cache: list[TmuxWindow] | None = None
+        self._windows_cache_at = 0.0
 
     @property
     def server(self) -> libtmux.Server:
@@ -98,50 +103,104 @@ class TmuxManager:
             except Exception:
                 pass  # var not set in session env — nothing to remove
 
+    # list_windows() is called by the 1s status poll for every binding plus
+    # every send/capture, so it is cached briefly and done with a single
+    # tmux fork instead of libtmux's per-window list-panes calls.
+    _LIST_WINDOWS_TTL = 0.5
+    _LIST_FORMAT = "\x1f".join(
+        [
+            "#{window_id}",
+            "#{window_name}",
+            "#{pane_current_path}",
+            "#{pane_current_command}",
+            "#{pane_active}",
+        ]
+    )
+
     async def list_windows(self) -> list[TmuxWindow]:
         """List all windows in the session with their working directories.
+
+        Results are cached for _LIST_WINDOWS_TTL seconds. An empty result
+        is double-checked against the session's existence so a transient
+        tmux hiccup never looks like "all windows are gone" to callers
+        that unbind topics based on it.
 
         Returns:
             List of TmuxWindow with window info and cwd
         """
+        async with self._list_lock:
+            now = time.monotonic()
+            if self._windows_cache is not None and (
+                now - self._windows_cache_at < self._LIST_WINDOWS_TTL
+            ):
+                return list(self._windows_cache)
 
-        def _sync_list_windows() -> list[TmuxWindow]:
-            windows = []
-            session = self.get_session()
+            windows = await asyncio.to_thread(self._sync_list_windows)
+            if not windows and not await asyncio.to_thread(self.get_session):
+                # Session unreachable — surface an empty list but do NOT
+                # cache it so the next call re-probes immediately.
+                logger.warning("tmux session '%s' unreachable", self.session_name)
+                return []
 
-            if not session:
-                return windows
+            self._windows_cache = windows
+            self._windows_cache_at = now
+            return list(windows)
 
-            for window in session.windows:
-                name = window.window_name or ""
-                # Skip the main window (placeholder window)
-                if name == config.tmux_main_window_name:
-                    continue
+    def invalidate_windows_cache(self) -> None:
+        """Drop the list_windows cache (after create/kill/rename)."""
+        self._windows_cache = None
 
-                try:
-                    # Get the active pane's current path and command
-                    pane = window.active_pane
-                    if pane:
-                        cwd = pane.pane_current_path or ""
-                        pane_cmd = pane.pane_current_command or ""
-                    else:
-                        cwd = ""
-                        pane_cmd = ""
+    def _sync_list_windows(self) -> list[TmuxWindow]:
+        """Single `tmux list-panes -s` call, parsed with a \x1f separator.
 
-                    windows.append(
-                        TmuxWindow(
-                            window_id=window.window_id or "",
-                            window_name=name,
-                            cwd=cwd,
-                            pane_current_command=pane_cmd,
-                        )
-                    )
-                except Exception as e:
-                    logger.debug(f"Error getting window info: {e}")
+        Avoids libtmux's per-window queries and its zip(strict=True) crash
+        when any format field contains a newline.
+        """
+        try:
+            result = subprocess.run(
+                [
+                    "tmux",
+                    "list-panes",
+                    "-s",
+                    "-t",
+                    self.session_name,
+                    "-F",
+                    self._LIST_FORMAT,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as e:
+            logger.debug("tmux list-panes failed: %s", e)
+            return []
+        if result.returncode != 0:
+            logger.debug("tmux list-panes failed: %s", result.stderr.strip())
+            return []
 
-            return windows
-
-        return await asyncio.to_thread(_sync_list_windows)
+        windows: list[TmuxWindow] = []
+        seen: set[str] = set()
+        for line in result.stdout.splitlines():
+            parts = line.split("\x1f")
+            if len(parts) != 5:
+                continue
+            window_id, name, cwd, pane_cmd, active = parts
+            # One entry per window: prefer the active pane
+            if active != "1" or window_id in seen:
+                continue
+            if name == config.tmux_main_window_name:
+                continue
+            seen.add(window_id)
+            windows.append(
+                TmuxWindow(
+                    window_id=window_id,
+                    window_name=name,
+                    cwd=cwd,
+                    pane_current_command=pane_cmd,
+                )
+            )
+        return windows
 
     async def find_window_by_name(self, window_name: str) -> TmuxWindow | None:
         """Find a window by its name.
@@ -342,6 +401,7 @@ class TmuxManager:
                 if not window:
                     return False
                 window.rename_window(new_name)
+                self.invalidate_windows_cache()
                 logger.info("Renamed window %s to '%s'", window_id, new_name)
                 return True
             except Exception as e:
@@ -362,6 +422,7 @@ class TmuxManager:
                 if not window:
                     return False
                 window.kill()
+                self.invalidate_windows_cache()
                 logger.info("Killed window %s", window_id)
                 return True
             except Exception as e:
@@ -436,6 +497,7 @@ class TmuxManager:
                             cmd = f"{cmd} --resume {resume_session_id}"
                         pane.send_keys(cmd, enter=True)
 
+                self.invalidate_windows_cache()
                 logger.info(
                     "Created window '%s' (id=%s) at %s",
                     final_window_name,

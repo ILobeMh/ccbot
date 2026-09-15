@@ -55,7 +55,7 @@ def read_cwd_from_jsonl(file_path: str | Path) -> str:
     Shared by session.py and session_monitor.py.
     """
     try:
-        with open(file_path, "r", encoding="utf-8") as f:
+        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
                 line = line.strip()
                 if not line:

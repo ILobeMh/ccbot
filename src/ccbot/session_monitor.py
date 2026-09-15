@@ -206,7 +206,9 @@ class SessionMonitor:
         """
         new_entries = []
         try:
-            async with aiofiles.open(file_path, "r", encoding="utf-8") as f:
+            async with aiofiles.open(
+                file_path, "r", encoding="utf-8", errors="replace"
+            ) as f:
                 # Get file size to detect truncation
                 await f.seek(0, 2)  # Seek to end
                 file_size = await f.tell()
