@@ -2396,6 +2396,7 @@ async def post_init(application: Application) -> None:
         BotCommand("history", "Message history for this topic"),
         BotCommand("screenshot", "Terminal screenshot with control keys"),
         BotCommand("esc", "Send Escape to interrupt Claude"),
+        BotCommand("info", "Session internals: tmux window, session id, launch cmd"),
         BotCommand(
             "mode", "Show / switch permission mode (normal, accept, plan, bypass)"
         ),
