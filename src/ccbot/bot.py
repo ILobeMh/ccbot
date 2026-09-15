@@ -37,6 +37,7 @@ import io
 import logging
 import time
 from pathlib import Path
+from typing import Any
 
 from telegram import (
     Bot,
@@ -59,6 +60,7 @@ from telegram.ext import (
 )
 from telegram.request import HTTPXRequest
 
+from .claude_config import ensure_trusted_directory
 from .config import config
 from .handlers.callback_data import (
     CB_ASK_DOWN,
@@ -78,6 +80,10 @@ from .handlers.callback_data import (
     CB_HISTORY_NEXT,
     CB_HISTORY_PREV,
     CB_KEYS_PREFIX,
+    CB_KILL,
+    CB_MODE_CANCEL,
+    CB_MODE_SELECT,
+    CB_RESTART,
     CB_SCREENSHOT_REFRESH,
     CB_SESSION_CANCEL,
     CB_SESSION_NEW,
@@ -91,16 +97,21 @@ from .handlers.directory_browser import (
     BROWSE_DIRS_KEY,
     BROWSE_PAGE_KEY,
     BROWSE_PATH_KEY,
+    RESUME_SESSION_KEY,
+    SELECTED_PATH_KEY,
     SESSIONS_KEY,
     STATE_BROWSING_DIRECTORY,
     STATE_KEY,
+    STATE_SELECTING_MODE,
     STATE_SELECTING_SESSION,
     STATE_SELECTING_WINDOW,
     UNBOUND_WINDOWS_KEY,
     build_directory_browser,
+    build_mode_picker,
     build_session_picker,
     build_window_picker,
     clear_browse_state,
+    clear_mode_picker_state,
     clear_session_picker_state,
     clear_window_picker_state,
 )
@@ -129,13 +140,19 @@ from .handlers.message_sender import (
     send_with_fallback,
 )
 from .handlers.response_builder import build_response_parts
-from .handlers.status_polling import status_poll_loop
+from .handlers.status_polling import mark_launching, status_poll_loop
 from .markdown_v2 import convert_markdown
 from .screenshot import text_to_image
 from .session import session_manager
 from .session_monitor import NewMessage, SessionMonitor
 from .terminal_parser import extract_bash_output, is_interactive_ui
-from .tmux_manager import tmux_manager
+from .tmux_manager import (
+    LAUNCH_MODE_LABELS,
+    LAUNCH_MODES,
+    build_claude_command,
+    normalize_launch_mode,
+    tmux_manager,
+)
 from .transcribe import close_client as close_transcribe_client
 from .transcribe import transcribe_voice
 from .utils import ccbot_dir
@@ -279,6 +296,99 @@ async def unbind_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
 
+async def _restart_claude(
+    user_id: int, wid: str, mode: str | None = None
+) -> tuple[bool, str]:
+    """Stop Claude Code in ``wid`` and relaunch it (resuming its session).
+
+    ``mode`` overrides the stored launch mode. Returns ``(ok, message)``.
+    """
+    window = await tmux_manager.find_window_by_id(wid)
+    if not window:
+        return False, "Window no longer exists."
+    launch = session_manager.get_launch_info(wid)
+    mode = mode or launch.get("mode") or session_manager.get_last_launch_mode(user_id)
+    if mode not in LAUNCH_MODES:
+        mode = "default"
+    ws = session_manager.get_window_state(wid)
+    resume_sid = ws.session_id or None
+    cwd = ws.cwd or window.cwd
+    display = session_manager.get_display_name(wid)
+
+    mark_launching(wid, True)
+    try:
+        if not await tmux_manager.stop_claude(wid):
+            return False, "Could not stop Claude Code in this window."
+        if config.auto_trust_dirs and cwd:
+            await asyncio.to_thread(ensure_trusted_directory, cwd)
+        command = build_claude_command(mode, resume_sid)
+        if not await tmux_manager.start_claude(wid, command):
+            return False, "Failed to type the claude command into the window."
+        ready, note = await _launch_and_register(wid, cwd, display, resume_sid, mode)
+    finally:
+        mark_launching(wid, False)
+    mode_label = LAUNCH_MODE_LABELS.get(mode, mode)
+    what = f"resumed `{resume_sid[:8]}…`" if resume_sid else "started fresh"
+    if ready:
+        extra = f" (answered: {note})" if note != "ready" else ""
+        return True, f"✅ Restarted in {mode_label} mode, {what}{extra}."
+    return False, f"⚠️ Restarted ({what}) but Claude Code is not ready: {note}."
+
+
+async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Restart Claude Code in this topic's window: /restart [normal|accept|plan|bypass]."""
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    if not update.message:
+        return
+    thread_id = _get_thread_id(update)
+    wid = session_manager.resolve_window_for_thread(user.id, thread_id)
+    if not wid:
+        await safe_reply(update.message, "❌ No session bound to this topic.")
+        return
+    mode: str | None = None
+    if context.args:
+        mode = normalize_launch_mode(context.args[0])
+        if mode is None:
+            await safe_reply(
+                update.message,
+                "❌ Unknown mode. Use one of: normal, accept, plan, bypass.",
+            )
+            return
+    progress = await safe_reply(update.message, "⏳ Restarting Claude Code…")
+    ok, msg = await _restart_claude(user.id, wid, mode)
+    await safe_edit(progress, msg)
+    logger.info("restart window=%s user=%d ok=%s", wid, user.id, ok)
+
+
+async def kill_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Kill this topic's tmux window and forget its session."""
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    if not update.message:
+        return
+    thread_id = _get_thread_id(update)
+    if thread_id is None:
+        await safe_reply(update.message, "❌ This command only works in a topic.")
+        return
+    wid = session_manager.get_window_for_thread(user.id, thread_id)
+    if not wid:
+        await safe_reply(update.message, "❌ No session bound to this topic.")
+        return
+    display = session_manager.get_display_name(wid)
+    killed = await tmux_manager.kill_window(wid)
+    session_manager.unbind_thread(user.id, thread_id)
+    await session_manager.remove_session_map_entry(wid)
+    await clear_topic_state(user.id, thread_id, context.bot, context.user_data)
+    if killed:
+        text = f"🗑 Killed window '{display}'. Send a message to start a new session."
+    else:
+        text = f"⚠️ Window '{display}' was already gone; topic unbound."
+    await safe_reply(update.message, text)
+
+
 async def esc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send Escape key to interrupt Claude."""
     user = update.effective_user
@@ -363,6 +473,7 @@ _KEYS_SEND_MAP: dict[str, tuple[str, bool, bool]] = {
     "ent": ("Enter", False, False),
     "spc": ("Space", False, False),
     "tab": ("Tab", False, False),
+    "btab": ("BTab", False, False),  # Shift+Tab: cycle permission mode
     "cc": ("C-c", False, False),
 }
 
@@ -376,6 +487,7 @@ _KEY_LABELS: dict[str, str] = {
     "ent": "⏎ Enter",
     "spc": "␣ Space",
     "tab": "⇥ Tab",
+    "btab": "⇧⇥ Mode",
     "cc": "^C",
 }
 
@@ -395,10 +507,11 @@ def _build_screenshot_keyboard(window_id: str) -> InlineKeyboardMarkup:
             [btn("←", "lt"), btn("↓", "dn"), btn("→", "rt")],
             [btn("⎋ Esc", "esc"), btn("^C", "cc"), btn("⏎ Enter", "ent")],
             [
+                btn("⇧⇥ Mode", "btab"),
                 InlineKeyboardButton(
                     "🔄 Refresh",
                     callback_data=f"{CB_SCREENSHOT_REFRESH}{window_id}"[:64],
-                )
+                ),
             ],
         ]
     )
@@ -878,7 +991,20 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         clear_session_picker_state(context.user_data)
         context.user_data.pop("_pending_thread_id", None)
         context.user_data.pop("_pending_thread_text", None)
-        context.user_data.pop("_selected_path", None)
+        context.user_data.pop(SELECTED_PATH_KEY, None)
+
+    # Ignore text in mode picker mode (only for the same thread)
+    if context.user_data and context.user_data.get(STATE_KEY) == STATE_SELECTING_MODE:
+        pending_tid = context.user_data.get("_pending_thread_id")
+        if pending_tid == thread_id:
+            await safe_reply(
+                update.message,
+                "Please choose a mode above, or tap Cancel.",
+            )
+            return
+        clear_mode_picker_state(context.user_data)
+        context.user_data.pop("_pending_thread_id", None)
+        context.user_data.pop("_pending_thread_text", None)
 
     # Must be in a named topic
     if thread_id is None:
@@ -1016,7 +1142,112 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await handle_interactive_ui(context.bot, user.id, wid, thread_id)
 
 
-# --- Window creation helper ---
+# --- Window creation helpers ---
+
+
+async def _present(update: Update, text: str, keyboard: Any = None) -> None:
+    """Edit the callback message if this is a button press, else reply."""
+    if update.callback_query:
+        await safe_edit(update.callback_query, text, reply_markup=keyboard)
+    elif update.message:
+        await safe_reply(update.message, text, reply_markup=keyboard)
+
+
+async def _show_mode_picker(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    selected_path: str,
+    resume_session_id: str | None = None,
+) -> None:
+    """Ask which permission mode to launch Claude Code with."""
+    user = update.effective_user
+    last_mode = session_manager.get_last_launch_mode(user.id) if user else "default"
+    if last_mode not in LAUNCH_MODES:
+        last_mode = "default"
+    if context.user_data is not None:
+        context.user_data[STATE_KEY] = STATE_SELECTING_MODE
+        context.user_data[SELECTED_PATH_KEY] = selected_path
+        if resume_session_id:
+            context.user_data[RESUME_SESSION_KEY] = resume_session_id
+        else:
+            context.user_data.pop(RESUME_SESSION_KEY, None)
+    text, keyboard = build_mode_picker(selected_path, last_mode, resume_session_id)
+    await _present(update, text, keyboard)
+
+
+async def _on_directory_chosen(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    selected_path: str,
+) -> None:
+    """Directory picked (browser or typed path): session picker or mode picker."""
+    sessions = await session_manager.list_sessions_for_directory(selected_path)
+    if sessions:
+        if context.user_data is not None:
+            context.user_data[STATE_KEY] = STATE_SELECTING_SESSION
+            context.user_data[SESSIONS_KEY] = sessions
+            context.user_data[SELECTED_PATH_KEY] = selected_path
+        text, keyboard = build_session_picker(sessions)
+        await _present(update, text, keyboard)
+        return
+    await _show_mode_picker(update, context, selected_path)
+
+
+async def _launch_and_register(
+    window_id: str,
+    selected_path: str,
+    window_name: str,
+    resume_session_id: str | None,
+    mode: str,
+) -> tuple[bool, str]:
+    """Wait for Claude Code to come up in ``window_id`` and register it.
+
+    Handles startup dialogs, waits for the SessionStart hook, and forces
+    the session_map entry for --resume. Returns ``(ready, note)``.
+    """
+    session_manager.set_launch_info(
+        window_id, mode, build_claude_command(mode, resume_session_id)
+    )
+    ready, note = await tmux_manager.wait_for_claude_ready(window_id, timeout=45.0)
+    if not ready:
+        logger.warning("Claude not ready in %s: %s", window_id, note)
+
+    # The hook fires only once Claude is past its startup dialogs, so wait
+    # for it after the prompt is visible. Resume loads state and is slower.
+    hook_timeout = 20.0 if resume_session_id else 10.0
+    hook_ok = await session_manager.wait_for_session_map_entry(
+        window_id, timeout=hook_timeout
+    )
+    if not hook_ok:
+        logger.warning("SessionStart hook did not register window %s", window_id)
+
+    # --resume: messages keep writing to the resumed session's JSONL, and
+    # current Claude Code reports the original session_id in the
+    # SessionStart hook (source="resume"), so normally nothing to fix up.
+    # If the hook timed out or reported a different id (older CC versions),
+    # force both window_state AND session_map to the resumed id —
+    # session_map drives the monitor's watch list, and load_session_map()
+    # would revert a window_state-only override on the next poll cycle.
+    if resume_session_id:
+        ws = session_manager.get_window_state(window_id)
+        if ws.session_id != resume_session_id:
+            logger.info(
+                "Resume override: window %s session_id %r -> %s",
+                window_id,
+                ws.session_id,
+                resume_session_id,
+            )
+            ws.session_id = resume_session_id
+            ws.cwd = str(selected_path)
+            ws.window_name = window_name
+            session_manager._save_state()
+        await session_manager.override_session_map_entry(
+            window_id,
+            resume_session_id,
+            cwd=str(selected_path),
+            window_name=window_name,
+        )
+    return ready, note
 
 
 async def _create_and_bind_window(
@@ -1026,127 +1257,110 @@ async def _create_and_bind_window(
     selected_path: str,
     pending_thread_id: int | None,
     resume_session_id: str | None = None,
+    mode: str = "default",
 ) -> None:
     """Create a tmux window, bind it to a topic, and forward pending text.
 
-    Shared by CB_DIR_CONFIRM (no sessions), CB_SESSION_NEW, and CB_SESSION_SELECT.
+    Shared by the mode picker (new and resumed sessions).
     """
     from telegram import CallbackQuery, User
 
     assert isinstance(query, CallbackQuery)
     assert isinstance(user, User)
 
+    if config.auto_trust_dirs:
+        await asyncio.to_thread(ensure_trusted_directory, selected_path)
+
     success, message, created_wname, created_wid = await tmux_manager.create_window(
-        selected_path, resume_session_id=resume_session_id
+        selected_path, resume_session_id=resume_session_id, mode=mode
     )
-    if success:
-        logger.info(
-            "Window created: %s (id=%s) at %s (user=%d, thread=%s, resume=%s)",
-            created_wname,
-            created_wid,
-            selected_path,
-            user.id,
-            pending_thread_id,
-            resume_session_id,
-        )
-        # Wait for Claude Code's SessionStart hook to register in session_map.
-        # Resume sessions take longer to start (loading session state), so use
-        # a longer timeout to avoid silently dropping messages.
-        hook_timeout = 15.0 if resume_session_id else 5.0
-        hook_ok = await session_manager.wait_for_session_map_entry(
-            created_wid, timeout=hook_timeout
-        )
-
-        # --resume: messages keep writing to the resumed session's JSONL, and
-        # current Claude Code reports the original session_id in the
-        # SessionStart hook (source="resume"), so normally nothing to fix up.
-        # If the hook timed out or reported a different id (older CC versions),
-        # force both window_state AND session_map to the resumed id —
-        # session_map drives the monitor's watch list, and load_session_map()
-        # would revert a window_state-only override on the next poll cycle.
-        if resume_session_id:
-            ws = session_manager.get_window_state(created_wid)
-            if not hook_ok:
-                logger.warning(
-                    "Hook timed out for resume window %s, "
-                    "manually setting session_id=%s cwd=%s",
-                    created_wid,
-                    resume_session_id,
-                    selected_path,
-                )
-                ws.session_id = resume_session_id
-                ws.cwd = str(selected_path)
-                ws.window_name = created_wname
-                session_manager._save_state()
-            elif ws.session_id != resume_session_id:
-                logger.info(
-                    "Resume override: window %s session_id %s -> %s",
-                    created_wid,
-                    ws.session_id,
-                    resume_session_id,
-                )
-                ws.session_id = resume_session_id
-                session_manager._save_state()
-            await session_manager.override_session_map_entry(
-                created_wid,
-                resume_session_id,
-                cwd=str(selected_path),
-                window_name=created_wname,
-            )
-
-        if pending_thread_id is not None:
-            # Thread bind flow: bind thread to newly created window
-            session_manager.bind_thread(
-                user.id, pending_thread_id, created_wid, window_name=created_wname
-            )
-
-            status = "Resumed" if resume_session_id else "Created"
-            await safe_edit(
-                query,
-                f"✅ {message}\n\n{status}. Send messages here.",
-            )
-
-            # Send pending text if any
-            pending_text = (
-                context.user_data.get("_pending_thread_text")
-                if context.user_data
-                else None
-            )
-            if pending_text:
-                logger.debug(
-                    "Forwarding pending text to window %s (len=%d)",
-                    created_wname,
-                    len(pending_text),
-                )
-                if context.user_data is not None:
-                    context.user_data.pop("_pending_thread_text", None)
-                    context.user_data.pop("_pending_thread_id", None)
-                send_ok, send_msg = await session_manager.send_to_window(
-                    created_wid,
-                    pending_text,
-                )
-                if not send_ok:
-                    logger.warning("Failed to forward pending text: %s", send_msg)
-                    resolved_chat = session_manager.resolve_chat_id(
-                        user.id, pending_thread_id
-                    )
-                    await safe_send(
-                        context.bot,
-                        resolved_chat,
-                        f"❌ Failed to send pending message: {send_msg}",
-                        message_thread_id=pending_thread_id,
-                    )
-            elif context.user_data is not None:
-                context.user_data.pop("_pending_thread_id", None)
-        else:
-            # Should not happen in topic-only mode, but handle gracefully
-            await safe_edit(query, f"✅ {message}")
-    else:
+    if not success:
         await safe_edit(query, f"❌ {message}")
         if pending_thread_id is not None and context.user_data is not None:
             context.user_data.pop("_pending_thread_id", None)
             context.user_data.pop("_pending_thread_text", None)
-    await query.answer("Created" if success else "Failed")
+        await query.answer("Failed")
+        return
+
+    logger.info(
+        "Window created: %s (id=%s) at %s (user=%d, thread=%s, resume=%s, mode=%s)",
+        created_wname,
+        created_wid,
+        selected_path,
+        user.id,
+        pending_thread_id,
+        resume_session_id,
+        mode,
+    )
+    await query.answer("Starting Claude Code…")
+    await safe_edit(query, f"⏳ {message}\n\nStarting Claude Code ({mode})…")
+
+    # Bind first so status polling can already show what's happening
+    if pending_thread_id is not None:
+        session_manager.bind_thread(
+            user.id, pending_thread_id, created_wid, window_name=created_wname
+        )
+
+    mark_launching(created_wid, True)
+    try:
+        ready, note = await _launch_and_register(
+            created_wid, selected_path, created_wname, resume_session_id, mode
+        )
+    finally:
+        mark_launching(created_wid, False)
+
+    status = "Resumed" if resume_session_id else "Created"
+    mode_label = LAUNCH_MODE_LABELS.get(mode, mode)
+    if ready:
+        extra = f" (answered: {note})" if note != "ready" else ""
+        await safe_edit(
+            query,
+            f"✅ {message}\n\n{status} in {mode_label} mode{extra}. Send messages here.",
+        )
+    else:
+        await safe_edit(
+            query,
+            f"⚠️ {message}\n\nClaude Code did not become ready: {note}.\n"
+            "Check /screenshot, or /restart to relaunch.",
+        )
+
+    if pending_thread_id is None:
+        return
+
+    # Forward the first message (typed before the session existed) only
+    # once Claude is actually accepting input.
+    pending_text = (
+        context.user_data.get("_pending_thread_text") if context.user_data else None
+    )
+    if context.user_data is not None:
+        context.user_data.pop("_pending_thread_text", None)
+        context.user_data.pop("_pending_thread_id", None)
+    if not pending_text:
+        return
+    resolved_chat = session_manager.resolve_chat_id(user.id, pending_thread_id)
+    if not ready:
+        await safe_send(
+            context.bot,
+            resolved_chat,
+            "⚠️ Your first message was not sent (Claude Code isn't ready). "
+            "Please resend it once the session is up.",
+            message_thread_id=pending_thread_id,
+        )
+        return
+    logger.debug(
+        "Forwarding pending text to window %s (len=%d)",
+        created_wname,
+        len(pending_text),
+    )
+    send_ok, send_msg = await session_manager.send_to_window(created_wid, pending_text)
+    if not send_ok:
+        logger.warning("Failed to forward pending text: %s", send_msg)
+        await safe_send(
+            context.bot,
+            resolved_chat,
+            f"❌ Failed to send pending message: {send_msg}",
+            message_thread_id=pending_thread_id,
+        )
 
 
 # --- Callback query handler ---
@@ -1338,24 +1552,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             return
 
         clear_browse_state(context.user_data)
-
-        # Check for existing sessions in this directory
-        sessions = await session_manager.list_sessions_for_directory(selected_path)
-        if sessions:
-            # Show session picker — store state for later
-            if context.user_data is not None:
-                context.user_data[STATE_KEY] = STATE_SELECTING_SESSION
-                context.user_data[SESSIONS_KEY] = sessions
-                context.user_data["_selected_path"] = selected_path
-            text, keyboard = build_session_picker(sessions)
-            await safe_edit(query, text, reply_markup=keyboard)
-            await query.answer()
-            return
-
-        # No existing sessions — create new window directly
-        await _create_and_bind_window(
-            query, context, user, selected_path, pending_thread_id
-        )
+        await _on_directory_chosen(update, context, selected_path)
+        await query.answer()
 
     elif data == CB_DIR_CANCEL:
         pending_tid = (
@@ -1398,22 +1596,15 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
         session = cached_sessions[idx]
         selected_path = (
-            context.user_data.get("_selected_path", str(Path.cwd()))
+            context.user_data.get(SELECTED_PATH_KEY, str(Path.cwd()))
             if context.user_data
             else str(Path.cwd())
         )
         clear_session_picker_state(context.user_data)
-        if context.user_data is not None:
-            context.user_data.pop("_selected_path", None)
-
-        await _create_and_bind_window(
-            query,
-            context,
-            user,
-            selected_path,
-            pending_tid,
-            resume_session_id=session.session_id,
+        await _show_mode_picker(
+            update, context, selected_path, resume_session_id=session.session_id
         )
+        await query.answer()
 
     elif data == CB_SESSION_NEW:
         pending_tid = (
@@ -1425,15 +1616,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.answer("Stale picker (topic mismatch)", show_alert=True)
             return
         selected_path = (
-            context.user_data.get("_selected_path", str(Path.cwd()))
+            context.user_data.get(SELECTED_PATH_KEY, str(Path.cwd()))
             if context.user_data
             else str(Path.cwd())
         )
         clear_session_picker_state(context.user_data)
-        if context.user_data is not None:
-            context.user_data.pop("_selected_path", None)
-
-        await _create_and_bind_window(query, context, user, selected_path, pending_tid)
+        await _show_mode_picker(update, context, selected_path)
+        await query.answer()
 
     elif data == CB_SESSION_CANCEL:
         pending_tid = (
@@ -1446,7 +1635,49 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if context.user_data is not None:
             context.user_data.pop("_pending_thread_id", None)
             context.user_data.pop("_pending_thread_text", None)
-            context.user_data.pop("_selected_path", None)
+            context.user_data.pop(SELECTED_PATH_KEY, None)
+        await safe_edit(query, "Cancelled")
+        await query.answer("Cancelled")
+
+    # Launch-mode picker: start Claude Code
+    elif data.startswith(CB_MODE_SELECT):
+        pending_tid = (
+            context.user_data.get("_pending_thread_id") if context.user_data else None
+        )
+        if pending_tid is None:
+            pending_tid = _get_thread_id(update)
+        if pending_tid is not None and _get_thread_id(update) != pending_tid:
+            await query.answer("Stale picker (topic mismatch)", show_alert=True)
+            return
+        mode = data[len(CB_MODE_SELECT) :]
+        if mode not in LAUNCH_MODES:
+            await query.answer("Unknown mode")
+            return
+        selected_path = (
+            context.user_data.get(SELECTED_PATH_KEY, str(Path.cwd()))
+            if context.user_data
+            else str(Path.cwd())
+        )
+        resume_sid = (
+            context.user_data.get(RESUME_SESSION_KEY) if context.user_data else None
+        )
+        clear_mode_picker_state(context.user_data)
+        session_manager.set_last_launch_mode(user.id, mode)
+        await _create_and_bind_window(
+            query,
+            context,
+            user,
+            selected_path,
+            pending_tid,
+            resume_session_id=resume_sid,
+            mode=mode,
+        )
+
+    elif data == CB_MODE_CANCEL:
+        clear_mode_picker_state(context.user_data)
+        if context.user_data is not None:
+            context.user_data.pop("_pending_thread_id", None)
+            context.user_data.pop("_pending_thread_text", None)
         await safe_edit(query, "Cancelled")
         await query.answer("Cancelled")
 
@@ -1688,6 +1919,41 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
         await query.answer("🔄")
 
+    # Health notification buttons
+    elif data.startswith(CB_RESTART):
+        window_id = data[len(CB_RESTART) :]
+        thread_id = _get_thread_id(update)
+        bound = session_manager.resolve_window_for_thread(user.id, thread_id)
+        if bound != window_id:
+            await query.answer("This topic is no longer bound to that window")
+            return
+        await query.answer("Restarting…")
+        await safe_edit(query, "⏳ Restarting Claude Code…")
+        ok, msg = await _restart_claude(user.id, window_id)
+        await safe_edit(query, msg)
+        logger.info("restart(button) window=%s user=%d ok=%s", window_id, user.id, ok)
+
+    elif data.startswith(CB_KILL):
+        window_id = data[len(CB_KILL) :]
+        thread_id = _get_thread_id(update)
+        if thread_id is None:
+            await query.answer("Only in a topic")
+            return
+        bound = session_manager.get_window_for_thread(user.id, thread_id)
+        if bound != window_id:
+            await query.answer("This topic is no longer bound to that window")
+            return
+        display = session_manager.get_display_name(window_id)
+        await tmux_manager.kill_window(window_id)
+        session_manager.unbind_thread(user.id, thread_id)
+        await session_manager.remove_session_map_entry(window_id)
+        await clear_topic_state(user.id, thread_id, context.bot, context.user_data)
+        await safe_edit(
+            query,
+            f"🗑 Killed window '{display}'. Send a message to start a new session.",
+        )
+        await query.answer("Killed")
+
     # Screenshot quick keys: send key to tmux window
     elif data.startswith(CB_KEYS_PREFIX):
         rest = data[len(CB_KEYS_PREFIX) :]
@@ -1844,7 +2110,8 @@ async def post_init(application: Application) -> None:
         BotCommand("history", "Message history for this topic"),
         BotCommand("screenshot", "Terminal screenshot with control keys"),
         BotCommand("esc", "Send Escape to interrupt Claude"),
-        BotCommand("kill", "Kill session and delete topic"),
+        BotCommand("restart", "Restart Claude Code (resumes session; add a mode)"),
+        BotCommand("kill", "Kill the tmux window and forget the session"),
         BotCommand("unbind", "Unbind topic from session (keeps window running)"),
         BotCommand("usage", "Show Claude Code usage remaining"),
     ]
@@ -1949,6 +2216,8 @@ def create_bot() -> Application:
     application.add_handler(CommandHandler("history", history_command))
     application.add_handler(CommandHandler("screenshot", screenshot_command))
     application.add_handler(CommandHandler("esc", esc_command))
+    application.add_handler(CommandHandler("restart", restart_command))
+    application.add_handler(CommandHandler("kill", kill_command))
     application.add_handler(CommandHandler("unbind", unbind_command))
     application.add_handler(CommandHandler("usage", usage_command))
     application.add_handler(CallbackQueryHandler(callback_handler))

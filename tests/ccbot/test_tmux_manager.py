@@ -83,3 +83,59 @@ class TestListWindows:
         assert await mgr.list_windows() == []
         assert await mgr.list_windows() == []
         assert calls == 1
+
+
+class TestBuildClaudeCommand:
+    @pytest.fixture(autouse=True)
+    def _cfg(self, monkeypatch):
+        monkeypatch.setattr(tm.config, "claude_command", "claude")
+        monkeypatch.setattr(tm.os, "geteuid", lambda: 1000)
+
+    def test_default_allows_bypass_cycle(self):
+        assert tm.build_claude_command("default") == (
+            "claude --allow-dangerously-skip-permissions"
+        )
+
+    def test_bypass(self):
+        assert tm.build_claude_command("bypassPermissions") == (
+            "claude --dangerously-skip-permissions"
+        )
+
+    def test_plan_with_resume(self):
+        sid = "550e8400-e29b-41d4-a716-446655440000"
+        assert tm.build_claude_command("plan", sid) == (
+            f"claude --permission-mode plan --allow-dangerously-skip-permissions "
+            f"--resume {sid}"
+        )
+
+    def test_root_never_gets_allow_flag(self, monkeypatch):
+        monkeypatch.setattr(tm.os, "geteuid", lambda: 0)
+        assert tm.build_claude_command("acceptEdits") == (
+            "claude --permission-mode acceptEdits"
+        )
+
+    def test_custom_claude_command(self, monkeypatch):
+        monkeypatch.setattr(tm.config, "claude_command", "IS_SANDBOX=1 claude")
+        assert tm.build_claude_command("bypassPermissions").startswith(
+            "IS_SANDBOX=1 claude --dangerously"
+        )
+
+
+class TestNormalizeLaunchMode:
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            ("normal", "default"),
+            ("Default", "default"),
+            ("accept", "acceptEdits"),
+            ("acceptEdits", "acceptEdits"),
+            ("plan", "plan"),
+            ("bypass", "bypassPermissions"),
+            ("yolo", "bypassPermissions"),
+            ("nonsense", None),
+            ("", None),
+            (None, None),
+        ],
+    )
+    def test_aliases(self, raw, expected):
+        assert tm.normalize_launch_mode(raw) == expected

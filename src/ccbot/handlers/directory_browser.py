@@ -3,6 +3,8 @@
 Provides UIs in Telegram for:
   - Window picker: list unbound tmux windows for quick binding
   - Directory browser: navigate directory hierarchies to create new sessions
+  - Session picker: resume an existing Claude session in that directory
+  - Mode picker: choose the permission mode Claude Code is launched with
 
 Key components:
   - DIRS_PER_PAGE: Number of directories shown per page
@@ -21,12 +23,15 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from ..config import config
 from ..session import ClaudeSession
+from ..tmux_manager import LAUNCH_MODE_LABELS, LAUNCH_MODES
 from .callback_data import (
     CB_DIR_CANCEL,
     CB_DIR_CONFIRM,
     CB_DIR_PAGE,
     CB_DIR_SELECT,
     CB_DIR_UP,
+    CB_MODE_CANCEL,
+    CB_MODE_SELECT,
     CB_SESSION_CANCEL,
     CB_SESSION_NEW,
     CB_SESSION_SELECT,
@@ -48,6 +53,9 @@ BROWSE_DIRS_KEY = "browse_dirs"  # Cache of subdirs for current path
 UNBOUND_WINDOWS_KEY = "unbound_windows"  # Cache of (name, cwd) tuples
 STATE_SELECTING_SESSION = "selecting_session"
 SESSIONS_KEY = "cached_sessions"  # Cache of ClaudeSession list
+STATE_SELECTING_MODE = "selecting_mode"
+SELECTED_PATH_KEY = "_selected_path"
+RESUME_SESSION_KEY = "_resume_session_id"
 
 
 def clear_browse_state(user_data: dict | None) -> None:
@@ -71,6 +79,56 @@ def clear_session_picker_state(user_data: dict | None) -> None:
     if user_data is not None:
         user_data.pop(STATE_KEY, None)
         user_data.pop(SESSIONS_KEY, None)
+
+
+def clear_mode_picker_state(user_data: dict | None) -> None:
+    """Clear launch-mode picker state keys from user_data."""
+    if user_data is not None:
+        user_data.pop(STATE_KEY, None)
+        user_data.pop(SELECTED_PATH_KEY, None)
+        user_data.pop(RESUME_SESSION_KEY, None)
+
+
+def build_mode_picker(
+    selected_path: str,
+    last_mode: str,
+    resume_session_id: str | None = None,
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Build the launch-mode picker shown right before starting Claude Code.
+
+    The user's last choice is listed first and marked with •.
+    """
+    action = "Resume" if resume_session_id else "Start"
+    lines = [
+        f"*{action} Claude Code in:*",
+        f"`{_escape_md(selected_path)}`",
+        "",
+        "Choose the permission mode:",
+        "• *Normal* — asks before edits/commands",
+        "• *Accept edits* — file edits auto-approved",
+        "• *Plan* — read-only planning first",
+        "• *Skip permissions* — `--dangerously-skip-permissions`",
+    ]
+    order = [last_mode] + [m for m in LAUNCH_MODES if m != last_mode]
+    buttons: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for mode in order:
+        label = LAUNCH_MODE_LABELS[mode]
+        if mode == last_mode:
+            label = f"• {label}"
+        row.append(InlineKeyboardButton(label, callback_data=f"{CB_MODE_SELECT}{mode}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton("Cancel", callback_data=CB_MODE_CANCEL)])
+    return "\n".join(lines), InlineKeyboardMarkup(buttons)
+
+
+def _escape_md(text: str) -> str:
+    """Escape backticks so a path survives inside an inline code span."""
+    return text.replace("`", "'")
 
 
 def build_window_picker(

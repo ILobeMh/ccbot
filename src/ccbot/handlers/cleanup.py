@@ -47,3 +47,5 @@ async def clear_topic_state(
         if user_data.get("_pending_thread_id") == thread_id:
             user_data.pop("_pending_thread_id", None)
             user_data.pop("_pending_thread_text", None)
+            user_data.pop("_selected_path", None)
+            user_data.pop("_resume_session_id", None)

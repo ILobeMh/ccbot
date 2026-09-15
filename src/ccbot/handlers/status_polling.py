@@ -3,6 +3,9 @@
 Provides background polling of terminal status lines for all active users:
   - Detects Claude Code status (working, waiting, etc.)
   - Detects interactive UIs (permission prompts) not triggered via JSONL
+  - Answers startup dialogs (trust folder, …) on the bot's behalf
+  - Notifies once when Claude Code exited (shell prompt) or an update is
+    installed, with Restart / Kill buttons
   - Updates status messages in Telegram
   - Polls thread_bindings (each topic = one window)
   - Periodically probes topic existence via unpin_all_forum_topic_messages
@@ -20,17 +23,19 @@ import asyncio
 import logging
 import time
 
-from telegram import Bot
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest
 
 from ..session import session_manager
 from ..terminal_parser import (
     AUTO_ANSWER_DIALOGS,
     extract_interactive_content,
+    has_update_pending,
     is_interactive_ui,
     parse_status_line,
 )
-from ..tmux_manager import tmux_manager
+from ..tmux_manager import SHELL_COMMANDS, tmux_manager
+from .callback_data import CB_KILL, CB_RESTART
 from .cleanup import clear_topic_state
 from .interactive_ui import (
     clear_interactive_msg,
@@ -38,6 +43,7 @@ from .interactive_ui import (
     handle_interactive_ui,
 )
 from .message_queue import enqueue_status_update, get_message_queue
+from .message_sender import safe_send
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +52,88 @@ STATUS_POLL_INTERVAL = 1.0  # seconds - faster response (rate limiting at send l
 
 # Topic existence probe interval
 TOPIC_CHECK_INTERVAL = 60.0  # seconds
+
+
+# Windows the bot is currently (re)starting Claude in — health checks are
+# suppressed for them so the transient shell prompt isn't reported.
+_launching: set[str] = set()
+# Consecutive polls that saw a shell prompt, per window
+_shell_polls: dict[str, int] = {}
+# Windows already notified about "Claude exited" / "update pending"
+_exit_notified: set[str] = set()
+_update_notified: set[str] = set()
+SHELL_POLLS_BEFORE_NOTIFY = 5
+
+
+def mark_launching(window_id: str, launching: bool) -> None:
+    """Suppress health notifications while the bot restarts Claude itself."""
+    if launching:
+        _launching.add(window_id)
+    else:
+        _launching.discard(window_id)
+        _shell_polls.pop(window_id, None)
+        _exit_notified.discard(window_id)
+        _update_notified.discard(window_id)
+
+
+def _health_keyboard(window_id: str, with_kill: bool) -> InlineKeyboardMarkup:
+    row = [
+        InlineKeyboardButton(
+            "🔄 Restart", callback_data=f"{CB_RESTART}{window_id}"[:64]
+        )
+    ]
+    if with_kill:
+        row.append(
+            InlineKeyboardButton("🗑 Kill", callback_data=f"{CB_KILL}{window_id}"[:64])
+        )
+    return InlineKeyboardMarkup([row])
+
+
+async def _check_window_health(
+    bot: Bot,
+    user_id: int,
+    window_id: str,
+    thread_id: int | None,
+    pane_cmd: str,
+    pane_text: str,
+) -> None:
+    """Notify (once) when Claude exited or an update wants a restart."""
+    if window_id in _launching:
+        return
+    chat_id = session_manager.resolve_chat_id(user_id, thread_id)
+    display = session_manager.get_display_name(window_id)
+
+    if pane_cmd in SHELL_COMMANDS:
+        n = _shell_polls.get(window_id, 0) + 1
+        _shell_polls[window_id] = n
+        if n >= SHELL_POLLS_BEFORE_NOTIFY and window_id not in _exit_notified:
+            _exit_notified.add(window_id)
+            await safe_send(
+                bot,
+                chat_id,
+                f"⚠️ Claude Code is not running in '{display}' (shell prompt). "
+                "Restart it or kill the window.",
+                message_thread_id=thread_id,
+                reply_markup=_health_keyboard(window_id, with_kill=True),
+            )
+        return
+
+    if _shell_polls.pop(window_id, None):
+        _exit_notified.discard(window_id)
+
+    if has_update_pending(pane_text):
+        if window_id not in _update_notified:
+            _update_notified.add(window_id)
+            await safe_send(
+                bot,
+                chat_id,
+                f"✔ Claude Code update installed in '{display}'. "
+                "Restart to apply it (the session is resumed).",
+                message_thread_id=thread_id,
+                reply_markup=_health_keyboard(window_id, with_kill=False),
+            )
+    else:
+        _update_notified.discard(window_id)
 
 
 async def update_status_message(
@@ -77,6 +165,12 @@ async def update_status_message(
     if not pane_text:
         # Transient capture failure - keep existing status message
         return
+
+    await _check_window_health(
+        bot, user_id, window_id, thread_id, w.pane_current_command, pane_text
+    )
+    if w.pane_current_command in SHELL_COMMANDS:
+        return  # nothing to parse in a shell
 
     interactive_window = get_interactive_window(user_id, thread_id)
     should_check_new_ui = True

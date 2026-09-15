@@ -96,6 +96,15 @@ class Config:
             os.getenv("CCBOT_SHOW_TOOL_CALLS", "true").lower() != "false"
         )
 
+        # Default permission mode for new sessions when the user has no
+        # remembered choice: default | acceptEdits | plan | bypassPermissions
+        self.claude_permission_mode = os.getenv("CLAUDE_PERMISSION_MODE", "default")
+
+        # Pre-trust directories in ~/.claude.json before launching claude
+        self.auto_trust_dirs = (
+            os.getenv("CCBOT_AUTO_TRUST_DIRS", "true").lower() != "false"
+        )
+
         # Show Claude's thinking blocks (as collapsed expandable quotes)
         self.show_thinking = os.getenv("CCBOT_SHOW_THINKING", "true").lower() != "false"
 

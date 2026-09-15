@@ -49,3 +49,12 @@ CB_SESSION_CANCEL = "rs:cancel"  # cancel
 
 # Screenshot control keys
 CB_KEYS_PREFIX = "kb:"  # kb:<key_id>:<window>
+
+# Launch mode picker (new session) and mode switching (running session)
+CB_MODE_SELECT = "md:sel:"  # md:sel:<mode>
+CB_MODE_CANCEL = "md:cancel"
+CB_MODE_SET = "md:set:"  # md:set:<mode>:<window>  (Shift+Tab cycling)
+
+# Window lifecycle
+CB_RESTART = "rw:go:"  # rw:go:<window>[:<mode>]
+CB_KILL = "rw:kill:"  # rw:kill:<window>

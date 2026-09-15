@@ -117,6 +117,12 @@ class SessionManager:
     # History: originally added in 5afc111, erroneously removed in 26cb81f,
     # restored in PR #23.
     group_chat_ids: dict[str, int] = field(default_factory=dict)
+    # window_id -> {"mode": launch mode, "command": shell command used}
+    # Kept separately from window_states because those are pruned against
+    # session_map.json, which has no entry until the hook fires.
+    window_launch_info: dict[str, dict[str, str]] = field(default_factory=dict)
+    # user_id -> last launch mode chosen in the mode picker
+    last_launch_modes: dict[int, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self._load_state()
@@ -133,6 +139,10 @@ class SessionManager:
             },
             "window_display_names": self.window_display_names,
             "group_chat_ids": self.group_chat_ids,
+            "window_launch_info": self.window_launch_info,
+            "last_launch_modes": {
+                str(uid): mode for uid, mode in self.last_launch_modes.items()
+            },
         }
         atomic_write_json(config.state_file, state)
         logger.debug("State saved to %s", config.state_file)
@@ -166,6 +176,15 @@ class SessionManager:
                 self.group_chat_ids = {
                     k: int(v) for k, v in state.get("group_chat_ids", {}).items()
                 }
+                self.window_launch_info = {
+                    k: dict(v)
+                    for k, v in state.get("window_launch_info", {}).items()
+                    if isinstance(v, dict)
+                }
+                self.last_launch_modes = {
+                    int(uid): str(mode)
+                    for uid, mode in state.get("last_launch_modes", {}).items()
+                }
 
                 # Detect old format: keys that don't look like window IDs
                 needs_migration = False
@@ -196,6 +215,8 @@ class SessionManager:
                 self.thread_bindings = {}
                 self.window_display_names = {}
                 self.group_chat_ids = {}
+                self.window_launch_info = {}
+                self.last_launch_modes = {}
                 pass
 
     async def resolve_stale_ids(self) -> None:
@@ -459,6 +480,20 @@ class SessionManager:
 
         if await asyncio.to_thread(self._mutate_session_map_locked, mutate):
             logger.info("session_map override: %s -> session_id=%s", key, session_id)
+
+    async def remove_session_map_entry(self, window_id: str) -> None:
+        """Drop a window's session_map entry (after /kill) so the monitor stops."""
+        key = f"{config.tmux_session_name}:{window_id}"
+
+        def mutate(session_map: dict[str, dict]) -> bool:
+            return session_map.pop(key, None) is not None
+
+        if await asyncio.to_thread(self._mutate_session_map_locked, mutate):
+            logger.info("session_map entry removed: %s", key)
+        self.window_states.pop(window_id, None)
+        self.window_display_names.pop(window_id, None)
+        self.window_launch_info.pop(window_id, None)
+        self._save_state()
 
     async def _migrate_old_format_session_map_keys(
         self, live_by_name: dict[str, str]
@@ -854,6 +889,27 @@ class SessionManager:
             return file_path
         matches = list(config.claude_projects_path.glob(f"*/{state.session_id}.jsonl"))
         return matches[0] if matches else None
+
+    # --- Launch info (mode / command) ---
+
+    def set_launch_info(self, window_id: str, mode: str, command: str) -> None:
+        self.window_launch_info[window_id] = {"mode": mode, "command": command}
+        self._save_state()
+
+    def get_launch_info(self, window_id: str) -> dict[str, str]:
+        return self.window_launch_info.get(window_id, {})
+
+    def drop_launch_info(self, window_id: str) -> None:
+        if self.window_launch_info.pop(window_id, None) is not None:
+            self._save_state()
+
+    def get_last_launch_mode(self, user_id: int) -> str:
+        return self.last_launch_modes.get(user_id) or config.claude_permission_mode
+
+    def set_last_launch_mode(self, user_id: int, mode: str) -> None:
+        if self.last_launch_modes.get(user_id) != mode:
+            self.last_launch_modes[user_id] = mode
+            self._save_state()
 
     # --- User window offset management ---
 

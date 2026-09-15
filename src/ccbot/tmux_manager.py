@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import subprocess
 import time
@@ -31,6 +32,64 @@ from .terminal_parser import (
     is_blocking_dialog,
     is_prompt_ready,
 )
+
+# Launch modes → extra `claude` CLI flags. Keys double as the canonical
+# permission-mode names (as reported by hooks / `--permission-mode`).
+LAUNCH_MODES: dict[str, str] = {
+    "default": "",
+    "acceptEdits": "--permission-mode acceptEdits",
+    "plan": "--permission-mode plan",
+    "bypassPermissions": "--dangerously-skip-permissions",
+}
+LAUNCH_MODE_LABELS: dict[str, str] = {
+    "default": "🟢 Normal",
+    "acceptEdits": "✏️ Accept edits",
+    "plan": "📝 Plan",
+    "bypassPermissions": "⚡ Skip permissions",
+}
+# Accepted aliases for /restart <mode> and /mode <mode>
+LAUNCH_MODE_ALIASES: dict[str, str] = {
+    "default": "default",
+    "normal": "default",
+    "manual": "default",
+    "acceptedits": "acceptEdits",
+    "accept": "acceptEdits",
+    "edit": "acceptEdits",
+    "plan": "plan",
+    "bypasspermissions": "bypassPermissions",
+    "bypass": "bypassPermissions",
+    "skip": "bypassPermissions",
+    "dangerous": "bypassPermissions",
+    "yolo": "bypassPermissions",
+}
+
+
+def normalize_launch_mode(value: str | None) -> str | None:
+    """Map a user-typed mode name to a LAUNCH_MODES key (None if unknown)."""
+    if not value:
+        return None
+    return LAUNCH_MODE_ALIASES.get(value.strip().lower())
+
+
+def build_claude_command(
+    mode: str = "default", resume_session_id: str | None = None
+) -> str:
+    """Build the shell command that starts Claude Code in a window.
+
+    Non-bypass modes get --allow-dangerously-skip-permissions so that
+    Shift+Tab (and /mode) can still reach bypass later — except as root,
+    where Claude Code refuses the flag.
+    """
+    parts = [config.claude_command]
+    flag = LAUNCH_MODES.get(mode, "")
+    if flag:
+        parts.append(flag)
+    if mode != "bypassPermissions" and os.geteuid() != 0:
+        parts.append("--allow-dangerously-skip-permissions")
+    if resume_session_id:
+        parts.append(f"--resume {resume_session_id}")
+    return " ".join(parts)
+
 
 # pane_current_command values meaning "Claude Code is not running here"
 SHELL_COMMANDS = frozenset(
@@ -411,6 +470,74 @@ class TmuxManager:
             "check /screenshot and answer it there.",
         )
 
+    async def stop_claude(self, window_id: str, timeout: float = 6.0) -> bool:
+        """Stop the Claude Code process in a window, leaving the shell.
+
+        Escape + two Ctrl-C is Claude Code's exit sequence; if the pane is
+        still not at a shell after ``timeout`` the pane is respawned with
+        ``tmux respawn-pane -k`` (keeps the window id).
+        """
+        window = await self.find_window_by_id(window_id)
+        if window is None:
+            return False
+        if window.pane_current_command not in SHELL_COMMANDS:
+            await self.send_key(window_id, "Escape")
+            await asyncio.sleep(0.3)
+            await self.send_key(window_id, "C-c")
+            await asyncio.sleep(0.4)
+            await self.send_key(window_id, "C-c")
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                await asyncio.sleep(0.5)
+                self.invalidate_windows_cache()
+                w = await self.find_window_by_id(window_id)
+                if w is None:
+                    return False
+                if w.pane_current_command in SHELL_COMMANDS:
+                    return True
+            logger.warning("Claude in %s did not exit; respawning pane", window_id)
+            proc = await asyncio.create_subprocess_exec(
+                "tmux",
+                "respawn-pane",
+                "-k",
+                "-t",
+                window_id,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await proc.communicate()
+            if proc.returncode != 0:
+                logger.error("respawn-pane failed: %s", stderr.decode().strip())
+                return False
+            await asyncio.sleep(0.5)
+            self.invalidate_windows_cache()
+        return True
+
+    async def start_claude(self, window_id: str, command: str) -> bool:
+        """Type ``command`` into the window's shell and press Enter.
+
+        A shell that is still redrawing its prompt (right after Claude
+        exited) can swallow the first keystrokes, so the typed line is
+        verified against the pane before Enter and retyped once if needed.
+        """
+        await asyncio.sleep(1.0)  # let the prompt settle
+        for attempt in range(2):
+            if attempt:
+                await self.send_key(window_id, "C-u")
+                await asyncio.sleep(0.3)
+            if not await self.send_keys(window_id, command, enter=False, literal=True):
+                return False
+            await asyncio.sleep(0.6)
+            pane = await self.capture_pane(window_id) or ""
+            tail = "".join(pane.rstrip().split("\n")[-3:])
+            # Prompt themes may wrap or decorate the line; compare without spaces
+            if command.replace(" ", "") in tail.replace(" ", ""):
+                return await self.send_key(window_id, "Enter")
+            logger.warning(
+                "Typed command not visible in %s (attempt %d)", window_id, attempt + 1
+            )
+        return False
+
     async def send_keys(
         self, window_id: str, text: str, enter: bool = True, literal: bool = True
     ) -> bool:
@@ -560,6 +687,7 @@ class TmuxManager:
         window_name: str | None = None,
         start_claude: bool = True,
         resume_session_id: str | None = None,
+        mode: str = "default",
     ) -> tuple[bool, str, str, str]:
         """Create a new tmux window and optionally start Claude Code.
 
@@ -568,6 +696,7 @@ class TmuxManager:
             window_name: Optional window name (defaults to directory name)
             start_claude: Whether to start claude command
             resume_session_id: If set, append --resume <id> to claude command
+            mode: Launch mode key from LAUNCH_MODES
 
         Returns:
             Tuple of (success, message, window_name, window_id)
@@ -615,9 +744,7 @@ class TmuxManager:
                 if start_claude:
                     pane = window.active_pane
                     if pane:
-                        cmd = config.claude_command
-                        if resume_session_id:
-                            cmd = f"{cmd} --resume {resume_session_id}"
+                        cmd = build_claude_command(mode, resume_session_id)
                         pane.send_keys(cmd, enter=True)
 
                 self.invalidate_windows_cache()
