@@ -35,6 +35,7 @@ Key functions: create_bot(), handle_new_message().
 import asyncio
 import io
 import logging
+import subprocess
 import time
 from pathlib import Path
 from typing import Any
@@ -42,6 +43,8 @@ from typing import Any
 from telegram import (
     Bot,
     BotCommand,
+    BotCommandScopeAllGroupChats,
+    BotCommandScopeAllPrivateChats,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputMediaDocument,
@@ -60,6 +63,7 @@ from telegram.ext import (
 )
 from telegram.request import HTTPXRequest
 
+from . import __version__
 from .claude_config import ensure_trusted_directory
 from .config import config
 from .handlers.callback_data import (
@@ -83,6 +87,7 @@ from .handlers.callback_data import (
     CB_KILL,
     CB_MODE_CANCEL,
     CB_MODE_SELECT,
+    CB_MODE_SET,
     CB_RESTART,
     CB_SCREENSHOT_REFRESH,
     CB_SESSION_CANCEL,
@@ -147,10 +152,17 @@ from .markdown_v2 import convert_markdown
 from .screenshot import text_to_image
 from .session import session_manager
 from .session_monitor import NewMessage, SessionMonitor
-from .terminal_parser import extract_bash_output, is_interactive_ui
+from .terminal_parser import (
+    extract_bash_output,
+    has_update_pending,
+    is_blocking_dialog,
+    is_interactive_ui,
+    parse_permission_mode,
+)
 from .tmux_manager import (
     LAUNCH_MODE_LABELS,
     LAUNCH_MODES,
+    SHELL_COMMANDS,
     build_claude_command,
     normalize_launch_mode,
     tmux_manager,
@@ -171,10 +183,19 @@ _status_poll_task: asyncio.Task | None = None
 CC_COMMANDS: dict[str, str] = {
     "clear": "↗ Clear conversation history",
     "compact": "↗ Compact conversation context",
+    "context": "↗ Show context window usage",
     "cost": "↗ Show token/cost usage",
+    "effort": "↗ Set reasoning effort (low/medium/high/max)",
+    "fast": "↗ Toggle fast mode",
     "help": "↗ Show Claude Code help",
     "memory": "↗ Edit CLAUDE.md",
     "model": "↗ Switch AI model",
+    "permissions": "↗ Manage permission rules",
+    "plan": "↗ Plan mode for the next prompt",
+    "resume": "↗ Resume another session (picker)",
+    "rewind": "↗ Rewind conversation / files",
+    "status": "↗ Show Claude Code status",
+    "tasks": "↗ List background tasks",
 }
 
 
@@ -389,6 +410,228 @@ async def kill_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     else:
         text = f"⚠️ Window '{display}' was already gone; topic unbound."
     await safe_reply(update.message, text)
+
+
+def _mode_keyboard(window_id: str, current: str | None) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for mode, label in LAUNCH_MODE_LABELS.items():
+        text = f"• {label}" if mode == current else label
+        row.append(
+            InlineKeyboardButton(
+                text, callback_data=f"{CB_MODE_SET}{mode}:{window_id}"[:64]
+            )
+        )
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return InlineKeyboardMarkup(rows)
+
+
+async def _current_mode(wid: str) -> str | None:
+    pane = await tmux_manager.capture_pane(wid)
+    mode = parse_permission_mode(pane or "")
+    if mode is None:
+        mode = session_manager.get_launch_info(wid).get("mode") or None
+    return mode
+
+
+async def _switch_mode(wid: str, target: str) -> tuple[bool, str]:
+    """Cycle Shift+Tab until the footer shows ``target``."""
+    pane = await tmux_manager.capture_pane(wid) or ""
+    if is_blocking_dialog(pane):
+        return False, "A dialog is open — answer it first (see /screenshot)."
+    current = parse_permission_mode(pane)
+    if current is None:
+        return (
+            False,
+            "Can't read the current mode from the terminal (is Claude running?).",
+        )
+    seen: list[str] = [current]
+    for _ in range(6):
+        if current == target:
+            return True, f"Mode is now {LAUNCH_MODE_LABELS.get(target, target)}."
+        await tmux_manager.send_key(wid, "BTab")
+        await asyncio.sleep(0.4)
+        current = parse_permission_mode(await tmux_manager.capture_pane(wid) or "")
+        if current is None:
+            return False, "Lost the footer while cycling; check /screenshot."
+        if current in seen and current != target:
+            break
+        seen.append(current)
+    wanted = LAUNCH_MODE_LABELS.get(target, target)
+    return (
+        False,
+        f"{wanted} is not in this session's Shift+Tab cycle "
+        f"(cycled through: {', '.join(seen)}). Use /restart <mode> instead.",
+    )
+
+
+async def mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show or switch the permission mode: /mode [normal|accept|plan|bypass]."""
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    if not update.message:
+        return
+    thread_id = _get_thread_id(update)
+    wid = session_manager.resolve_window_for_thread(user.id, thread_id)
+    if not wid:
+        await safe_reply(update.message, "❌ No session bound to this topic.")
+        return
+    if context.args:
+        target = normalize_launch_mode(context.args[0])
+        if target is None:
+            await safe_reply(
+                update.message, "❌ Unknown mode. Use: normal, accept, plan, bypass."
+            )
+            return
+        ok, msg = await _switch_mode(wid, target)
+        await safe_reply(update.message, ("✅ " if ok else "⚠️ ") + msg)
+        return
+    current = await _current_mode(wid)
+    label = LAUNCH_MODE_LABELS.get(current or "", current or "unknown")
+    await safe_reply(
+        update.message,
+        f"Permission mode: **{label}**\nPick one to switch (Shift+Tab cycle):",
+        reply_markup=_mode_keyboard(wid, current),
+    )
+
+
+_BOT_STARTED_AT = time.monotonic()
+_claude_version_cache: tuple[float, str] = (0.0, "")
+
+
+async def _claude_version() -> str:
+    """`claude --version`, cached for 10 minutes."""
+    global _claude_version_cache
+    cached_at, cached = _claude_version_cache
+    if cached and time.monotonic() - cached_at < 600:
+        return cached
+
+    def _run() -> str:
+        try:
+            out = subprocess.run(
+                [config.claude_command.split()[-1], "--version"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            return out.stdout.strip() or out.stderr.strip() or "unknown"
+        except (OSError, subprocess.SubprocessError) as e:
+            return f"unknown ({e})"
+
+    version = await asyncio.to_thread(_run)
+    _claude_version_cache = (time.monotonic(), version)
+    return version
+
+
+async def _git_branch(cwd: str) -> str:
+    def _run() -> str:
+        try:
+            out = subprocess.run(
+                ["git", "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            return out.stdout.strip() if out.returncode == 0 else ""
+        except (OSError, subprocess.SubprocessError):
+            return ""
+
+    return await asyncio.to_thread(_run)
+
+
+def _fmt_size(n: int) -> str:
+    size = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024:
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+
+def _fmt_uptime(seconds: float) -> str:
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    d, h = divmod(h, 24)
+    return f"{d}d {h}h {m}m" if d else f"{h}h {m}m {s}s"
+
+
+async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show tmux / Claude Code / Telegram internals for this topic's session."""
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    if not update.message:
+        return
+    thread_id = _get_thread_id(update)
+    wid = session_manager.resolve_window_for_thread(user.id, thread_id)
+    if not wid:
+        await safe_reply(update.message, "❌ No session bound to this topic.")
+        return
+
+    w = await tmux_manager.find_window_by_id(wid)
+    ws = session_manager.get_window_state(wid)
+    launch = session_manager.get_launch_info(wid)
+    display = session_manager.get_display_name(wid)
+    tmux_session = config.tmux_session_name
+    pane = await tmux_manager.capture_pane(wid) if w else None
+    current_mode = parse_permission_mode(pane or "") if pane else None
+    claude_running = bool(w) and w.pane_current_command not in SHELL_COMMANDS
+    cwd = ws.cwd or (w.cwd if w else "")
+    branch = await _git_branch(cwd) if cwd else ""
+    version = await _claude_version()
+    jsonl = session_manager.resolve_session_file_for_window(wid)
+
+    lines = [
+        "**tmux**",
+        f"session/window: `{tmux_session}` / `{wid}` ({display})",
+        f"pane: {'claude' if claude_running else (w.pane_current_command if w else 'gone')}",
+        "attach:",
+        f"`tmux attach -t {tmux_session} \\; select-window -t {wid}`",
+        "peek:",
+        f"`tmux capture-pane -p -t {wid}`",
+        "",
+        "**Claude Code**",
+        f"version: {version}"
+        + (
+            " — ✔ update installed, /restart to apply"
+            if pane and has_update_pending(pane)
+            else ""
+        ),
+        f"session id: `{ws.session_id or '—'}`",
+        f"launch mode: {LAUNCH_MODE_LABELS.get(launch.get('mode', ''), launch.get('mode') or '—')}",
+        f"current mode: {LAUNCH_MODE_LABELS.get(current_mode or '', current_mode or '—')}",
+        f"command: `{launch.get('command') or '—'}`",
+        f"cwd: `{cwd or '—'}`" + (f" (branch `{branch}`)" if branch else ""),
+    ]
+    if jsonl:
+        try:
+            st = jsonl.stat()
+            age = _fmt_uptime(time.time() - st.st_mtime)
+            lines.append(
+                f"transcript: `{jsonl}` ({_fmt_size(st.st_size)}, updated {age} ago)"
+            )
+        except OSError:
+            lines.append(f"transcript: `{jsonl}`")
+    else:
+        lines.append("transcript: — (hook not registered yet?)")
+    if ws.session_id:
+        lines.append("resume from a terminal:")
+        lines.append(f"`cd {cwd} && claude --resume {ws.session_id}`")
+    chat = update.effective_chat
+    lines += [
+        "",
+        "**Telegram / bot**",
+        f"user `{user.id}` · chat `{chat.id if chat else '—'}` · topic `{thread_id}`",
+        f"ccbot {__version__} · config `{config.config_dir}` · up {_fmt_uptime(time.monotonic() - _BOT_STARTED_AT)}",
+    ]
+    await safe_reply(update.message, "\n".join(lines))
 
 
 async def esc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1943,6 +2186,27 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
         await query.answer("🔄")
 
+    # /mode keyboard
+    elif data.startswith(CB_MODE_SET):
+        rest = data[len(CB_MODE_SET) :]
+        target, _, window_id = rest.partition(":")
+        thread_id = _get_thread_id(update)
+        if session_manager.resolve_window_for_thread(user.id, thread_id) != window_id:
+            await query.answer("This topic is no longer bound to that window")
+            return
+        if target not in LAUNCH_MODES:
+            await query.answer("Unknown mode")
+            return
+        await query.answer("Switching…")
+        ok, msg = await _switch_mode(window_id, target)
+        current = await _current_mode(window_id)
+        label = LAUNCH_MODE_LABELS.get(current or "", current or "unknown")
+        await safe_edit(
+            query,
+            f"Permission mode: **{label}**\n{'✅' if ok else '⚠️'} {msg}",
+            reply_markup=_mode_keyboard(window_id, current),
+        )
+
     # Health notification buttons
     elif data.startswith(CB_RESTART):
         window_id = data[len(CB_RESTART) :]
@@ -2127,13 +2391,14 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
 async def post_init(application: Application) -> None:
     global session_monitor, _status_poll_task
 
-    await application.bot.delete_my_commands()
-
     bot_commands = [
         BotCommand("start", "Show welcome message"),
         BotCommand("history", "Message history for this topic"),
         BotCommand("screenshot", "Terminal screenshot with control keys"),
         BotCommand("esc", "Send Escape to interrupt Claude"),
+        BotCommand(
+            "mode", "Show / switch permission mode (normal, accept, plan, bypass)"
+        ),
         BotCommand("restart", "Restart Claude Code (resumes session; add a mode)"),
         BotCommand("kill", "Kill the tmux window and forget the session"),
         BotCommand("unbind", "Unbind topic from session (keeps window running)"),
@@ -2143,7 +2408,19 @@ async def post_init(application: Application) -> None:
     for cmd_name, desc in CC_COMMANDS.items():
         bot_commands.append(BotCommand(cmd_name, desc))
 
-    await application.bot.set_my_commands(bot_commands)
+    # Register for private chats AND group chats: forum topics live in
+    # supergroups, and Telegram clients only show the "/" menu in a group
+    # when commands are set for a group scope.
+    for scope in (
+        None,
+        BotCommandScopeAllPrivateChats(),
+        BotCommandScopeAllGroupChats(),
+    ):
+        try:
+            await application.bot.delete_my_commands(scope=scope)
+            await application.bot.set_my_commands(bot_commands, scope=scope)
+        except Exception as e:
+            logger.warning("set_my_commands(scope=%s) failed: %s", scope, e)
 
     # Re-resolve stale window IDs from persisted state against live tmux windows
     await session_manager.resolve_stale_ids()
@@ -2241,6 +2518,8 @@ def create_bot() -> Application:
     application.add_handler(CommandHandler("screenshot", screenshot_command))
     application.add_handler(CommandHandler("esc", esc_command))
     application.add_handler(CommandHandler("restart", restart_command))
+    application.add_handler(CommandHandler("mode", mode_command))
+    application.add_handler(CommandHandler("info", info_command))
     application.add_handler(CommandHandler("kill", kill_command))
     application.add_handler(CommandHandler("unbind", unbind_command))
     application.add_handler(CommandHandler("usage", usage_command))

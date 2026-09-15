@@ -381,3 +381,45 @@ class TestResolveSessionFileForWindow:
     ) -> None:
         monkeypatch.setattr(session_mod.config, "claude_projects_path", tmp_path)
         assert mgr.resolve_session_file_for_window("@9") is None
+
+
+class TestListSessionsForDirectory:
+    @pytest.fixture
+    def projects(self, monkeypatch, tmp_path):
+        projects = tmp_path / "projects"
+        monkeypatch.setattr(session_mod.config, "claude_projects_path", projects)
+        return projects
+
+    @staticmethod
+    def _write(path, entries) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+
+    @pytest.mark.asyncio
+    async def test_titles_and_junk_files(self, mgr: SessionManager, projects) -> None:
+        cwd = "/home/u/proj"
+        pdir = projects / SessionManager._encode_cwd(cwd)
+        sid_a = "aaaaaaaa-0000-0000-0000-000000000001"
+        sid_b = "bbbbbbbb-0000-0000-0000-000000000002"
+        user = {
+            "type": "user",
+            "message": {"role": "user", "content": "first prompt here"},
+        }
+        self._write(
+            pdir / f"{sid_a}.jsonl",
+            [
+                user,
+                {"type": "ai-title", "aiTitle": "AI name"},
+                {"type": "custom-title", "customTitle": "My name"},
+            ],
+        )
+        self._write(pdir / f"{sid_b}.jsonl", [user])
+        # Leftovers Claude Code sets aside must not be offered for --resume
+        self._write(pdir / f"{sid_b}.orphaned-1-x.jsonl", [user])
+        self._write(pdir / "sessions-index.jsonl", [user])
+
+        sessions = await mgr.list_sessions_for_directory(cwd)
+        by_id = {s.session_id: s for s in sessions}
+        assert set(by_id) == {sid_a, sid_b}
+        assert by_id[sid_a].summary == "My name"
+        assert by_id[sid_b].summary == "first prompt here"

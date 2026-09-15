@@ -100,14 +100,14 @@ def build_mode_picker(
     """
     action = "Resume" if resume_session_id else "Start"
     lines = [
-        f"*{action} Claude Code in:*",
+        f"**{action} Claude Code in:**",
         f"`{_escape_md(selected_path)}`",
         "",
         "Choose the permission mode:",
-        "• *Normal* — asks before edits/commands",
-        "• *Accept edits* — file edits auto-approved",
-        "• *Plan* — read-only planning first",
-        "• *Skip permissions* — `--dangerously-skip-permissions`",
+        "• **Normal** — asks before edits/commands",
+        "• **Accept edits** — file edits auto-approved",
+        "• **Plan** — read-only planning first",
+        "• **Skip permissions** — `--dangerously-skip-permissions`",
     ]
     order = [last_mode] + [m for m in LAUNCH_MODES if m != last_mode]
     buttons: list[list[InlineKeyboardButton]] = []

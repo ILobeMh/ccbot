@@ -34,7 +34,7 @@ from typing import Any
 import aiofiles
 
 from .config import config
-from .tmux_manager import SHELL_COMMANDS, tmux_manager
+from .tmux_manager import _UUID_RE, SHELL_COMMANDS, tmux_manager
 from .transcript_parser import TranscriptParser
 from .utils import atomic_write_json
 
@@ -766,6 +766,7 @@ class SessionManager:
 
         # Single pass: read file once, extract summary + count messages
         summary = ""
+        title_locked = False
         last_user_msg = ""
         message_count = 0
         try:
@@ -779,8 +780,19 @@ class SessionManager:
                     message_count += 1
                     try:
                         data = json.loads(line)
-                        # Check for summary
-                        if data.get("type") == "summary":
+                        dtype = data.get("type")
+                        # Titles: /rename or --name (custom-title) beat AI titles,
+                        # which beat the legacy summary entries.
+                        if dtype == "custom-title" and data.get("customTitle"):
+                            summary = str(data["customTitle"])
+                            title_locked = True
+                        elif (
+                            dtype == "ai-title"
+                            and data.get("aiTitle")
+                            and not title_locked
+                        ):
+                            summary = str(data["aiTitle"])
+                        elif dtype == "summary" and not title_locked:
                             s = data.get("summary", "")
                             if s:
                                 summary = s
@@ -827,10 +839,11 @@ class SessionManager:
             reverse=True,
         )
 
-        # Skip sessions-index and cap at 10
+        # Only real session files (skip sessions-index, *.orphaned-*,
+        # *.jsonl.superseded-* leftovers) and cap at 10
         sessions: list[ClaudeSession] = []
         for f in jsonl_files:
-            if f.stem == "sessions-index":
+            if not _UUID_RE.fullmatch(f.stem):
                 continue
             if len(sessions) >= 10:
                 break
