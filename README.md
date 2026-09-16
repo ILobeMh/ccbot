@@ -98,10 +98,14 @@ ALLOWED_USERS=your_telegram_user_id
 | `CCBOT_SHOW_USER_MESSAGES` | `true` | Mirror your own prompts (👤) into the topic |
 | `CCBOT_SHOW_TOOL_CALLS` | `true` | Show tool_use / tool_result messages |
 | `CCBOT_SHOW_THINKING` | `true` | Show thinking blocks as collapsed expandable quotes |
+| `CCBOT_MAX_THINKING_CHARS` | `500` | Thinking chars per turn; `0` sends it all as `[i/N]` parts |
+| `CCBOT_STATUS_UPDATES` | `true` | Live status-line edits ("Moseying… (7s)") |
+| `CCBOT_QUIET_HOURS` | _(off)_ | `HH-HH` window (server time) with no ccc / health alerts |
+| `CCBOT_CCC_ALERTS` | `true` | ccc exhausted / available-again messages |
 | `CLAUDE_PERMISSION_MODE` | `default` | Initial launch mode offered first in the mode picker (`default`, `acceptEdits`, `plan`, `bypassPermissions`) |
 | `CCBOT_AUTO_TRUST_DIRS` | `true` | Pre-trust the project in `~/.claude.json` before launching `claude` (skips the "Quick safety check" dialog) |
 | `CCBOT_DEFAULT_DIR` | _(bot cwd)_ | Directory the directory browser opens at |
-| `CCBOT_SPECIAL_TOPICS` | `shell,ccc` | Bot-owned topics to create in the group (see below); empty disables |
+| `CCBOT_SPECIAL_TOPICS` | `shell,ccc,settings` | Bot-owned topics to create in the group (see below); empty disables |
 | `CCBOT_FORUM_CHAT_ID` | _(learned)_ | Supergroup id used to create special topics (needs the "Manage Topics" admin right) |
 | `CCBOT_SHELL_TIMEOUT` | `120` | Per-command timeout (seconds) in the `shell` topic |
 | `CCBOT_CCC_COMMAND` | `ccc` | Path to the `ccc` account switcher used by the `ccc` topic |
@@ -193,6 +197,7 @@ The bot creates these topics itself (it needs the **Manage Topics** admin right 
 | Topic | What it does |
 | ----- | ------------ |
 | `shell` | A raw shell on the bot's host — no Claude Code. Every message runs as a command (`$SHELL -lc`); the reply shows the output, exit code, duration and cwd. `cd` persists, output over 3000 chars is attached as a file, and a running command has a ⏹ Kill button. |
+| `settings` | Live bot settings with one button per option (thinking on/off and length incl. full split, tool calls, 👤 mirror, status line, default launch mode, auto-trust, shell timeout, ccc alerts/poll, screenshot font, quiet hours). Applied immediately and saved to `~/.ccbot/settings.json`, which overrides the env defaults. `/settings` shows the same dashboard anywhere. |
 | `ccc` | Claude Code / Codex account switching via [`ccc`](https://github.com/ILobeMh/claude-code-codex-sw). Any message shows the dashboard (accounts, plan, 5h/7d quota, reset times, reset credits) with ▶ Use / ⏭ Next / 🔄 Refresh buttons and a 🔁 button that restarts every Claude Code session so it picks up the new login. A watcher polls quota, wakes up right after the earliest reset, and posts when the account in use is exhausted (with the best alternative) and when an exhausted account is usable again. |
 
 ### Topic Workflow

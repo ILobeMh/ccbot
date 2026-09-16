@@ -13,9 +13,37 @@ Key function:
   - build_response_parts: Build paginated response messages
 """
 
+from ..config import config
 from ..markdown_v2 import convert_markdown_tables
 from ..telegram_sender import split_message
 from ..transcript_parser import TranscriptParser
+
+# Raw chars per thinking part; escaping inflates this before the 3800-char
+# render budget in markdown_v2._render_expandable_quote
+THINKING_PART_CHARS = 2800
+THINKING_PREFIX = "∴ Thinking…"
+
+
+def _build_thinking_parts(text: str, max_chars: int) -> list[str]:
+    start_tag = TranscriptParser.EXPANDABLE_QUOTE_START
+    end_tag = TranscriptParser.EXPANDABLE_QUOTE_END
+    if start_tag in text and end_tag in text:
+        inner = text[text.index(start_tag) + len(start_tag) : text.index(end_tag)]
+    else:
+        inner = text
+    inner = inner.strip()
+    if max_chars > 0:
+        if len(inner) > max_chars:
+            inner = inner[:max_chars] + "\n\n… (thinking truncated)"
+        return [f"{THINKING_PREFIX}\n{start_tag}{inner}{end_tag}"]
+    chunks = split_message(inner, max_length=THINKING_PART_CHARS) or [""]
+    total = len(chunks)
+    if total == 1:
+        return [f"{THINKING_PREFIX}\n{start_tag}{chunks[0]}{end_tag}"]
+    return [
+        f"{THINKING_PREFIX} [{i}/{total}]\n{start_tag}{chunk}{end_tag}"
+        for i, chunk in enumerate(chunks, 1)
+    ]
 
 
 def build_response_parts(
@@ -41,18 +69,10 @@ def build_response_parts(
             text = text[:3000] + "…"
         return [f"{prefix}{text}"]
 
-    # Truncate thinking content to keep it compact
+    # Thinking: truncate to config.thinking_max_chars, or (0) send it all as
+    # [i/N] parts, each its own collapsed quote
     if content_type == "thinking" and is_complete:
-        start_tag = TranscriptParser.EXPANDABLE_QUOTE_START
-        end_tag = TranscriptParser.EXPANDABLE_QUOTE_END
-        max_thinking = 500
-        if start_tag in text and end_tag in text:
-            inner = text[text.index(start_tag) + len(start_tag) : text.index(end_tag)]
-            if len(inner) > max_thinking:
-                inner = inner[:max_thinking] + "\n\n… (thinking truncated)"
-            text = start_tag + inner + end_tag
-        elif len(text) > max_thinking:
-            text = text[:max_thinking] + "\n\n… (thinking truncated)"
+        return _build_thinking_parts(text, config.thinking_max_chars)
 
     # Format based on content type
     if content_type == "thinking":

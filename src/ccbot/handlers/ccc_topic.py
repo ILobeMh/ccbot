@@ -30,6 +30,7 @@ from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 from ..config import config
+from ..settings import in_quiet_hours
 from . import special_topics
 from .callback_data import (
     CB_CCC_NEXT,
@@ -440,6 +441,9 @@ class CccTopic:
 
     async def _announce(self, ev: QuotaEvent, accounts: list[Account]) -> None:
         if self._bot is None or self._chat_id is None:
+            return
+        if not config.ccc_alerts or in_quiet_hours():
+            logger.info("ccc alert suppressed (%s %s)", ev.kind, ev.account.name)
             return
         a = ev.account
         icon = PROVIDER_ICON.get(a.provider, "")

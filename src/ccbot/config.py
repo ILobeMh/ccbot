@@ -104,7 +104,7 @@ class Config:
         # empty disables). Implementations register themselves by name.
         self.special_topics: set[str] = {
             t.strip()
-            for t in os.getenv("CCBOT_SPECIAL_TOPICS", "shell,ccc").split(",")
+            for t in os.getenv("CCBOT_SPECIAL_TOPICS", "shell,ccc,settings").split(",")
             if t.strip()
         }
         # Supergroup id for creating special topics; learned from the first
@@ -120,6 +120,7 @@ class Config:
         # `ccc` (Claude/Codex account switcher) binary and quota poll interval
         self.ccc_command = os.getenv("CCBOT_CCC_COMMAND", "ccc")
         self.ccc_poll_interval = float(os.getenv("CCBOT_CCC_POLL_INTERVAL", "300"))
+        self.ccc_alerts = os.getenv("CCBOT_CCC_ALERTS", "true").lower() != "false"
 
         # Directory the directory browser opens at (default: bot's cwd)
         self.default_dir = os.getenv("CCBOT_DEFAULT_DIR", "")
@@ -131,6 +132,23 @@ class Config:
 
         # Show Claude's thinking blocks (as collapsed expandable quotes)
         self.show_thinking = os.getenv("CCBOT_SHOW_THINKING", "true").lower() != "false"
+        # Max thinking chars per turn; 0 = send everything, split into parts
+        self.thinking_max_chars = int(os.getenv("CCBOT_MAX_THINKING_CHARS", "500"))
+
+        # Send the live status line ("Moseying… (7s)") as an edited message
+        self.status_updates = (
+            os.getenv("CCBOT_STATUS_UPDATES", "true").lower() != "false"
+        )
+
+        # Screenshot font size in px
+        raw_font = os.getenv("CCBOT_SCREENSHOT_FONT_SIZE", "").strip()
+        self.screenshot_font_size = (
+            int(raw_font) if raw_font.isdigit() and 8 <= int(raw_font) <= 96 else 28
+        )
+
+        # "HH-HH" window (server local time) in which alert-style messages
+        # (ccc quota, Claude exited, update pending) are suppressed; "" = off
+        self.quiet_hours = os.getenv("CCBOT_QUIET_HOURS", "").strip()
 
         # Show hidden (dot) directories in directory browser
         self.show_hidden_dirs = (

@@ -55,8 +55,8 @@ class TestRender:
         assert img.width > 32
 
     @pytest.mark.asyncio
-    async def test_font_size_env(self, monkeypatch):
-        monkeypatch.setenv("CCBOT_SCREENSHOT_FONT_SIZE", "12")
+    async def test_font_size_from_config(self, monkeypatch):
+        from ccbot.config import config
+
+        monkeypatch.setattr(config, "screenshot_font_size", 12)
         assert ss._default_font_size() == 12
-        monkeypatch.setenv("CCBOT_SCREENSHOT_FONT_SIZE", "999")
-        assert ss._default_font_size() == 28

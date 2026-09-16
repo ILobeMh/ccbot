@@ -63,7 +63,7 @@ from telegram.ext import (
 )
 from telegram.request import HTTPXRequest
 
-from . import __version__
+from . import __version__, settings
 from .claude_config import ensure_trusted_directory
 from .config import config
 from .handlers import shell_topic as _shell_topic  # noqa: F401  (registers "shell")
@@ -149,6 +149,7 @@ from .handlers.message_sender import (
     send_with_fallback,
 )
 from .handlers.response_builder import build_response_parts
+from .handlers.settings_topic import settings_command
 from .handlers.special_topics import (
     ensure_special_topics,
     is_special_thread,
@@ -2422,6 +2423,7 @@ async def post_init(application: Application) -> None:
         BotCommand("screenshot", "Terminal screenshot with control keys"),
         BotCommand("esc", "Send Escape to interrupt Claude"),
         BotCommand("info", "Session internals: tmux window, session id, launch cmd"),
+        BotCommand("settings", "Bot settings: thinking, tool calls, modes, alerts"),
         BotCommand(
             "mode", "Show / switch permission mode (normal, accept, plan, bypass)"
         ),
@@ -2520,6 +2522,8 @@ async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 def create_bot() -> Application:
+    settings.load()
+
     # Explicit timeouts: PTB's default pool_timeout of 1s makes concurrent
     # sends fail spuriously under load; reads need headroom for long polls.
     def _request() -> HTTPXRequest:
@@ -2557,6 +2561,7 @@ def create_bot() -> Application:
     application.add_handler(CommandHandler("restart", restart_command))
     application.add_handler(CommandHandler("mode", mode_command))
     application.add_handler(CommandHandler("info", info_command))
+    application.add_handler(CommandHandler("settings", settings_command))
     application.add_handler(CommandHandler("kill", kill_command))
     application.add_handler(CommandHandler("unbind", unbind_command))
     application.add_handler(CommandHandler("usage", usage_command))

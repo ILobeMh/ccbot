@@ -26,7 +26,9 @@ import time
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest
 
+from ..config import config
 from ..session import session_manager
+from ..settings import in_quiet_hours
 from ..terminal_parser import (
     AUTO_ANSWER_DIALOGS,
     extract_interactive_content,
@@ -98,7 +100,7 @@ async def _check_window_health(
     pane_text: str,
 ) -> None:
     """Notify (once) when Claude exited or an update wants a restart."""
-    if window_id in _launching:
+    if window_id in _launching or in_quiet_hours():
         return
     chat_id = session_manager.resolve_chat_id(user_id, thread_id)
     display = session_manager.get_display_name(window_id)
@@ -211,6 +213,9 @@ async def update_status_message(
 
     # Normal status line check — skip if queue is non-empty
     if skip_status:
+        return
+
+    if not config.status_updates:
         return
 
     status_line = parse_status_line(pane_text)

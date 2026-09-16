@@ -57,10 +57,10 @@ def _font_paths() -> list[Path]:
 
 
 def _default_font_size() -> int:
-    raw = os.environ.get("CCBOT_SCREENSHOT_FONT_SIZE", "").strip()
-    if raw.isdigit() and 8 <= int(raw) <= 96:
-        return int(raw)
-    return 28
+    # Deferred import: config is heavy and screenshot is imported early
+    from .config import config
+
+    return int(config.screenshot_font_size)
 
 
 @functools.lru_cache(maxsize=8)
