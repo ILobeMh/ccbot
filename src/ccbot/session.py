@@ -123,6 +123,8 @@ class SessionManager:
     window_launch_info: dict[str, dict[str, str]] = field(default_factory=dict)
     # user_id -> last launch mode chosen in the mode picker
     last_launch_modes: dict[int, str] = field(default_factory=dict)
+    # special topic name (e.g. "shell") -> forum thread id
+    special_topics: dict[str, int] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self._load_state()
@@ -143,6 +145,7 @@ class SessionManager:
             "last_launch_modes": {
                 str(uid): mode for uid, mode in self.last_launch_modes.items()
             },
+            "special_topics": self.special_topics,
         }
         atomic_write_json(config.state_file, state)
         logger.debug("State saved to %s", config.state_file)
@@ -185,6 +188,10 @@ class SessionManager:
                     int(uid): str(mode)
                     for uid, mode in state.get("last_launch_modes", {}).items()
                 }
+                self.special_topics = {
+                    str(name): int(tid)
+                    for name, tid in state.get("special_topics", {}).items()
+                }
 
                 # Detect old format: keys that don't look like window IDs
                 needs_migration = False
@@ -217,6 +224,7 @@ class SessionManager:
                 self.group_chat_ids = {}
                 self.window_launch_info = {}
                 self.last_launch_modes = {}
+                self.special_topics = {}
                 pass
 
     async def resolve_stale_ids(self) -> None:
@@ -922,6 +930,16 @@ class SessionManager:
     def set_last_launch_mode(self, user_id: int, mode: str) -> None:
         if self.last_launch_modes.get(user_id) != mode:
             self.last_launch_modes[user_id] = mode
+            self._save_state()
+
+    # --- Special topics ---
+
+    def set_special_topic(self, name: str, thread_id: int) -> None:
+        self.special_topics[name] = thread_id
+        self._save_state()
+
+    def drop_special_topic(self, name: str) -> None:
+        if self.special_topics.pop(name, None) is not None:
             self._save_state()
 
     # --- User window offset management ---

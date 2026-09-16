@@ -101,6 +101,8 @@ ALLOWED_USERS=your_telegram_user_id
 | `CLAUDE_PERMISSION_MODE` | `default` | Initial launch mode offered first in the mode picker (`default`, `acceptEdits`, `plan`, `bypassPermissions`) |
 | `CCBOT_AUTO_TRUST_DIRS` | `true` | Pre-trust the project in `~/.claude.json` before launching `claude` (skips the "Quick safety check" dialog) |
 | `CCBOT_DEFAULT_DIR` | _(bot cwd)_ | Directory the directory browser opens at |
+| `CCBOT_SPECIAL_TOPICS` | `shell,ccc` | Bot-owned topics to create in the group (see below); empty disables |
+| `CCBOT_FORUM_CHAT_ID` | _(learned)_ | Supergroup id used to create special topics (needs the "Manage Topics" admin right) |
 | `CCBOT_SCREENSHOT_FONT` | _(bundled MesloLGS NF)_ | TTF/OTF used as the primary `/screenshot` font |
 | `CCBOT_SCREENSHOT_FONT_SIZE` | `28` | `/screenshot` font size in px |
 | `OPENAI_API_KEY` | _(none)_ | OpenAI API key for voice message transcription |

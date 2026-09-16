@@ -147,6 +147,12 @@ from .handlers.message_sender import (
     send_with_fallback,
 )
 from .handlers.response_builder import build_response_parts
+from .handlers.special_topics import (
+    ensure_special_topics,
+    is_special_thread,
+    special_callback_router,
+    special_message_router,
+)
 from .handlers.status_polling import mark_launching, status_poll_loop
 from .markdown_v2 import convert_markdown
 from .screenshot import text_to_image
@@ -772,6 +778,13 @@ async def topic_closed_handler(
 
     thread_id = _get_thread_id(update)
     if thread_id is None:
+        return
+
+    if is_special_thread(thread_id):
+        # Bot-owned topic closed by the user: forget it (recreated on restart)
+        for name, tid in list(session_manager.special_topics.items()):
+            if tid == thread_id:
+                session_manager.drop_special_topic(name)
         return
 
     wid = session_manager.get_window_for_thread(user.id, thread_id)
@@ -2451,6 +2464,9 @@ async def post_init(application: Application) -> None:
     _status_poll_task = asyncio.create_task(status_poll_loop(application.bot))
     logger.info("Status polling task started")
 
+    # Create bot-owned topics (shell, ccc, …) once the forum chat is known
+    await ensure_special_topics(application.bot)
+
 
 async def post_shutdown(application: Application) -> None:
     global _status_poll_task
@@ -2513,6 +2529,13 @@ def create_bot() -> Application:
         .build()
     )
     application.add_error_handler(_error_handler)
+
+    # Special (bot-owned) topics run before everything else and swallow
+    # their updates, so the regular topic→window routing never sees them.
+    application.add_handler(
+        MessageHandler(filters.TEXT, special_message_router), group=-1
+    )
+    application.add_handler(CallbackQueryHandler(special_callback_router), group=-1)
 
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("history", history_command))

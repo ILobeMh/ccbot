@@ -100,6 +100,20 @@ class Config:
         # remembered choice: default | acceptEdits | plan | bypassPermissions
         self.claude_permission_mode = os.getenv("CLAUDE_PERMISSION_MODE", "default")
 
+        # Bot-owned special topics to create in the forum group (comma list;
+        # empty disables). Implementations register themselves by name.
+        self.special_topics: set[str] = {
+            t.strip()
+            for t in os.getenv("CCBOT_SPECIAL_TOPICS", "shell,ccc").split(",")
+            if t.strip()
+        }
+        # Supergroup id for creating special topics; learned from the first
+        # group message when unset
+        raw_forum = os.getenv("CCBOT_FORUM_CHAT_ID", "").strip()
+        self.forum_chat_id: int | None = (
+            int(raw_forum) if raw_forum.lstrip("-").isdigit() else None
+        )
+
         # Directory the directory browser opens at (default: bot's cwd)
         self.default_dir = os.getenv("CCBOT_DEFAULT_DIR", "")
 
