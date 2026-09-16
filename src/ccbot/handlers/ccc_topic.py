@@ -516,6 +516,10 @@ class CccTopic:
             message_thread_id=self._thread_id,
             reply_markup=kb,
         )
+        # Deferred import: notifications_topic imports nothing from here
+        from .notifications_topic import notify
+
+        await notify("ccc", text, signature=f"{ev.kind}:{a.id}")
 
     # -- interaction
 

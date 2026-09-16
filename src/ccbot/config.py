@@ -104,7 +104,9 @@ class Config:
         # empty disables). Implementations register themselves by name.
         self.special_topics: set[str] = {
             t.strip()
-            for t in os.getenv("CCBOT_SPECIAL_TOPICS", "shell,ccc,settings").split(",")
+            for t in os.getenv(
+                "CCBOT_SPECIAL_TOPICS", "shell,ccc,settings,notifications"
+            ).split(",")
             if t.strip()
         }
         # Supergroup id for creating special topics; learned from the first
@@ -149,6 +151,20 @@ class Config:
         # "HH-HH" window (server local time) in which alert-style messages
         # (ccc quota, Claude exited, update pending) are suppressed; "" = off
         self.quiet_hours = os.getenv("CCBOT_QUIET_HOURS", "").strip()
+
+        # Notifications topic: which event kinds are posted
+        self.notify_needs_input = (
+            os.getenv("CCBOT_NOTIFY_INPUT", "true").lower() != "false"
+        )
+        self.notify_turn_done = (
+            os.getenv("CCBOT_NOTIFY_DONE", "true").lower() != "false"
+        )
+        self.notify_turn_min = float(os.getenv("CCBOT_NOTIFY_DONE_MIN_SECONDS", "0"))
+        self.notify_lifecycle = (
+            os.getenv("CCBOT_NOTIFY_LIFECYCLE", "true").lower() != "false"
+        )
+        self.notify_errors = os.getenv("CCBOT_NOTIFY_ERRORS", "true").lower() != "false"
+        self.notify_ccc = os.getenv("CCBOT_NOTIFY_CCC", "true").lower() != "false"
 
         # Show hidden (dot) directories in directory browser
         self.show_hidden_dirs = (

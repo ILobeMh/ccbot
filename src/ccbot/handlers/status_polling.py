@@ -34,6 +34,7 @@ from ..terminal_parser import (
     extract_interactive_content,
     has_update_pending,
     is_interactive_ui,
+    is_working,
     parse_status_line,
 )
 from ..tmux_manager import SHELL_COMMANDS, tmux_manager
@@ -46,6 +47,7 @@ from .interactive_ui import (
 )
 from .message_queue import enqueue_status_update, get_message_queue
 from .message_sender import safe_send
+from .notifications_topic import mark_ui, mark_working, notify
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +112,7 @@ async def _check_window_health(
         _shell_polls[window_id] = n
         if n >= SHELL_POLLS_BEFORE_NOTIFY and window_id not in _exit_notified:
             _exit_notified.add(window_id)
+            await notify("lifecycle", "Claude Code exited (shell prompt)", window_id)
             await safe_send(
                 bot,
                 chat_id,
@@ -126,6 +129,11 @@ async def _check_window_health(
     if has_update_pending(pane_text):
         if window_id not in _update_notified:
             _update_notified.add(window_id)
+            await notify(
+                "lifecycle",
+                "Claude Code update installed — restart to apply",
+                window_id,
+            )
             await safe_send(
                 bot,
                 chat_id,
@@ -173,6 +181,20 @@ async def update_status_message(
     )
     if w.pane_current_command in SHELL_COMMANDS:
         return  # nothing to parse in a shell
+
+    # Notifications: busy→idle transitions ("turn finished") and dialogs
+    ui_now = extract_interactive_content(pane_text)
+    busy = is_working(pane_text)
+    await mark_working(
+        window_id,
+        busy,
+        None if busy else parse_status_line(pane_text),
+        paused=ui_now is not None,
+    )
+    if ui_now is not None and ui_now.name not in AUTO_ANSWER_DIALOGS:
+        await mark_ui(window_id, ui_now.name, ui_now.content)
+    else:
+        await mark_ui(window_id, None)
 
     interactive_window = get_interactive_window(user_id, thread_id)
     should_check_new_ui = True

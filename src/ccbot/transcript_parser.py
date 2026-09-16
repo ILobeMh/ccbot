@@ -507,11 +507,14 @@ class TranscriptParser:
                     if btype == "text":
                         t = block.get("text", "").strip()
                         if t and t != cls._NO_CONTENT_PLACEHOLDER:
+                            # Synthetic assistant messages carrying an API
+                            # failure ("You've hit your session limit", 5xx)
+                            is_error = bool(data.get("isApiErrorMessage"))
                             result.append(
                                 ParsedEntry(
                                     role="assistant",
-                                    text=t,
-                                    content_type="text",
+                                    text=f"🚨 {t}" if is_error else t,
+                                    content_type="error" if is_error else "text",
                                     timestamp=entry_timestamp,
                                 )
                             )

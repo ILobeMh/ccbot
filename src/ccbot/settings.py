@@ -142,6 +142,43 @@ SETTINGS: list[Setting] = [
         fmt=_secs,
     ),
     Setting(
+        "notify_needs_input",
+        "Notify: needs input",
+        "Notifications",
+        "bool",
+        help="Questions, permission / plan prompts, dialogs",
+    ),
+    Setting("notify_turn_done", "Notify: turn finished", "Notifications", "bool"),
+    Setting(
+        "notify_turn_min",
+        "… only if it took ≥",
+        "Notifications",
+        "choice",
+        choices=[0.0, 30.0, 120.0, 300.0],
+        fmt=lambda v: "any" if not v else _secs(v),
+    ),
+    Setting(
+        "notify_lifecycle",
+        "Notify: session lifecycle",
+        "Notifications",
+        "bool",
+        help="Created / resumed / restarted / exited / update installed",
+    ),
+    Setting(
+        "notify_errors",
+        "Notify: API errors",
+        "Notifications",
+        "bool",
+        help="Rate limits, session limits, server errors",
+    ),
+    Setting(
+        "notify_ccc",
+        "Notify: ccc quota",
+        "Notifications",
+        "bool",
+        help="Mirror ccc exhausted / available alerts here",
+    ),
+    Setting(
         "screenshot_font_size",
         "Screenshot font",
         "Misc",
@@ -156,7 +193,7 @@ SETTINGS: list[Setting] = [
         "choice",
         choices=["", "22-07", "23-08", "00-08"],
         fmt=_quiet,
-        help="No ccc / health alerts in this window (server local time)",
+        help="No notifications / alerts in this window (server local time)",
     ),
 ]
 _BY_KEY = {s.key: s for s in SETTINGS}

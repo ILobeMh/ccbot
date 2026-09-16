@@ -148,6 +148,7 @@ from .handlers.message_sender import (
     safe_send,
     send_with_fallback,
 )
+from .handlers.notifications_topic import notify, record_assistant_text
 from .handlers.response_builder import build_response_parts
 from .handlers.settings_topic import settings_command
 from .handlers.special_topics import (
@@ -360,6 +361,11 @@ async def _restart_claude(
     finally:
         mark_launching(wid, False)
     mode_label = LAUNCH_MODE_LABELS.get(mode, mode)
+    await notify(
+        "lifecycle",
+        f"restarted in {mode_label} mode" + ("" if ready else f" — not ready: {note}"),
+        wid,
+    )
     what = f"resumed `{resume_sid[:8]}…`" if resume_sid else "started fresh"
     if ready:
         extra = f" (answered: {note})" if note != "ready" else ""
@@ -1604,6 +1610,12 @@ async def _create_and_bind_window(
 
     status = "Resumed" if resume_session_id else "Created"
     mode_label = LAUNCH_MODE_LABELS.get(mode, mode)
+    await notify(
+        "lifecycle",
+        f"{status.lower()} in {mode_label} mode"
+        + ("" if ready else f" — not ready: {note}"),
+        created_wid,
+    )
     if ready:
         extra = f" (answered: {note})" if note != "ready" else ""
         await safe_edit(
@@ -2376,6 +2388,11 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
         # Skip thinking blocks when CCBOT_SHOW_THINKING=false
         if not config.show_thinking and msg.content_type == "thinking":
             continue
+
+        if msg.content_type == "text" and msg.role == "assistant":
+            record_assistant_text(wid, msg.text)
+        elif msg.content_type == "error":
+            await notify("error", msg.text[:300], wid, signature=msg.text[:80])
 
         parts = build_response_parts(
             msg.text,
