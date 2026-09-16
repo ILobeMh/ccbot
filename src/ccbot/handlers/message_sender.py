@@ -206,15 +206,16 @@ async def safe_reply(message: Message, text: str, **kwargs: Any) -> Message:
 
 
 async def safe_edit(target: Any, text: str, **kwargs: Any) -> None:
-    """Edit message with formatting, falling back to plain text on failure."""
+    """Edit message with formatting, falling back to plain text on failure.
+
+    ``target`` is a CallbackQuery (``edit_message_text``) or a Message
+    (``edit_text``) — e.g. a progress message returned by safe_reply.
+    """
     kwargs.setdefault("link_preview_options", NO_LINK_PREVIEW)
+    edit = getattr(target, "edit_message_text", None) or target.edit_text
     await run_with_fallback(
-        lambda: target.edit_message_text(
-            _ensure_formatted(text),
-            parse_mode=PARSE_MODE,
-            **kwargs,
-        ),
-        lambda: target.edit_message_text(strip_sentinels(text), **kwargs),
+        lambda: edit(_ensure_formatted(text), parse_mode=PARSE_MODE, **kwargs),
+        lambda: edit(strip_sentinels(text), **kwargs),
         "edit_message_text",
     )
 

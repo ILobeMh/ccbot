@@ -7,6 +7,7 @@ from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 
 from ccbot.handlers.message_sender import (
     edit_with_fallback,
+    safe_edit,
     safe_reply,
     safe_send,
     send_with_fallback,
@@ -118,3 +119,20 @@ class TestEditWithFallback:
         bot = _bot([RetryAfter(1)])
         with pytest.raises(RetryAfter):
             await edit_with_fallback(bot, 1, 10, "text")
+
+
+class TestSafeEditTargets:
+    @pytest.mark.asyncio
+    async def test_message_target_uses_edit_text(self):
+        message = MagicMock(spec=["edit_text"])
+        message.edit_text = AsyncMock()
+        await safe_edit(message, "hi")
+        message.edit_text.assert_awaited_once()
+        assert message.edit_text.await_args.kwargs["parse_mode"] == "MarkdownV2"
+
+    @pytest.mark.asyncio
+    async def test_query_target_uses_edit_message_text(self):
+        query = MagicMock()
+        query.edit_message_text = AsyncMock()
+        await safe_edit(query, "hi")
+        query.edit_message_text.assert_awaited_once()

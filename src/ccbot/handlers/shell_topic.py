@@ -141,7 +141,7 @@ class ShellTopic:
 
     def __init__(self) -> None:
         self.cwd = str(Path.home())
-        self._running: dict[int, asyncio.Task[ShellResult]] = {}  # msg_id -> task
+        self._seq = 0  # job ids for the ⏹ Kill button
         self._procs: dict[int, asyncio.subprocess.Process] = {}
 
     async def on_ready(self, bot: Bot, chat_id: int, thread_id: int) -> None:
@@ -164,11 +164,19 @@ class ShellTopic:
         command = text.strip()
         if not command:
             return
+        self._seq += 1
+        job_id = self._seq
         progress = await safe_reply(
             msg,
-            f"⏳ `{_pretty_cwd(self.cwd)} $` {_fence(command)}",
+            f"⏳ `{_pretty_cwd(self.cwd)}`\n{_fence('$ ' + command)}",
             reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("⏹ Kill", callback_data="pending")]]
+                [
+                    [
+                        InlineKeyboardButton(
+                            "⏹ Kill", callback_data=f"{CB_SHELL_KILL}{job_id}"
+                        )
+                    ]
+                ]
             ),
         )
         started: asyncio.Future[asyncio.subprocess.Process] = (
@@ -177,30 +185,11 @@ class ShellTopic:
         task = asyncio.create_task(
             run_shell(command, self.cwd, config.shell_timeout, on_start=started)
         )
-        self._running[progress.message_id] = task
-        started.add_done_callback(
-            lambda f: self._procs.__setitem__(progress.message_id, f.result())
-        )
-        try:
-            await progress.edit_reply_markup(
-                InlineKeyboardMarkup(
-                    [
-                        [
-                            InlineKeyboardButton(
-                                "⏹ Kill",
-                                callback_data=f"{CB_SHELL_KILL}{progress.message_id}",
-                            )
-                        ]
-                    ]
-                )
-            )
-        except Exception:
-            pass
+        started.add_done_callback(lambda f: self._procs.__setitem__(job_id, f.result()))
         try:
             result = await task
         finally:
-            self._running.pop(progress.message_id, None)
-            self._procs.pop(progress.message_id, None)
+            self._procs.pop(job_id, None)
 
         self.cwd = result.cwd
         if result.cancelled:
@@ -225,7 +214,7 @@ class ShellTopic:
         else:
             body = _fence(output)
 
-        await safe_edit(progress, f"`$` {_fence(command)}\n{body}\n{footer}")
+        await safe_edit(progress, f"{_fence('$ ' + command)}\n{body}\n{footer}")
         if len(output) > INLINE_LIMIT:
             await msg.reply_document(
                 document=io.BytesIO(output.encode("utf-8")),
