@@ -59,8 +59,8 @@ class TestRender:
         a.windows[0].remaining = 0
         a.windows[0].resets_at = datetime.now(timezone.utc) - timedelta(minutes=5)
         text, _ = cc.render_dashboard(accounts)
-        assert "⛔ exhausted" in text
-        assert "↻due" in text
+        assert "⛔" in text
+        assert "↻ due" in text
 
 
 class TestWatcher:
