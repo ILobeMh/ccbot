@@ -117,6 +117,10 @@ class Config:
         # Per-command timeout for the "shell" special topic (seconds)
         self.shell_timeout = float(os.getenv("CCBOT_SHELL_TIMEOUT", "120"))
 
+        # `ccc` (Claude/Codex account switcher) binary and quota poll interval
+        self.ccc_command = os.getenv("CCBOT_CCC_COMMAND", "ccc")
+        self.ccc_poll_interval = float(os.getenv("CCBOT_CCC_POLL_INTERVAL", "300"))
+
         # Directory the directory browser opens at (default: bot's cwd)
         self.default_dir = os.getenv("CCBOT_DEFAULT_DIR", "")
 

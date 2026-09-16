@@ -1,0 +1,648 @@
+{
+ "accounts": [
+  {
+   "account": {
+    "id": "00000000-0000-0000-0000-000000000001",
+    "provider": "codex",
+    "name": "p***@i***.com",
+    "email": "p***@i***.com",
+    "identity": "",
+    "status": "ready",
+    "createdAt": "2026-08-13T14:36:46.534697055Z",
+    "updatedAt": "2026-09-15T16:00:43.860363079Z",
+    "credentialUpdatedAt": "2026-09-09T17:50:44.317269492Z"
+   },
+   "current": true,
+   "quota": {
+    "schemaVersion": 1,
+    "provider": "codex",
+    "accountId": "00000000-0000-0000-0000-000000000001",
+    "plan": "plus",
+    "windows": [
+     {
+      "name": "five_hour",
+      "durationSeconds": 18000,
+      "usedPercent": 0,
+      "remainingPercent": 100,
+      "resetsAt": "2026-09-16T07:46:33Z"
+     },
+     {
+      "name": "seven_day",
+      "durationSeconds": 604800,
+      "usedPercent": 31,
+      "remainingPercent": 69,
+      "resetsAt": "2026-09-21T02:57:22Z"
+     }
+    ],
+    "creditsRemaining": 0,
+    "resetCredits": {
+     "availableCount": 2,
+     "credits": [
+      {
+       "id": "RateLimitResetCredit_x",
+       "resetType": "codexRateLimits",
+       "status": "available",
+       "title": "Full reset (Weekly + 5 hr)",
+       "description": "Thanks for using Codex! You've been granted one free rate limit reset.",
+       "grantedAt": "2026-09-04T00:44:06Z",
+       "expiresAt": "2026-10-04T00:44:06Z"
+      },
+      {
+       "id": "RateLimitResetCredit_x",
+       "resetType": "codexRateLimits",
+       "status": "available",
+       "title": "Full reset (Weekly + 5 hr)",
+       "description": "Thanks for using Codex! You've been granted one free rate limit reset.",
+       "grantedAt": "2026-09-04T22:00:23Z",
+       "expiresAt": "2026-10-04T22:00:23Z"
+      }
+     ]
+    },
+    "fetchedAt": "2026-09-16T02:46:33.116319637Z"
+   },
+   "stale": false
+  },
+  {
+   "account": {
+    "id": "00000000-0000-0000-0000-000000000002",
+    "provider": "claude",
+    "name": "m***@p***.me",
+    "email": "m***@p***.me",
+    "identity": "",
+    "status": "ready",
+    "createdAt": "2026-08-25T22:18:21.835130817Z",
+    "updatedAt": "2026-09-16T02:44:09.37985369Z",
+    "credentialUpdatedAt": "2026-09-16T06:18:05.101Z"
+   },
+   "current": false,
+   "quota": {
+    "schemaVersion": 1,
+    "provider": "claude",
+    "accountId": "00000000-0000-0000-0000-000000000002",
+    "plan": "pro",
+    "windows": [
+     {
+      "name": "five_hour",
+      "durationSeconds": 18000,
+      "usedPercent": 0,
+      "remainingPercent": 100
+     },
+     {
+      "name": "seven_day",
+      "durationSeconds": 604800,
+      "usedPercent": 32,
+      "remainingPercent": 68,
+      "resetsAt": "2026-09-20T08:59:59.648749Z"
+     },
+     {
+      "name": "nimbus_quill",
+      "usedPercent": 0,
+      "remainingPercent": 100
+     }
+    ],
+    "extraUsage": {
+     "enabled": false
+    },
+    "fetchedAt": "2026-09-15T22:18:05.941833012Z"
+   },
+   "stale": false
+  },
+  {
+   "account": {
+    "id": "00000000-0000-0000-0000-000000000003",
+    "provider": "codex",
+    "name": "d***@g***.com",
+    "email": "d***@g***.com",
+    "identity": "",
+    "status": "ready",
+    "createdAt": "2026-09-12T02:51:16.893602117Z",
+    "updatedAt": "2026-09-15T15:24:24.444613807Z",
+    "credentialUpdatedAt": "2026-09-12T02:51:16.706227691Z"
+   },
+   "current": false,
+   "quota": {
+    "schemaVersion": 1,
+    "provider": "codex",
+    "accountId": "00000000-0000-0000-0000-000000000003",
+    "plan": "plus",
+    "windows": [
+     {
+      "name": "five_hour",
+      "durationSeconds": 18000,
+      "usedPercent": 0,
+      "remainingPercent": 100,
+      "resetsAt": "2026-09-16T03:18:08Z"
+     },
+     {
+      "name": "seven_day",
+      "durationSeconds": 604800,
+      "usedPercent": 38,
+      "remainingPercent": 62,
+      "resetsAt": "2026-09-19T11:02:39Z"
+     }
+    ],
+    "creditsRemaining": 0,
+    "resetCredits": {
+     "availableCount": 2,
+     "credits": [
+      {
+       "id": "RateLimitResetCredit_x",
+       "resetType": "codexRateLimits",
+       "status": "available",
+       "title": "Full reset (Weekly + 5 hr)",
+       "description": "Thanks for using Codex! You've been granted one free rate limit reset.",
+       "grantedAt": "2026-09-04T00:49:15Z",
+       "expiresAt": "2026-10-04T00:49:15Z"
+      },
+      {
+       "id": "RateLimitResetCredit_x",
+       "resetType": "codexRateLimits",
+       "status": "available",
+       "title": "Full reset (Weekly + 5 hr)",
+       "description": "Thanks for using Codex! You've been granted one free rate limit reset.",
+       "grantedAt": "2026-09-04T22:14:58Z",
+       "expiresAt": "2026-10-04T22:14:58Z"
+      }
+     ]
+    },
+    "fetchedAt": "2026-09-15T22:18:08.086123033Z"
+   },
+   "stale": false
+  },
+  {
+   "account": {
+    "id": "00000000-0000-0000-0000-000000000004",
+    "provider": "claude",
+    "name": "i***@g***.com",
+    "email": "i***@g***.com",
+    "identity": "",
+    "status": "ready",
+    "createdAt": "2026-08-25T06:49:46.943378947Z",
+    "updatedAt": "2026-09-16T02:52:15.299154893Z",
+    "credentialUpdatedAt": "2026-09-16T10:47:58.502Z"
+   },
+   "current": true,
+   "quota": {
+    "schemaVersion": 1,
+    "provider": "claude",
+    "accountId": "00000000-0000-0000-0000-000000000004",
+    "plan": "pro",
+    "windows": [
+     {
+      "name": "five_hour",
+      "durationSeconds": 18000,
+      "usedPercent": 66,
+      "remainingPercent": 34,
+      "resetsAt": "2026-09-16T01:29:59.818613Z"
+     },
+     {
+      "name": "nimbus_quill",
+      "usedPercent": 0,
+      "remainingPercent": 100
+     },
+     {
+      "name": "seven_day",
+      "durationSeconds": 604800,
+      "usedPercent": 21,
+      "remainingPercent": 79,
+      "resetsAt": "2026-09-22T05:59:59.818643Z"
+     }
+    ],
+    "extraUsage": {
+     "enabled": false
+    },
+    "fetchedAt": "2026-09-16T00:12:35.905745123Z"
+   },
+   "stale": true
+  },
+  {
+   "account": {
+    "id": "00000000-0000-0000-0000-000000000005",
+    "provider": "codex",
+    "name": "i***@i***.com",
+    "email": "i***@i***.com",
+    "identity": "",
+    "status": "ready",
+    "createdAt": "2026-08-13T14:36:46.534697055Z",
+    "updatedAt": "2026-09-16T02:46:31.154355481Z",
+    "credentialUpdatedAt": "2026-09-09T17:50:40.718785838Z"
+   },
+   "current": false,
+   "quota": {
+    "schemaVersion": 1,
+    "provider": "codex",
+    "accountId": "00000000-0000-0000-0000-000000000005",
+    "plan": "plus",
+    "windows": [
+     {
+      "name": "five_hour",
+      "durationSeconds": 18000,
+      "usedPercent": 86,
+      "remainingPercent": 14,
+      "resetsAt": "2026-09-16T02:50:03Z"
+     },
+     {
+      "name": "seven_day",
+      "durationSeconds": 604800,
+      "usedPercent": 43,
+      "remainingPercent": 57,
+      "resetsAt": "2026-09-21T04:06:14Z"
+     }
+    ],
+    "creditsRemaining": 0,
+    "resetCredits": {
+     "availableCount": 3,
+     "credits": [
+      {
+       "id": "RateLimitResetCredit_x",
+       "resetType": "codexRateLimits",
+       "status": "available",
+       "title": "Full reset (Weekly + 5 hr)",
+       "description": "Thanks for using Codex! You've been granted one free rate limit reset.",
+       "grantedAt": "2026-08-21T23:23:40Z",
+       "expiresAt": "2026-09-20T23:23:40Z"
+      },
+      {
+       "id": "RateLimitResetCredit_x",
+       "resetType": "codexRateLimits",
+       "status": "available",
+       "title": "Full reset (Weekly + 5 hr)",
+       "description": "Thanks for using Codex! You've been granted one free rate limit reset.",
+       "grantedAt": "2026-09-04T00:48:42Z",
+       "expiresAt": "2026-10-04T00:48:42Z"
+      },
+      {
+       "id": "RateLimitResetCredit_x",
+       "resetType": "codexRateLimits",
+       "status": "available",
+       "title": "Full reset (Weekly + 5 hr)",
+       "description": "Thanks for using Codex! You've been granted one free rate limit reset.",
+       "grantedAt": "2026-09-04T22:12:57Z",
+       "expiresAt": "2026-10-04T22:12:57Z"
+      }
+     ]
+    },
+    "fetchedAt": "2026-09-16T00:12:34.446907183Z"
+   },
+   "stale": false
+  },
+  {
+   "account": {
+    "id": "00000000-0000-0000-0000-000000000006",
+    "provider": "codex",
+    "name": "j***@i***.com",
+    "email": "j***@i***.com",
+    "identity": "",
+    "status": "ready",
+    "createdAt": "2026-08-15T07:29:02.925863027Z",
+    "updatedAt": "2026-09-13T01:20:25.085852223Z",
+    "credentialUpdatedAt": "2026-09-13T01:20:24.879962025Z"
+   },
+   "current": false,
+   "quota": {
+    "schemaVersion": 1,
+    "provider": "codex",
+    "accountId": "00000000-0000-0000-0000-000000000006",
+    "plan": "free",
+    "windows": [
+     {
+      "name": "43200_minute",
+      "durationSeconds": 2592000,
+      "usedPercent": 0,
+      "remainingPercent": 100,
+      "resetsAt": "2026-10-15T22:18:03Z"
+     }
+    ],
+    "creditsRemaining": 0,
+    "resetCredits": {
+     "availableCount": 2,
+     "credits": [
+      {
+       "id": "RateLimitResetCredit_x",
+       "resetType": "codexRateLimits",
+       "status": "available",
+       "title": "Full reset (Monthly)",
+       "description": "Thanks for using Codex! You've been granted one free rate limit reset.",
+       "grantedAt": "2026-09-04T00:37:12Z",
+       "expiresAt": "2026-10-04T00:37:12Z"
+      },
+      {
+       "id": "RateLimitResetCredit_x",
+       "resetType": "codexRateLimits",
+       "status": "available",
+       "title": "Full reset (Monthly)",
+       "description": "Thanks for using Codex! You've been granted one free rate limit reset.",
+       "grantedAt": "2026-09-04T21:47:52Z",
+       "expiresAt": "2026-10-04T21:47:52Z"
+      }
+     ]
+    },
+    "fetchedAt": "2026-09-15T22:18:03.953377689Z"
+   },
+   "stale": false
+  },
+  {
+   "account": {
+    "id": "00000000-0000-0000-0000-000000000007",
+    "provider": "codex",
+    "name": "g***@i***.com",
+    "email": "g***@i***.com",
+    "identity": "",
+    "status": "ready",
+    "createdAt": "2026-08-15T07:24:17.394924044Z",
+    "updatedAt": "2026-09-06T09:44:18.61460276Z",
+    "credentialUpdatedAt": "2026-09-06T09:44:16.014408011Z"
+   },
+   "current": false,
+   "quota": {
+    "schemaVersion": 1,
+    "provider": "codex",
+    "accountId": "00000000-0000-0000-0000-000000000007",
+    "plan": "free",
+    "windows": [
+     {
+      "name": "43200_minute",
+      "durationSeconds": 2592000,
+      "usedPercent": 0,
+      "remainingPercent": 100,
+      "resetsAt": "2026-10-15T22:18:01Z"
+     }
+    ],
+    "creditsRemaining": 0,
+    "resetCredits": {
+     "availableCount": 1,
+     "credits": [
+      {
+       "id": "RateLimitResetCredit_x",
+       "resetType": "codexRateLimits",
+       "status": "available",
+       "title": "Full reset (Monthly)",
+       "description": "Thanks for using Codex! You've been granted one free rate limit reset.",
+       "grantedAt": "2026-08-21T23:54:20Z",
+       "expiresAt": "2026-09-20T23:54:20Z"
+      }
+     ]
+    },
+    "fetchedAt": "2026-09-15T22:18:01.504825808Z"
+   },
+   "stale": false
+  },
+  {
+   "account": {
+    "id": "00000000-0000-0000-0000-000000000008",
+    "provider": "codex",
+    "name": "p***@i***.com",
+    "email": "p***@i***.com",
+    "identity": "",
+    "status": "ready",
+    "createdAt": "2026-08-15T07:18:13.273200988Z",
+    "updatedAt": "2026-09-06T09:44:15.07040747Z",
+    "credentialUpdatedAt": "2026-09-06T09:44:12.419698995Z"
+   },
+   "current": false,
+   "quota": {
+    "schemaVersion": 1,
+    "provider": "codex",
+    "accountId": "00000000-0000-0000-0000-000000000008",
+    "plan": "free",
+    "windows": [
+     {
+      "name": "43200_minute",
+      "durationSeconds": 2592000,
+      "usedPercent": 0,
+      "remainingPercent": 100,
+      "resetsAt": "2026-10-15T22:17:59Z"
+     }
+    ],
+    "creditsRemaining": 0,
+    "resetCredits": {
+     "availableCount": 1,
+     "credits": [
+      {
+       "id": "RateLimitResetCredit_x",
+       "resetType": "codexRateLimits",
+       "status": "available",
+       "title": "Full reset (Monthly)",
+       "description": "Thanks for using Codex! You've been granted one free rate limit reset.",
+       "grantedAt": "2026-08-21T23:10:09Z",
+       "expiresAt": "2026-09-20T23:10:09Z"
+      }
+     ]
+    },
+    "fetchedAt": "2026-09-15T22:17:59.283845803Z"
+   },
+   "stale": false
+  },
+  {
+   "account": {
+    "id": "00000000-0000-0000-0000-000000000009",
+    "provider": "codex",
+    "name": "m***@i***.com",
+    "email": "m***@i***.com",
+    "identity": "",
+    "status": "ready",
+    "createdAt": "2026-08-13T14:36:46.534697055Z",
+    "updatedAt": "2026-09-06T09:43:48.909671727Z",
+    "credentialUpdatedAt": "2026-09-06T09:43:04.40707505Z"
+   },
+   "current": false,
+   "quota": {
+    "schemaVersion": 1,
+    "provider": "codex",
+    "accountId": "00000000-0000-0000-0000-000000000009",
+    "plan": "free",
+    "windows": [
+     {
+      "name": "43200_minute",
+      "durationSeconds": 2592000,
+      "usedPercent": 0,
+      "remainingPercent": 100,
+      "resetsAt": "2026-10-15T22:17:57Z"
+     }
+    ],
+    "creditsRemaining": 0,
+    "resetCredits": {
+     "availableCount": 1,
+     "credits": [
+      {
+       "id": "RateLimitResetCredit_x",
+       "resetType": "codexRateLimits",
+       "status": "available",
+       "title": "Full reset (Monthly)",
+       "description": "Thanks for using Codex! You've been granted one free rate limit reset.",
+       "grantedAt": "2026-08-22T19:16:00Z",
+       "expiresAt": "2026-09-21T19:16:00Z"
+      }
+     ]
+    },
+    "fetchedAt": "2026-09-15T22:17:57.342709333Z"
+   },
+   "stale": false
+  },
+  {
+   "account": {
+    "id": "00000000-0000-0000-0000-00000000000a",
+    "provider": "codex",
+    "name": "d***@o***.fr",
+    "email": "d***@o***.fr",
+    "identity": "",
+    "status": "ready",
+    "createdAt": "2026-08-13T14:36:46.534697055Z",
+    "updatedAt": "2026-09-11T22:02:22.127843618Z",
+    "credentialUpdatedAt": "2026-09-11T22:02:21.941964747Z"
+   },
+   "current": false,
+   "quota": {
+    "schemaVersion": 1,
+    "provider": "codex",
+    "accountId": "00000000-0000-0000-0000-00000000000a",
+    "plan": "free",
+    "windows": [
+     {
+      "name": "43200_minute",
+      "durationSeconds": 2592000,
+      "usedPercent": 0,
+      "remainingPercent": 100,
+      "resetsAt": "2026-10-11T22:04:25Z"
+     }
+    ],
+    "creditsRemaining": 0,
+    "resetCredits": {
+     "availableCount": 3,
+     "credits": [
+      {
+       "id": "RateLimitResetCredit_x",
+       "resetType": "codexRateLimits",
+       "status": "available",
+       "title": "Full reset (Monthly)",
+       "description": "Thanks for using Codex! You've been granted one free rate limit reset.",
+       "grantedAt": "2026-08-21T23:52:26Z",
+       "expiresAt": "2026-09-20T23:52:26Z"
+      },
+      {
+       "id": "RateLimitResetCredit_x",
+       "resetType": "codexRateLimits",
+       "status": "available",
+       "title": "Full reset (Monthly)",
+       "description": "Thanks for using Codex! You've been granted one free rate limit reset.",
+       "grantedAt": "2026-09-04T05:18:09Z",
+       "expiresAt": "2026-10-04T05:18:09Z"
+      },
+      {
+       "id": "RateLimitResetCredit_x",
+       "resetType": "codexRateLimits",
+       "status": "available",
+       "title": "Full reset (Monthly)",
+       "description": "Thanks for using Codex! You've been granted one free rate limit reset.",
+       "grantedAt": "2026-09-04T23:48:34Z",
+       "expiresAt": "2026-10-04T23:48:34Z"
+      }
+     ]
+    },
+    "fetchedAt": "2026-09-15T22:17:52.133533786Z"
+   },
+   "stale": false
+  },
+  {
+   "account": {
+    "id": "00000000-0000-0000-0000-00000000000b",
+    "provider": "codex",
+    "name": "e***@o***.fr",
+    "email": "e***@o***.fr",
+    "identity": "",
+    "status": "ready",
+    "createdAt": "2026-08-13T14:36:46.534697055Z",
+    "updatedAt": "2026-09-11T22:03:29.046706094Z",
+    "credentialUpdatedAt": "2026-09-11T22:03:28.830234672Z"
+   },
+   "current": false,
+   "quota": {
+    "schemaVersion": 1,
+    "provider": "codex",
+    "accountId": "00000000-0000-0000-0000-00000000000b",
+    "plan": "free",
+    "windows": [
+     {
+      "name": "43200_minute",
+      "durationSeconds": 2592000,
+      "usedPercent": 0,
+      "remainingPercent": 100,
+      "resetsAt": "2026-10-15T22:17:49Z"
+     }
+    ],
+    "creditsRemaining": 0,
+    "resetCredits": {
+     "availableCount": 0
+    },
+    "fetchedAt": "2026-09-15T22:17:49.713443056Z"
+   },
+   "stale": false
+  },
+  {
+   "account": {
+    "id": "00000000-0000-0000-0000-00000000000c",
+    "provider": "codex",
+    "name": "s***@o***.com",
+    "email": "s***@o***.com",
+    "identity": "",
+    "status": "ready",
+    "createdAt": "2026-08-13T14:36:46.534697055Z",
+    "updatedAt": "2026-09-14T02:56:54.06974206Z",
+    "credentialUpdatedAt": "2026-09-14T02:56:53.91026165Z"
+   },
+   "current": false,
+   "quota": {
+    "schemaVersion": 1,
+    "provider": "codex",
+    "accountId": "00000000-0000-0000-0000-00000000000c",
+    "plan": "free",
+    "windows": [
+     {
+      "name": "43200_minute",
+      "durationSeconds": 2592000,
+      "usedPercent": 0,
+      "remainingPercent": 100,
+      "resetsAt": "2026-10-15T22:17:46Z"
+     }
+    ],
+    "creditsRemaining": 0,
+    "resetCredits": {
+     "availableCount": 3,
+     "credits": [
+      {
+       "id": "RateLimitResetCredit_x",
+       "resetType": "codexRateLimits",
+       "status": "available",
+       "title": "Full reset (Monthly)",
+       "description": "Thanks for using Codex! You've been granted one free rate limit reset.",
+       "grantedAt": "2026-08-22T19:16:10Z",
+       "expiresAt": "2026-09-21T19:16:10Z"
+      },
+      {
+       "id": "RateLimitResetCredit_x",
+       "resetType": "codexRateLimits",
+       "status": "available",
+       "title": "Full reset (Monthly)",
+       "description": "Thanks for using Codex! You've been granted one free rate limit reset.",
+       "grantedAt": "2026-09-04T05:15:17Z",
+       "expiresAt": "2026-10-04T05:15:17Z"
+      },
+      {
+       "id": "RateLimitResetCredit_x",
+       "resetType": "codexRateLimits",
+       "status": "available",
+       "title": "Full reset (Monthly)",
+       "description": "Thanks for using Codex! You've been granted one free rate limit reset.",
+       "grantedAt": "2026-09-04T23:51:24Z",
+       "expiresAt": "2026-10-04T23:51:24Z"
+      }
+     ]
+    },
+    "fetchedAt": "2026-09-15T22:17:46.965190176Z"
+   },
+   "stale": false
+  }
+ ],
+ "generatedAt": "2026-09-16T02:52:15Z",
+ "schemaVersion": 1
+}

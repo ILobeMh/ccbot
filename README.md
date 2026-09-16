@@ -104,6 +104,8 @@ ALLOWED_USERS=your_telegram_user_id
 | `CCBOT_SPECIAL_TOPICS` | `shell,ccc` | Bot-owned topics to create in the group (see below); empty disables |
 | `CCBOT_FORUM_CHAT_ID` | _(learned)_ | Supergroup id used to create special topics (needs the "Manage Topics" admin right) |
 | `CCBOT_SHELL_TIMEOUT` | `120` | Per-command timeout (seconds) in the `shell` topic |
+| `CCBOT_CCC_COMMAND` | `ccc` | Path to the `ccc` account switcher used by the `ccc` topic |
+| `CCBOT_CCC_POLL_INTERVAL` | `300` | How often (seconds) the `ccc` topic re-checks quotas |
 | `CCBOT_SCREENSHOT_FONT` | _(bundled MesloLGS NF)_ | TTF/OTF used as the primary `/screenshot` font |
 | `CCBOT_SCREENSHOT_FONT_SIZE` | `28` | `/screenshot` font size in px |
 | `OPENAI_API_KEY` | _(none)_ | OpenAI API key for voice message transcription |
@@ -191,6 +193,7 @@ The bot creates these topics itself (it needs the **Manage Topics** admin right 
 | Topic | What it does |
 | ----- | ------------ |
 | `shell` | A raw shell on the bot's host — no Claude Code. Every message runs as a command (`$SHELL -lc`); the reply shows the output, exit code, duration and cwd. `cd` persists, output over 3000 chars is attached as a file, and a running command has a ⏹ Kill button. |
+| `ccc` | Claude Code / Codex account switching via [`ccc`](https://github.com/ILobeMh/claude-code-codex-sw). Any message shows the dashboard (accounts, plan, 5h/7d quota, reset times, reset credits) with ▶ Use / ⏭ Next / 🔄 Refresh buttons and a 🔁 button that restarts every Claude Code session so it picks up the new login. A watcher polls quota, wakes up right after the earliest reset, and posts when the account in use is exhausted (with the best alternative) and when an exhausted account is usable again. |
 
 ### Topic Workflow
 

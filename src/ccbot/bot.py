@@ -98,6 +98,7 @@ from .handlers.callback_data import (
     CB_WIN_CANCEL,
     CB_WIN_NEW,
 )
+from .handlers.ccc_topic import ccc_topic
 from .handlers.cleanup import clear_topic_state
 from .handlers.directory_browser import (
     BROWSE_DIRS_KEY,
@@ -363,6 +364,16 @@ async def _restart_claude(
         extra = f" (answered: {note})" if note != "ready" else ""
         return True, f"✅ Restarted in {mode_label} mode, {what}{extra}."
     return False, f"⚠️ Restarted ({what}) but Claude Code is not ready: {note}."
+
+
+async def _restart_all_claude_sessions() -> str:
+    """Restart Claude Code in every bound window (after an account switch)."""
+    lines: list[str] = []
+    for user_id, _thread_id, wid in list(session_manager.iter_thread_bindings()):
+        display = session_manager.get_display_name(wid)
+        ok, msg = await _restart_claude(user_id, wid)
+        lines.append(f"{'✅' if ok else '⚠️'} `{display}`: {msg}")
+    return "\n".join(lines) if lines else "No Claude Code sessions are bound."
 
 
 async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2466,6 +2477,7 @@ async def post_init(application: Application) -> None:
     logger.info("Status polling task started")
 
     # Create bot-owned topics (shell, ccc, …) once the forum chat is known
+    ccc_topic.set_restart_handler(_restart_all_claude_sessions)
     await ensure_special_topics(application.bot)
 
 
