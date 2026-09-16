@@ -2391,8 +2391,6 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
 
         if msg.content_type == "text" and msg.role == "assistant":
             record_assistant_text(wid, msg.text)
-        elif msg.content_type == "error":
-            await notify("error", msg.text[:300], wid, signature=msg.text[:80])
 
         parts = build_response_parts(
             msg.text,

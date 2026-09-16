@@ -52,6 +52,8 @@ class _State:
     working_since: dict[str, float] = {}
     # window_id -> last assistant text (first line) for "turn done"
     last_text: dict[str, str] = {}
+    # window_id -> Telegram message id of the last assistant text message
+    last_text_msg: dict[str, int] = {}
     # window_id -> signature of the UI already announced, and how many
     # dialogs have come and gone (so a re-shown dialog isn't deduped away)
     announced_ui: dict[str, str] = {}
@@ -64,12 +66,19 @@ _s = _State()
 DEDUPE_SECONDS = 60.0
 
 
-def _topic_link(chat_id: int, thread_id: int | None) -> str | None:
-    """Deep link to a forum topic (supergroup ids are -100<internal>)."""
+def _topic_link(
+    chat_id: int, thread_id: int | None, message_id: int | None = None
+) -> str | None:
+    """Deep link to a forum topic, or to one message inside it.
+
+    Supergroup ids are -100<internal>; t.me/c/<internal>/<thread>/<message>
+    opens the topic scrolled to that message.
+    """
     raw = str(chat_id)
     if not raw.startswith("-100") or thread_id is None:
         return None
-    return f"https://t.me/c/{raw[4:]}/{thread_id}"
+    link = f"https://t.me/c/{raw[4:]}/{thread_id}"
+    return f"{link}/{message_id}" if message_id else link
 
 
 def _enabled(kind: str) -> bool:
@@ -91,11 +100,13 @@ async def notify(
     *,
     signature: str | None = None,
     buttons: list[InlineKeyboardButton] | None = None,
+    message_id: int | None = None,
 ) -> bool:
     """Post an event to the notifications topic if that kind is enabled.
 
     ``signature`` suppresses repeats of the same event within
-    DEDUPE_SECONDS. Returns True when a message was sent.
+    DEDUPE_SECONDS. ``message_id`` makes the jump button open the topic at
+    that message instead of at the top. Returns True when a message was sent.
     """
     if kind not in KINDS or not _enabled(kind):
         return False
@@ -117,7 +128,7 @@ async def notify(
     if window_id:
         display = session_manager.get_display_name(window_id)
         where = f"**{display}** · "
-        link = _topic_link(_s.chat_id, _thread_for_window(window_id))
+        link = _topic_link(_s.chat_id, _thread_for_window(window_id), message_id)
         if link:
             rows.append([InlineKeyboardButton(f"↗ {display}", url=link)])
     if buttons:
@@ -139,6 +150,26 @@ def record_assistant_text(window_id: str, text: str) -> None:
     first = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
     if first:
         _s.last_text[window_id] = first[:160]
+
+
+async def record_sent(
+    window_id: str, content_type: str, message_id: int, text: str
+) -> None:
+    """Called by the queue after a content message reached Telegram.
+
+    Remembers the last reply's message id (for the turn-done jump link)
+    and raises the API-error notification once its message exists.
+    """
+    if content_type == "text":
+        _s.last_text_msg[window_id] = message_id
+    elif content_type == "error":
+        await notify(
+            "error",
+            text[:300],
+            window_id,
+            signature=text[:80],
+            message_id=message_id,
+        )
 
 
 async def mark_working(
@@ -172,11 +203,21 @@ async def mark_working(
         f"finished after {took}{status_note}{tail}",
         window_id,
         signature=f"done:{int(since)}",
+        message_id=_s.last_text_msg.get(window_id),
     )
 
 
-async def mark_ui(window_id: str, ui_name: str | None, content: str = "") -> None:
-    """Announce a newly shown interactive dialog once; reset when it clears."""
+async def mark_ui(
+    window_id: str,
+    ui_name: str | None,
+    content: str = "",
+    message_id: int | None = None,
+) -> None:
+    """Announce a newly shown interactive dialog once; reset when it clears.
+
+    Called with the Telegram message id of the rendered dialog (from
+    interactive_ui) so the jump button lands on it; ``None`` resets.
+    """
     if ui_name is None:
         if _s.announced_ui.pop(window_id, None) is not None:
             _s.ui_epoch[window_id] = _s.ui_epoch.get(window_id, 0) + 1
@@ -202,7 +243,11 @@ async def mark_ui(window_id: str, ui_name: str | None, content: str = "") -> Non
     )
     epoch = _s.ui_epoch.get(window_id, 0)
     await notify(
-        "input", f"{what}{detail}", window_id, signature=f"{epoch}:{signature}"
+        "input",
+        f"{what}{detail}",
+        window_id,
+        signature=f"{epoch}:{signature}",
+        message_id=message_id,
     )
 
 

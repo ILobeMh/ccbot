@@ -45,6 +45,31 @@ class TestNotify:
         assert url == "https://t.me/c/1234567890/55"
 
     @pytest.mark.asyncio
+    async def test_message_link(self, ready):
+        assert await nt.notify("input", "q", "@3", message_id=777)
+        url = ready.await_args.kwargs["reply_markup"].inline_keyboard[0][0].url
+        assert url == "https://t.me/c/1234567890/55/777"
+
+    @pytest.mark.asyncio
+    async def test_turn_done_links_last_reply(self, ready):
+        await nt.record_sent("@3", "text", 4242, "All done.")
+        await nt.mark_working("@3", True, None)
+        await nt.mark_working("@3", False, None)
+        url = ready.await_args.kwargs["reply_markup"].inline_keyboard[0][0].url
+        assert url.endswith("/55/4242")
+
+    @pytest.mark.asyncio
+    async def test_error_notified_from_record_sent(self, ready):
+        await nt.record_sent("@3", "error", 9, "🚨 You've hit your session limit")
+        assert ready.await_count == 1
+        assert "session limit" in ready.await_args.args[2]
+        assert (
+            ready.await_args.kwargs["reply_markup"]
+            .inline_keyboard[0][0]
+            .url.endswith("/9")
+        )
+
+    @pytest.mark.asyncio
     async def test_disabled_kind(self, ready, monkeypatch):
         monkeypatch.setattr(config, "notify_errors", False)
         assert not await nt.notify("error", "boom", "@3")

@@ -35,6 +35,7 @@ from .message_sender import (
     send_photo,
     send_with_fallback,
 )
+from .notifications_topic import record_sent
 
 logger = logging.getLogger(__name__)
 
@@ -397,6 +398,8 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
     # 3. Record tool_use message ID for later editing
     if last_msg_id and task.tool_use_id and task.content_type == "tool_use":
         _tool_msg_ids[(task.tool_use_id, user_id, tid)] = last_msg_id
+    if last_msg_id:
+        await record_sent(wid, task.content_type, last_msg_id, task.text or "")
 
     # 4. Send images if present (from tool_result with base64 image blocks)
     await _send_task_images(bot, chat_id, task)

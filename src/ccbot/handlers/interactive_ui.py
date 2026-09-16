@@ -34,6 +34,7 @@ from .callback_data import (
     CB_ASK_UP,
 )
 from .message_sender import NO_LINK_PREVIEW
+from .notifications_topic import mark_ui
 
 logger = logging.getLogger(__name__)
 
@@ -202,11 +203,13 @@ async def handle_interactive_ui(
                 link_preview_options=NO_LINK_PREVIEW,
             )
             _interactive_mode[ikey] = window_id
+            await mark_ui(window_id, content.name, content.content, existing_msg_id)
             return True
         except BadRequest as e:
             if "Message is not modified" in str(e):
                 # Content unchanged — keep existing message as-is
                 _interactive_mode[ikey] = window_id
+                await mark_ui(window_id, content.name, content.content, existing_msg_id)
                 return True
             # Other edit failure — fall through to send new message,
             # but keep old message until replacement succeeds
@@ -240,6 +243,7 @@ async def handle_interactive_ui(
     if sent:
         _interactive_msgs[ikey] = sent.message_id
         _interactive_mode[ikey] = window_id
+        await mark_ui(window_id, content.name, content.content, sent.message_id)
         # New message sent successfully — now safe to delete the old one
         if existing_msg_id:
             try:

@@ -191,10 +191,8 @@ async def update_status_message(
         None if busy else parse_status_line(pane_text),
         paused=ui_now is not None,
     )
-    if ui_now is not None and ui_now.name not in AUTO_ANSWER_DIALOGS:
-        await mark_ui(window_id, ui_now.name, ui_now.content)
-    else:
-        await mark_ui(window_id, None)
+    if ui_now is None:
+        await mark_ui(window_id, None)  # dialog gone → next one is announced again
 
     interactive_window = get_interactive_window(user_id, thread_id)
     should_check_new_ui = True
