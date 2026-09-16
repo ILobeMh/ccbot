@@ -223,7 +223,7 @@ def _rel(dt: datetime | None, now: datetime | None = None) -> str:
 
 def _gauge(pct: int | None) -> str:
     if pct is None:
-        return "?"
+        return "▕??????▏"
     filled = round(pct / 100 * 6)
     return "▕" + "█" * filled + "░" * (6 - filled) + "▏"
 
@@ -232,7 +232,41 @@ def _short(name: str, n: int = 18) -> str:
     return name if len(name) <= n else name[: n - 1] + "…"
 
 
+def _gauge_line(w: Window, now: datetime) -> str:
+    """One aligned gauge row for a code block: ``5h ▕███░░░▏  51%  ↻ 5d8h``."""
+    pct = "?" if w.remaining is None else f"{w.remaining}%"
+    reset = ""
+    if w.resets_at and w.resets_at <= now:
+        reset = "  ↻ due"  # cached quota older than its reset; 🔄 refreshes
+    elif w.resets_at and (w.remaining is None or w.remaining < 100):
+        reset = f"  ↻ {_rel(w.resets_at, now)}"
+    return f"  {w.label:<3}{_gauge(w.remaining)} {pct:>4}{reset}"
+
+
+def _account_block(a: Account, now: datetime) -> list[str]:
+    mark = "●" if a.current else "○"
+    flags = []
+    if a.exhausted:
+        flags.append("⛔")
+    if a.status != "ready":
+        flags.append(a.status)
+    if a.reset_credits:
+        flags.append(f"🎟{a.reset_credits}")
+    if a.stale:
+        flags.append("stale")
+    head = f"{mark} {_short(a.name, 24)}  {a.plan}"
+    if flags:
+        head += "  " + " ".join(flags)
+    return [head] + [_gauge_line(w, now) for w in a.main_windows]
+
+
 def render_dashboard(accounts: list[Account]) -> tuple[str, InlineKeyboardMarkup]:
+    """Dashboard text + keyboard, laid out for a phone-width screen.
+
+    Each provider is a heading followed by a monospace block: one line per
+    account (● = in use) and one aligned gauge line per quota window, so
+    nothing wraps and the bars line up.
+    """
     now = datetime.now(timezone.utc)
     lines: list[str] = []
     rows: list[list[InlineKeyboardButton]] = []
@@ -240,39 +274,24 @@ def render_dashboard(accounts: list[Account]) -> tuple[str, InlineKeyboardMarkup
         accs = [a for a in accounts if a.provider == provider]
         if not accs:
             continue
-        paid = [a for a in accs if a.plan != "free"]
-        free = [a for a in accs if a.plan == "free"]
-        lines.append(
-            f"{PROVIDER_ICON[provider]} **{PROVIDER_TITLE[provider]}** — {len(accs)} accounts"
+        paid = sorted(
+            [a for a in accs if a.plan != "free"], key=lambda x: (not x.current, x.name)
         )
-        for a in sorted(paid, key=lambda x: (not x.current, x.name)):
-            mark = "●" if a.current else "○"
-            parts = [f"{mark} `{_short(a.name)}` · {a.plan}"]
-            for w in a.main_windows:
-                reset = ""
-                if w.resets_at:
-                    # A reset time in the past means the cached quota is due
-                    # for a refresh (the watcher does it; 🔄 forces it).
-                    reset = (
-                        " ↻due" if w.resets_at <= now else f" ↻{_rel(w.resets_at, now)}"
-                    )
-                parts.append(f"{w.label} {_gauge(w.remaining)}{w.remaining}%{reset}")
-            flags = []
-            if a.exhausted:
-                flags.append("⛔ exhausted")
-            if a.status != "ready":
-                flags.append(a.status)
-            if a.reset_credits:
-                flags.append(f"🎟{a.reset_credits}")
-            if a.stale:
-                flags.append("stale")
-            if flags:
-                parts.append(" ".join(flags))
-            lines.append("  " + " · ".join(parts))
+        free = [a for a in accs if a.plan == "free"]
+        in_use = next((a for a in accs if a.current), None)
+        lines.append(
+            f"{PROVIDER_ICON[provider]} **{PROVIDER_TITLE[provider]}** — "
+            f"{len(accs)} accounts"
+            + (f", using `{_short(in_use.name, 24)}`" if in_use else "")
+        )
+        block: list[str] = []
+        for a in paid:
+            block.extend(_account_block(a, now))
         if free:
             ok = sum(1 for a in free if not a.exhausted)
-            lines.append(f"  ○ {len(free)} free accounts ({ok} with quota)")
-        lines.append("")
+            block.append(f"○ {len(free)} free accounts ({ok} with quota)")
+        lines.append("```\n" + "\n".join(block) + "\n```")
+
         use_row: list[InlineKeyboardButton] = []
         for a in sorted(paid, key=lambda x: x.name):
             if a.current:
@@ -304,7 +323,10 @@ def render_dashboard(accounts: list[Account]) -> tuple[str, InlineKeyboardMarkup
             ),
         ]
     )
-    lines.append(f"_updated {now.strftime('%H:%M:%S')} UTC_")
+    lines.append(
+        f"_● in use · ↻ resets in · 🎟 reset credits · updated "
+        f"{now.strftime('%H:%M')} UTC_"
+    )
     return "\n".join(lines), InlineKeyboardMarkup(rows)
 
 
