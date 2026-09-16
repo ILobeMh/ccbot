@@ -58,3 +58,6 @@ CB_MODE_SET = "md:set:"  # md:set:<mode>:<window>  (Shift+Tab cycling)
 # Window lifecycle
 CB_RESTART = "rw:go:"  # rw:go:<window>[:<mode>]
 CB_KILL = "rw:kill:"  # rw:kill:<window>
+
+# Special topics
+CB_SHELL_KILL = "sh:kill:"  # sh:kill:<message_id>

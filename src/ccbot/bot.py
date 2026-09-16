@@ -66,6 +66,7 @@ from telegram.request import HTTPXRequest
 from . import __version__
 from .claude_config import ensure_trusted_directory
 from .config import config
+from .handlers import shell_topic as _shell_topic  # noqa: F401  (registers "shell")
 from .handlers.callback_data import (
     CB_ASK_DOWN,
     CB_ASK_ENTER,

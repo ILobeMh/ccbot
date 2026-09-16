@@ -103,6 +103,7 @@ ALLOWED_USERS=your_telegram_user_id
 | `CCBOT_DEFAULT_DIR` | _(bot cwd)_ | Directory the directory browser opens at |
 | `CCBOT_SPECIAL_TOPICS` | `shell,ccc` | Bot-owned topics to create in the group (see below); empty disables |
 | `CCBOT_FORUM_CHAT_ID` | _(learned)_ | Supergroup id used to create special topics (needs the "Manage Topics" admin right) |
+| `CCBOT_SHELL_TIMEOUT` | `120` | Per-command timeout (seconds) in the `shell` topic |
 | `CCBOT_SCREENSHOT_FONT` | _(bundled MesloLGS NF)_ | TTF/OTF used as the primary `/screenshot` font |
 | `CCBOT_SCREENSHOT_FONT_SIZE` | `28` | `/screenshot` font size in px |
 | `OPENAI_API_KEY` | _(none)_ | OpenAI API key for voice message transcription |
@@ -182,6 +183,14 @@ uv run ccbot
 | `/memory`  | Edit CLAUDE.md               |
 
 Any unrecognized `/command` is also forwarded to Claude Code as-is (e.g. `/review`, `/doctor`, `/init`).
+
+### Special topics
+
+The bot creates these topics itself (it needs the **Manage Topics** admin right in the group). Delete one and it is recreated on the next bot restart; `CCBOT_SPECIAL_TOPICS=` (empty) disables them.
+
+| Topic | What it does |
+| ----- | ------------ |
+| `shell` | A raw shell on the bot's host — no Claude Code. Every message runs as a command (`$SHELL -lc`); the reply shows the output, exit code, duration and cwd. `cd` persists, output over 3000 chars is attached as a file, and a running command has a ⏹ Kill button. |
 
 ### Topic Workflow
 

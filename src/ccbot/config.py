@@ -114,6 +114,9 @@ class Config:
             int(raw_forum) if raw_forum.lstrip("-").isdigit() else None
         )
 
+        # Per-command timeout for the "shell" special topic (seconds)
+        self.shell_timeout = float(os.getenv("CCBOT_SHELL_TIMEOUT", "120"))
+
         # Directory the directory browser opens at (default: bot's cwd)
         self.default_dir = os.getenv("CCBOT_DEFAULT_DIR", "")
 
