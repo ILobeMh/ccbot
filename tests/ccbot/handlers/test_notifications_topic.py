@@ -30,6 +30,7 @@ def ready(monkeypatch):
         monkeypatch.setattr(config, attr, True)
     monkeypatch.setattr(config, "notify_turn_min", 0.0)
     monkeypatch.setattr(config, "quiet_hours", "")
+    monkeypatch.setattr(nt, "TURN_DONE_DELAY", 0)
     return send
 
 
@@ -57,6 +58,14 @@ class TestNotify:
         await nt.mark_working("@3", False, None)
         url = ready.await_args.kwargs["reply_markup"].inline_keyboard[0][0].url
         assert url.endswith("/55/4242")
+
+    @pytest.mark.asyncio
+    async def test_merged_thinking_message_counts_as_reply(self, ready):
+        await nt.record_sent("@3", "thinking", 4300, "…")
+        await nt.mark_working("@3", True, None)
+        await nt.mark_working("@3", False, None)
+        url = ready.await_args.kwargs["reply_markup"].inline_keyboard[0][0].url
+        assert url.endswith("/55/4300")
 
     @pytest.mark.asyncio
     async def test_error_notified_from_record_sent(self, ready):

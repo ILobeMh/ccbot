@@ -20,6 +20,7 @@ Key components:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 
@@ -60,10 +61,13 @@ class _State:
     ui_epoch: dict[str, int] = {}
     # (kind, window_id, signature) -> monotonic time, for generic dedupe
     recent: dict[tuple[str, str, str], float] = {}
+    # delayed announcements in flight (kept referenced until done)
+    pending: set[asyncio.Task[None]] = set()
 
 
 _s = _State()
 DEDUPE_SECONDS = 60.0
+TURN_DONE_DELAY = 4.0
 
 
 def _topic_link(
@@ -123,6 +127,9 @@ async def notify(
     _s.recent[sig_key] = now
 
     _attr, icon = KINDS[kind]
+    logger.info(
+        "notification %s window=%s msg=%s: %s", kind, window_id, message_id, text[:80]
+    )
     where = ""
     rows: list[list[InlineKeyboardButton]] = []
     if window_id:
@@ -160,7 +167,9 @@ async def record_sent(
     Remembers the last reply's message id (for the turn-done jump link)
     and raises the API-error notification once its message exists.
     """
-    if content_type == "text":
+    # Merged queue tasks carry the first part's content_type (often
+    # "thinking"), so treat every non-tool message as "the latest reply".
+    if content_type in ("text", "thinking"):
         _s.last_text_msg[window_id] = message_id
     elif content_type == "error":
         await notify(
@@ -193,6 +202,21 @@ async def mark_working(
     duration = time.monotonic() - since
     if duration < config.notify_turn_min:
         return
+    # The footer goes idle before the queue has delivered the last reply;
+    # announce a moment later (off the polling loop) so the jump link points
+    # at that message.
+    coro = _announce_done(window_id, since, duration, status)
+    if TURN_DONE_DELAY:
+        _s.pending.add(asyncio.create_task(coro))
+    else:
+        await coro
+
+
+async def _announce_done(
+    window_id: str, since: float, duration: float, status: str | None
+) -> None:
+    if TURN_DONE_DELAY:
+        await asyncio.sleep(TURN_DONE_DELAY)
     mins, secs = divmod(int(duration), 60)
     took = f"{mins}m{secs:02d}s" if mins else f"{secs}s"
     snippet = _s.last_text.get(window_id, "")
@@ -205,6 +229,7 @@ async def mark_working(
         signature=f"done:{int(since)}",
         message_id=_s.last_text_msg.get(window_id),
     )
+    _s.pending = {t for t in _s.pending if not t.done()}
 
 
 async def mark_ui(
