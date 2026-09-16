@@ -4,8 +4,9 @@ Anything that needs the user's attention or is worth knowing about lands
 here, tagged with the session's topic and a button that jumps to it:
   - needs input: AskUserQuestion, permission / bash approval, plan approval,
     unknown dialogs (deduplicated while the same dialog stays on screen)
-  - turn finished (after at least ``notify_turn_min`` seconds of work),
-    with the last reply's first line
+  - turn finished: the transcript's stop_reason == "end_turn" message,
+    linked directly, with the duration since the prompt (optionally only
+    turns longer than ``notify_turn_min`` seconds)
   - lifecycle: session created/resumed, restarted, Claude exited, update
     installed
   - API errors from the transcript (rate limits, session limits, 5xx)
@@ -15,7 +16,8 @@ Each kind has its own on/off in Settings; quiet hours apply to all.
 Key components:
   - notify(kind, …): the single entry point used by the rest of the bot
   - NotificationsTopic: SpecialTopic implementation registered as "notifications"
-  - mark_working()/mark_ui(): state used to detect turn-done and dedupe UIs
+  - record_turn_start()/record_sent()/mark_ui(): hooks from the monitor,
+    the send queue and the interactive UI
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from datetime import datetime, timezone
 
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
@@ -49,8 +52,8 @@ class _State:
     bot: Bot | None = None
     chat_id: int | None = None
     thread_id: int | None = None
-    # window_id -> monotonic time the current turn started (None = idle)
-    working_since: dict[str, float] = {}
+    # window_id -> transcript time of the last user prompt (turn start)
+    turn_started: dict[str, datetime] = {}
     # window_id -> last assistant text (first line) for "turn done"
     last_text: dict[str, str] = {}
     # window_id -> Telegram message id of the last assistant text message
@@ -61,13 +64,15 @@ class _State:
     ui_epoch: dict[str, int] = {}
     # (kind, window_id, signature) -> monotonic time, for generic dedupe
     recent: dict[tuple[str, str, str], float] = {}
-    # delayed announcements in flight (kept referenced until done)
-    pending: set[asyncio.Task[None]] = set()
+    # "<window>:<turn key>" -> delayed turn-done announcement (replaceable)
+    pending_done: dict[str, asyncio.Task[None]] = {}
 
 
 _s = _State()
 DEDUPE_SECONDS = 60.0
-TURN_DONE_DELAY = 4.0
+# The thinking and text lines of the final API message are delivered as
+# separate Telegram messages; wait briefly so the link lands on the last one.
+TURN_DONE_DELAY = 1.5
 
 
 def _topic_link(
@@ -153,6 +158,20 @@ async def notify(
 # ── State hooks called by the rest of the bot ─────────────────────────────
 
 
+def _parse_ts(raw: str | None) -> datetime | None:
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def record_turn_start(window_id: str, entry_ts: str | None) -> None:
+    """A user prompt was written to the transcript: the turn starts here."""
+    _s.turn_started[window_id] = _parse_ts(entry_ts) or datetime.now(timezone.utc)
+
+
 def record_assistant_text(window_id: str, text: str) -> None:
     first = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
     if first:
@@ -160,76 +179,62 @@ def record_assistant_text(window_id: str, text: str) -> None:
 
 
 async def record_sent(
-    window_id: str, content_type: str, message_id: int, text: str
+    window_id: str,
+    content_type: str,
+    message_id: int,
+    text: str,
+    *,
+    ends_turn: bool = False,
+    turn_key: str | None = None,
+    entry_ts: str | None = None,
 ) -> None:
     """Called by the queue after a content message reached Telegram.
 
-    Remembers the last reply's message id (for the turn-done jump link)
-    and raises the API-error notification once its message exists.
+    ``ends_turn`` (the transcript's stop_reason == "end_turn") is what
+    finishes a turn: the notification links to exactly this message and
+    the duration is measured from the prompt's transcript timestamp. The
+    thinking and text lines of one API message share ``turn_key``, so a
+    later delivery for the same key replaces the pending announcement.
     """
-    # Merged queue tasks carry the first part's content_type (often
-    # "thinking"), so treat every non-tool message as "the latest reply".
-    if content_type in ("text", "thinking"):
-        _s.last_text_msg[window_id] = message_id
-    elif content_type == "error":
+    if content_type == "error":
         await notify(
-            "error",
-            text[:300],
-            window_id,
-            signature=text[:80],
-            message_id=message_id,
+            "error", text[:300], window_id, signature=text[:80], message_id=message_id
         )
-
-
-async def mark_working(
-    window_id: str, working: bool, status: str | None, paused: bool = False
-) -> None:
-    """Track busy→idle transitions per window; emit 'turn done'.
-
-    ``paused`` (a dialog is on screen) freezes the state: the turn is
-    neither running nor finished, so no event fires until it clears.
-    """
-    if paused:
         return
-    since = _s.working_since.get(window_id)
-    if working:
-        if since is None:
-            _s.working_since[window_id] = time.monotonic()
+    if not ends_turn:
         return
-    if since is None:
-        return
-    _s.working_since.pop(window_id, None)
-    duration = time.monotonic() - since
-    if duration < config.notify_turn_min:
-        return
-    # The footer goes idle before the queue has delivered the last reply;
-    # announce a moment later (off the polling loop) so the jump link points
-    # at that message.
-    coro = _announce_done(window_id, since, duration, status)
-    if TURN_DONE_DELAY:
-        _s.pending.add(asyncio.create_task(coro))
-    else:
-        await coro
+    ended = _parse_ts(entry_ts) or datetime.now(timezone.utc)
+    key = f"{window_id}:{turn_key or message_id}"
+    pending = _s.pending_done.pop(key, None)
+    if pending is not None:
+        pending.cancel()
+    task = asyncio.create_task(_announce_done(window_id, message_id, key, ended, text))
+    _s.pending_done[key] = task
 
 
 async def _announce_done(
-    window_id: str, since: float, duration: float, status: str | None
+    window_id: str, message_id: int, key: str, ended: datetime, text: str
 ) -> None:
     if TURN_DONE_DELAY:
         await asyncio.sleep(TURN_DONE_DELAY)
-    mins, secs = divmod(int(duration), 60)
-    took = f"{mins}m{secs:02d}s" if mins else f"{secs}s"
-    snippet = _s.last_text.get(window_id, "")
-    tail = f"\n{snippet}" if snippet else ""
-    status_note = f" ({status})" if status else ""
+    _s.pending_done.pop(key, None)
+    started = _s.turn_started.pop(window_id, None)
+    took = ""
+    if started is not None:
+        total = max(0, int((ended - started).total_seconds()))
+        if total < config.notify_turn_min:
+            return
+        mins, secs = divmod(total, 60)
+        took = f" after {mins}m{secs:02d}s" if mins else f" after {secs}s"
+    first = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
+    tail = f"\n{first[:160]}" if first else ""
     await notify(
         "done",
-        f"finished after {took}{status_note}{tail}",
+        f"finished{took}{tail}",
         window_id,
-        signature=f"done:{int(since)}",
-        message_id=_s.last_text_msg.get(window_id),
+        signature=key,
+        message_id=message_id,
     )
-    _s.pending = {t for t in _s.pending if not t.done()}
 
 
 async def mark_ui(

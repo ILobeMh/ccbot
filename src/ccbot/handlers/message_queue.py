@@ -68,6 +68,9 @@ class MessageTask:
     content_type: str = "text"
     thread_id: int | None = None  # Telegram topic thread_id for targeted send
     image_data: list[tuple[str, bytes]] | None = None  # From tool_result images
+    ends_turn: bool = False  # last message of a Claude turn (stop_reason end_turn)
+    turn_key: str | None = None  # API message id, for turn-done dedupe
+    entry_ts: str | None = None  # JSONL timestamp
 
 
 # Per-user message queues and worker tasks
@@ -156,6 +159,7 @@ async def _merge_content_tasks(
     merged_parts = list(first.parts)
     current_length = sum(len(p) for p in merged_parts)
     merge_count = 0
+    merged_tasks: list[MessageTask] = [first]
 
     async with lock:
         items = _inspect_queue(queue)
@@ -177,6 +181,7 @@ async def _merge_content_tasks(
             merged_parts.extend(task.parts)
             current_length += task_length
             merge_count += 1
+            merged_tasks.append(task)
 
         # Put remaining items back into the queue
         for item in remaining:
@@ -195,6 +200,11 @@ async def _merge_content_tasks(
             parts=merged_parts,
             tool_use_id=first.tool_use_id,
             content_type=first.content_type,
+            ends_turn=any(t.ends_turn for t in merged_tasks),
+            turn_key=next(
+                (t.turn_key for t in reversed(merged_tasks) if t.ends_turn), None
+            ),
+            entry_ts=merged_tasks[-1].entry_ts,
             thread_id=first.thread_id,
         ),
         merge_count,
@@ -399,7 +409,15 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
     if last_msg_id and task.tool_use_id and task.content_type == "tool_use":
         _tool_msg_ids[(task.tool_use_id, user_id, tid)] = last_msg_id
     if last_msg_id:
-        await record_sent(wid, task.content_type, last_msg_id, task.text or "")
+        await record_sent(
+            wid,
+            task.content_type,
+            last_msg_id,
+            task.text or "",
+            ends_turn=task.ends_turn,
+            turn_key=task.turn_key,
+            entry_ts=task.entry_ts,
+        )
 
     # 4. Send images if present (from tool_result with base64 image blocks)
     await _send_task_images(bot, chat_id, task)
@@ -581,6 +599,9 @@ async def enqueue_content_message(
     text: str | None = None,
     thread_id: int | None = None,
     image_data: list[tuple[str, bytes]] | None = None,
+    ends_turn: bool = False,
+    turn_key: str | None = None,
+    entry_ts: str | None = None,
 ) -> None:
     """Enqueue a content message task."""
     logger.debug(
@@ -600,6 +621,9 @@ async def enqueue_content_message(
         content_type=content_type,
         thread_id=thread_id,
         image_data=image_data,
+        ends_turn=ends_turn,
+        turn_key=turn_key,
+        entry_ts=entry_ts,
     )
     queue.put_nowait(task)
 

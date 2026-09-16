@@ -148,7 +148,11 @@ from .handlers.message_sender import (
     safe_send,
     send_with_fallback,
 )
-from .handlers.notifications_topic import notify, record_assistant_text
+from .handlers.notifications_topic import (
+    notify,
+    record_assistant_text,
+    record_turn_start,
+)
 from .handlers.response_builder import build_response_parts
 from .handlers.settings_topic import settings_command
 from .handlers.special_topics import (
@@ -2389,7 +2393,11 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
         if not config.show_thinking and msg.content_type == "thinking":
             continue
 
-        if msg.content_type == "text" and msg.role == "assistant":
+        if msg.role == "user" and msg.content_type == "text":
+            record_turn_start(wid, msg.timestamp)
+            if not config.show_user_messages:
+                continue
+        elif msg.content_type == "text" and msg.role == "assistant":
             record_assistant_text(wid, msg.text)
 
         parts = build_response_parts(
@@ -2413,6 +2421,9 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
                 text=msg.text,
                 thread_id=thread_id,
                 image_data=msg.image_data,
+                ends_turn=msg.stop_reason == "end_turn",
+                turn_key=msg.api_message_id,
+                entry_ts=msg.timestamp,
             )
 
             # Update user's read offset to current file position

@@ -49,6 +49,9 @@ class NewMessage:
     role: str = "assistant"  # "user" or "assistant"
     tool_name: str | None = None  # For tool_use messages, the tool name
     image_data: list[tuple[str, bytes]] | None = None  # From tool_result images
+    timestamp: str | None = None  # ISO timestamp of the JSONL entry
+    stop_reason: str | None = None  # "end_turn" on the last message of a turn
+    api_message_id: str | None = None
 
 
 class SessionMonitor:
@@ -395,9 +398,8 @@ class SessionMonitor:
                 for entry in parsed_entries:
                     if not entry.text and not entry.image_data:
                         continue
-                    # Skip user messages unless show_user_messages is enabled
-                    if entry.role == "user" and not config.show_user_messages:
-                        continue
+                    # User messages are always emitted (they mark turn
+                    # starts); the bot decides whether to display them.
                     new_messages.append(
                         NewMessage(
                             session_id=session_info.session_id,
@@ -408,6 +410,9 @@ class SessionMonitor:
                             role=entry.role,
                             tool_name=entry.tool_name,
                             image_data=entry.image_data,
+                            timestamp=entry.timestamp,
+                            stop_reason=entry.stop_reason,
+                            api_message_id=entry.api_message_id,
                         )
                     )
 

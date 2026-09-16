@@ -534,3 +534,18 @@ class TestParseEntries:
         result, pending = TranscriptParser.parse_entries(entries)
         user_entries = [e for e in result if e.role == "user"]
         assert len(user_entries) == 0
+
+
+class TestTurnTagging:
+    def test_end_turn_and_message_id_tagged(self, make_jsonl_entry, make_text_block):
+        e1 = make_jsonl_entry("assistant", [make_text_block("working")])
+        e1["message"]["stop_reason"] = "tool_use"
+        e1["message"]["id"] = "msg_a"
+        e2 = make_jsonl_entry("assistant", [make_text_block("final")])
+        e2["message"]["stop_reason"] = "end_turn"
+        e2["message"]["id"] = "msg_b"
+        result, _ = TranscriptParser.parse_entries([e1, e2])
+        assert [(r.stop_reason, r.api_message_id) for r in result] == [
+            ("tool_use", "msg_a"),
+            ("end_turn", "msg_b"),
+        ]

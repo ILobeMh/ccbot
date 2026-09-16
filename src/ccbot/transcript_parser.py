@@ -48,6 +48,11 @@ class ParsedEntry:
     image_data: list[tuple[str, bytes]] | None = (
         None  # For tool_result entries with images: (media_type, raw_bytes)
     )
+    # Assistant entries: the API message's stop_reason ("end_turn" marks the
+    # last message of a turn) and id (shared by the thinking/text lines of
+    # one API message)
+    stop_reason: str | None = None
+    api_message_id: str | None = None
 
 
 @dataclass
@@ -450,7 +455,19 @@ class TranscriptParser:
         else:
             pending_tools = dict(pending_tools)  # don't mutate caller's dict
 
+        tag_from = 0  # entries appended since the previous line
+        tag_with: dict | None = None
+
+        def _tag() -> None:
+            if tag_with is None:
+                return
+            for e in result[tag_from:]:
+                e.stop_reason = tag_with.get("stop_reason")
+                e.api_message_id = tag_with.get("id")
+
         for data in entries:
+            _tag()
+            tag_from, tag_with = len(result), None
             msg_type = cls.get_message_type(data)
             if msg_type not in ("user", "assistant"):
                 continue
@@ -461,6 +478,8 @@ class TranscriptParser:
             message = data.get("message")
             if not isinstance(message, dict):
                 continue
+            if msg_type == "assistant":
+                tag_with = message
             content = message.get("content", "")
             if not isinstance(content, list):
                 content = [{"type": "text", "text": str(content)}] if content else []
@@ -763,6 +782,8 @@ class TranscriptParser:
                         tool_use_id=tool_id,
                     )
                 )
+
+        _tag()
 
         # Strip whitespace
         for entry in result:

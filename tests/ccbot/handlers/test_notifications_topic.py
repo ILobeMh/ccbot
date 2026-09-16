@@ -1,5 +1,6 @@
 """Tests for the notifications topic: gating, dedupe, turn-done and UI events."""
 
+import asyncio
 from unittest.mock import AsyncMock
 
 import pytest
@@ -52,22 +53,6 @@ class TestNotify:
         assert url == "https://t.me/c/1234567890/55/777"
 
     @pytest.mark.asyncio
-    async def test_turn_done_links_last_reply(self, ready):
-        await nt.record_sent("@3", "text", 4242, "All done.")
-        await nt.mark_working("@3", True, None)
-        await nt.mark_working("@3", False, None)
-        url = ready.await_args.kwargs["reply_markup"].inline_keyboard[0][0].url
-        assert url.endswith("/55/4242")
-
-    @pytest.mark.asyncio
-    async def test_merged_thinking_message_counts_as_reply(self, ready):
-        await nt.record_sent("@3", "thinking", 4300, "…")
-        await nt.mark_working("@3", True, None)
-        await nt.mark_working("@3", False, None)
-        url = ready.await_args.kwargs["reply_markup"].inline_keyboard[0][0].url
-        assert url.endswith("/55/4300")
-
-    @pytest.mark.asyncio
     async def test_error_notified_from_record_sent(self, ready):
         await nt.record_sent("@3", "error", 9, "🚨 You've hit your session limit")
         assert ready.await_count == 1
@@ -103,35 +88,62 @@ class TestNotify:
 
 class TestTurnDone:
     @pytest.mark.asyncio
-    async def test_busy_then_idle_fires_once(self, ready):
-        nt.record_assistant_text("@3", "All done.\nmore")
-        await nt.mark_working("@3", True, None)
-        await nt.mark_working("@3", True, None)
-        await nt.mark_working("@3", False, "Worked for 3s")
-        await nt.mark_working("@3", False, "Worked for 3s")
+    async def test_end_turn_links_that_message_with_duration(self, ready):
+        nt.record_turn_start("@3", "2026-09-17T01:00:00Z")
+        await nt.record_sent("@3", "text", 4242, "All done.\nmore")  # not end_turn
+        ready.assert_not_awaited()
+        await nt.record_sent(
+            "@3",
+            "text",
+            4243,
+            "Final answer.",
+            ends_turn=True,
+            turn_key="msg_1",
+            entry_ts="2026-09-17T01:03:33Z",
+        )
+        await asyncio.sleep(0)
         assert ready.await_count == 1
         text = ready.await_args.args[2]
-        assert "finished" in text and "Worked for 3s" in text and "All done." in text
+        assert "finished after 3m33s" in text and "Final answer." in text
+        url = ready.await_args.kwargs["reply_markup"].inline_keyboard[0][0].url
+        assert url.endswith("/55/4243")
 
     @pytest.mark.asyncio
-    async def test_idle_without_prior_busy_is_silent(self, ready):
-        await nt.mark_working("@3", False, "Worked for 3s")
-        ready.assert_not_awaited()
+    async def test_thinking_then_text_of_same_message_links_last(self, ready):
+        nt.record_turn_start("@3", "2026-09-17T01:00:00Z")
+        await nt.record_sent("@3", "thinking", 10, "…", ends_turn=True, turn_key="m")
+        await nt.record_sent("@3", "text", 11, "Answer", ends_turn=True, turn_key="m")
+        await asyncio.sleep(0)
+        assert ready.await_count == 1
+        assert (
+            ready.await_args.kwargs["reply_markup"]
+            .inline_keyboard[0][0]
+            .url.endswith("/11")
+        )
 
     @pytest.mark.asyncio
     async def test_min_duration(self, ready, monkeypatch):
         monkeypatch.setattr(config, "notify_turn_min", 3600.0)
-        await nt.mark_working("@3", True, None)
-        await nt.mark_working("@3", False, None)
+        nt.record_turn_start("@3", "2026-09-17T01:00:00Z")
+        await nt.record_sent(
+            "@3",
+            "text",
+            1,
+            "x",
+            ends_turn=True,
+            turn_key="k",
+            entry_ts="2026-09-17T01:00:05Z",
+        )
+        await asyncio.sleep(0)
         ready.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_dialog_pauses_instead_of_finishing(self, ready):
-        await nt.mark_working("@3", True, None)
-        await nt.mark_working("@3", False, None, paused=True)
-        ready.assert_not_awaited()
-        await nt.mark_working("@3", False, "done")
+    async def test_without_prompt_timestamp_still_notifies(self, ready):
+        await nt.record_sent("@3", "text", 7, "x", ends_turn=True, turn_key="k2")
+        await asyncio.sleep(0)
         assert ready.await_count == 1
+        assert "finished" in ready.await_args.args[2]
+        assert "after" not in ready.await_args.args[2]
 
 
 class TestUi:

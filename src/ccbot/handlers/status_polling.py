@@ -34,7 +34,6 @@ from ..terminal_parser import (
     extract_interactive_content,
     has_update_pending,
     is_interactive_ui,
-    is_working,
     parse_status_line,
 )
 from ..tmux_manager import SHELL_COMMANDS, tmux_manager
@@ -47,7 +46,7 @@ from .interactive_ui import (
 )
 from .message_queue import enqueue_status_update, get_message_queue
 from .message_sender import safe_send
-from .notifications_topic import mark_ui, mark_working, notify
+from .notifications_topic import mark_ui, notify
 
 logger = logging.getLogger(__name__)
 
@@ -182,15 +181,8 @@ async def update_status_message(
     if w.pane_current_command in SHELL_COMMANDS:
         return  # nothing to parse in a shell
 
-    # Notifications: busy→idle transitions ("turn finished") and dialogs
+    # Notifications: a dialog that disappeared may be announced again later
     ui_now = extract_interactive_content(pane_text)
-    busy = is_working(pane_text)
-    await mark_working(
-        window_id,
-        busy,
-        None if busy else parse_status_line(pane_text),
-        paused=ui_now is not None,
-    )
     if ui_now is None:
         await mark_ui(window_id, None)  # dialog gone → next one is announced again
 
