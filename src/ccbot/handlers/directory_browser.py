@@ -300,6 +300,11 @@ def find_session_cwd(session_id: str) -> str | None:
     return cwd or None
 
 
+def looks_like_session_ref(text: str) -> bool:
+    """True when the message is shaped like a session reference (id present)."""
+    return bool(_SESSION_ID_RE.search(text)) and len(text.split()) <= 4
+
+
 def resolve_session_ref(text: str) -> SessionRef | None:
     """Parse ``<session id>``, ``<path> <session id>`` or ``/resume …`` forms.
 

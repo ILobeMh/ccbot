@@ -127,6 +127,7 @@ from .handlers.directory_browser import (
     clear_mode_picker_state,
     clear_session_picker_state,
     clear_window_picker_state,
+    looks_like_session_ref,
     resolve_session_ref,
 )
 from .handlers.history import send_history
@@ -1468,6 +1469,14 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         ref = resolve_session_ref(text)
         if ref:
             await _launch_session_ref(update, context, ref)
+            return
+        if looks_like_session_ref(text):
+            await safe_reply(
+                update.message,
+                "❌ No transcript found for that session id — it can't be resumed. "
+                "(A session that never received a prompt has no transcript.) "
+                "Send a path to start fresh, or `/sessions` to see what's running.",
+            )
             return
 
         # A typed path skips the browser entirely
