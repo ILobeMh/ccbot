@@ -125,6 +125,9 @@ class SessionManager:
     last_launch_modes: dict[int, str] = field(default_factory=dict)
     # special topic name (e.g. "shell") -> forum thread id
     special_topics: dict[str, int] = field(default_factory=dict)
+    # session_id -> {"cwd", "mode", "name"} for windows killed via the bot,
+    # so the ▶ Resume button can bring them back with the same settings
+    killed_sessions: dict[str, dict[str, str]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self._load_state()
@@ -146,6 +149,7 @@ class SessionManager:
                 str(uid): mode for uid, mode in self.last_launch_modes.items()
             },
             "special_topics": self.special_topics,
+            "killed_sessions": self.killed_sessions,
         }
         atomic_write_json(config.state_file, state)
         logger.debug("State saved to %s", config.state_file)
@@ -192,6 +196,11 @@ class SessionManager:
                     str(name): int(tid)
                     for name, tid in state.get("special_topics", {}).items()
                 }
+                self.killed_sessions = {
+                    str(k): dict(v)
+                    for k, v in state.get("killed_sessions", {}).items()
+                    if isinstance(v, dict)
+                }
 
                 # Detect old format: keys that don't look like window IDs
                 needs_migration = False
@@ -225,6 +234,7 @@ class SessionManager:
                 self.window_launch_info = {}
                 self.last_launch_modes = {}
                 self.special_topics = {}
+                self.killed_sessions = {}
                 pass
 
     async def resolve_stale_ids(self) -> None:
@@ -931,6 +941,20 @@ class SessionManager:
         if self.last_launch_modes.get(user_id) != mode:
             self.last_launch_modes[user_id] = mode
             self._save_state()
+
+    # --- Killed sessions (resumable) ---
+
+    def remember_killed_session(
+        self, session_id: str, cwd: str, mode: str, name: str
+    ) -> None:
+        self.killed_sessions[session_id] = {"cwd": cwd, "mode": mode, "name": name}
+        # keep the map small: newest 50
+        for old in list(self.killed_sessions)[:-50]:
+            del self.killed_sessions[old]
+        self._save_state()
+
+    def get_killed_session(self, session_id: str) -> dict[str, str] | None:
+        return self.killed_sessions.get(session_id)
 
     # --- Special topics ---
 

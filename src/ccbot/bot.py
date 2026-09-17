@@ -90,6 +90,7 @@ from .handlers.callback_data import (
     CB_MODE_SELECT,
     CB_MODE_SET,
     CB_RESTART,
+    CB_RESUME_SESSION,
     CB_SCREENSHOT_REFRESH,
     CB_SESSION_CANCEL,
     CB_SESSION_NEW,
@@ -439,6 +440,67 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     logger.info("restart window=%s user=%d ok=%s", wid, user.id, ok)
 
 
+async def _kill_window_and_offer_resume(
+    bot: Bot,
+    user_id: int,
+    thread_id: int,
+    wid: str,
+    user_data: dict | None,
+) -> str:
+    """Kill a bound window, unbind the topic, and post a ▶ Resume message.
+
+    The message in the topic carries the session id / cwd / mode and a
+    button that brings the same session back (``/resume <id>`` works too).
+    Returns a short summary for the caller's own reply.
+    """
+    display = session_manager.get_display_name(wid)
+    ws = session_manager.get_window_state(wid)
+    launch = session_manager.get_launch_info(wid)
+    sid, cwd = ws.session_id, ws.cwd
+    mode = launch.get("mode") or "default"
+
+    killed = await tmux_manager.kill_window(wid)
+    session_manager.unbind_thread(user_id, thread_id)
+    await session_manager.remove_session_map_entry(wid)
+    await clear_topic_state(user_id, thread_id, bot, user_data)
+    chat_id = session_manager.resolve_chat_id(user_id, thread_id)
+
+    if sid and cwd:
+        session_manager.remember_killed_session(sid, cwd, mode, display)
+        mode_label = LAUNCH_MODE_LABELS.get(mode, mode)
+        await safe_send(
+            bot,
+            chat_id,
+            f"🗑 Killed `{display}` — the session is kept and can be resumed here.\n"
+            f"cwd `{cwd}`\nsession `{sid}`\nmode {mode_label}\n\n"
+            f"Tap ▶ or send `/resume {sid}`.",
+            message_thread_id=thread_id,
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "▶ Resume this session",
+                            callback_data=f"{CB_RESUME_SESSION}{sid}"[:64],
+                        )
+                    ]
+                ]
+            ),
+        )
+    else:
+        await safe_send(
+            bot,
+            chat_id,
+            f"🗑 Killed `{display}` (no session id known). "
+            "Send a message to start a new session.",
+            message_thread_id=thread_id,
+        )
+    return (
+        f"🗑 Killed `{display}`"
+        if killed
+        else f"⚠️ `{display}` was already gone; topic unbound"
+    )
+
+
 async def kill_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Kill this topic's tmux window and forget its session."""
     user = update.effective_user
@@ -454,16 +516,9 @@ async def kill_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not wid:
         await safe_reply(update.message, "❌ No session bound to this topic.")
         return
-    display = session_manager.get_display_name(wid)
-    killed = await tmux_manager.kill_window(wid)
-    session_manager.unbind_thread(user.id, thread_id)
-    await session_manager.remove_session_map_entry(wid)
-    await clear_topic_state(user.id, thread_id, context.bot, context.user_data)
-    if killed:
-        text = f"🗑 Killed window '{display}'. Send a message to start a new session."
-    else:
-        text = f"⚠️ Window '{display}' was already gone; topic unbound."
-    await safe_reply(update.message, text)
+    await _kill_window_and_offer_resume(
+        context.bot, user.id, thread_id, wid, context.user_data
+    )
 
 
 def _mode_keyboard(window_id: str, current: str | None) -> InlineKeyboardMarkup:
@@ -2354,16 +2409,42 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if bound != window_id:
             await query.answer("This topic is no longer bound to that window")
             return
-        display = session_manager.get_display_name(window_id)
-        await tmux_manager.kill_window(window_id)
-        session_manager.unbind_thread(user.id, thread_id)
-        await session_manager.remove_session_map_entry(window_id)
-        await clear_topic_state(user.id, thread_id, context.bot, context.user_data)
-        await safe_edit(
-            query,
-            f"🗑 Killed window '{display}'. Send a message to start a new session.",
+        summary = await _kill_window_and_offer_resume(
+            context.bot, user.id, thread_id, window_id, context.user_data
         )
+        await safe_edit(query, summary)
         await query.answer("Killed")
+
+    # ▶ Resume this session (posted when a window was killed)
+    elif data.startswith(CB_RESUME_SESSION):
+        sid = data[len(CB_RESUME_SESSION) :]
+        thread_id = _get_thread_id(update)
+        if thread_id is None:
+            await query.answer("Only in a topic", show_alert=True)
+            return
+        if session_manager.get_window_for_thread(user.id, thread_id):
+            await query.answer("This topic already has a session", show_alert=True)
+            return
+        remembered = session_manager.get_killed_session(sid)
+        ref = resolve_session_ref(f"{remembered['cwd']} {sid}" if remembered else sid)
+        if ref is None:
+            await query.answer("Session transcript not found anymore", show_alert=True)
+            return
+        mode = (remembered or {}).get("mode") or session_manager.get_last_launch_mode(
+            user.id
+        )
+        if context.user_data is not None:
+            context.user_data["_pending_thread_id"] = thread_id
+            context.user_data.pop("_pending_thread_text", None)
+        await _create_and_bind_window(
+            query,
+            context,
+            user,
+            ref.cwd,
+            thread_id,
+            resume_session_id=ref.session_id,
+            mode=mode if mode in LAUNCH_MODES else "default",
+        )
 
     # Screenshot quick keys: send key to tmux window
     elif data.startswith(CB_KEYS_PREFIX):
