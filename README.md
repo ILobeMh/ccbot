@@ -210,7 +210,7 @@ The bot creates these topics itself (it needs the **Manage Topics** admin right 
 **Creating a new session:**
 
 1. Create a new topic in the Telegram group
-2. Send any message in the topic — or send a full path (e.g. `/home/me/project`) to skip the browser
+2. Send any message in the topic — or send a full path (e.g. `/home/me/project`) to skip the browser, or `<session id>` / `<path> <session id> [mode]` / `/resume <session id>` to resume a known session immediately (no pickers; uses your last launch mode unless a mode is given)
 3. A directory browser appears — select the project directory
 4. If the directory has existing Claude sessions, a session picker appears — choose one to resume or start fresh
 5. A mode picker appears — Normal / Accept edits / Plan / Skip permissions (your last choice is listed first)

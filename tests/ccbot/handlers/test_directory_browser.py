@@ -10,6 +10,7 @@ from ccbot.handlers.directory_browser import (
     as_directory,
     browser_start_path,
     build_mode_picker,
+    resolve_session_ref,
 )
 
 
@@ -71,3 +72,51 @@ class TestBrowserStartPath:
     def test_falls_back_to_cwd(self, tmp_path, monkeypatch):
         monkeypatch.setattr(db.config, "default_dir", str(tmp_path / "missing"))
         assert browser_start_path() == str(Path.cwd())
+
+
+class TestResolveSessionRef:
+    SID = "550e8400-e29b-41d4-a716-446655440000"
+
+    @pytest.fixture
+    def projects(self, tmp_path, monkeypatch):
+        projects = tmp_path / "projects"
+        pdir = projects / "-home-u-proj"
+        pdir.mkdir(parents=True)
+        work = tmp_path / "work"
+        work.mkdir()
+        (pdir / f"{self.SID}.jsonl").write_text(
+            '{"type":"user","cwd":"%s","message":{"role":"user","content":"hi"}}\n'
+            % work
+        )
+        monkeypatch.setattr(db.config, "claude_projects_path", projects)
+        return work
+
+    def test_bare_id_reads_cwd_from_transcript(self, projects):
+        ref = resolve_session_ref(self.SID)
+        assert ref is not None
+        assert ref.cwd == str(projects) and ref.session_id == self.SID
+        assert ref.mode is None
+
+    def test_path_and_id_with_mode(self, projects, tmp_path):
+        other = tmp_path / "other"
+        other.mkdir()
+        ref = resolve_session_ref(f"{other} {self.SID.upper()} bypass")
+        assert ref == db.SessionRef(str(other.resolve()), self.SID, "bypassPermissions")
+
+    @pytest.mark.parametrize("prefix", ["/resume ", "resume ", "/resume --resume "])
+    def test_command_prefixes(self, projects, prefix):
+        ref = resolve_session_ref(prefix + self.SID)
+        assert ref is not None and ref.session_id == self.SID
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "hello",
+            "/resume",
+            "/home/u/proj",  # path only
+            "550e8400-e29b-41d4-a716-446655440001",  # no transcript
+            "/nonexistent/dir 550e8400-e29b-41d4-a716-446655440000",
+        ],
+    )
+    def test_rejects(self, projects, text):
+        assert resolve_session_ref(text) is None

@@ -113,6 +113,7 @@ from .handlers.directory_browser import (
     STATE_SELECTING_SESSION,
     STATE_SELECTING_WINDOW,
     UNBOUND_WINDOWS_KEY,
+    SessionRef,
     as_directory,
     browser_start_path,
     build_directory_browser,
@@ -123,6 +124,7 @@ from .handlers.directory_browser import (
     clear_mode_picker_state,
     clear_session_picker_state,
     clear_window_picker_state,
+    resolve_session_ref,
 )
 from .handlers.history import send_history
 from .handlers.interactive_ui import (
@@ -206,7 +208,7 @@ CC_COMMANDS: dict[str, str] = {
     "model": "↗ Switch AI model",
     "permissions": "↗ Manage permission rules",
     "plan": "↗ Plan mode for the next prompt",
-    "resume": "↗ Resume another session (picker)",
+    "resume": "Resume: /resume <session id> here, or Claude's picker when bound",
     "rewind": "↗ Rewind conversation / files",
     "status": "↗ Show Claude Code status",
     "tasks": "↗ List background tasks",
@@ -385,6 +387,29 @@ async def _restart_all_claude_sessions() -> str:
         ok, msg = await _restart_claude(user_id, wid)
         lines.append(f"{'✅' if ok else '⚠️'} `{display}`: {msg}")
     return "\n".join(lines) if lines else "No Claude Code sessions are bound."
+
+
+async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/resume [<path>] <session id> [mode] in an unbound topic; else forward to Claude."""
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id) or not update.message:
+        return
+    thread_id = _get_thread_id(update)
+    bound = thread_id is not None and session_manager.get_window_for_thread(
+        user.id, thread_id
+    )
+    ref = resolve_session_ref(update.message.text or "")
+    if ref and not bound:
+        await _launch_session_ref(update, context, ref)
+        return
+    if not bound and context.args:
+        await safe_reply(
+            update.message,
+            "❌ Unknown session. Use `/resume <session id>` or "
+            "`/resume <path> <session id>` (optionally followed by a mode).",
+        )
+        return
+    await forward_command_handler(update, context)
 
 
 async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1304,7 +1329,14 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     wid = session_manager.get_window_for_thread(user.id, thread_id)
     if wid is None:
-        # Unbound topic — a typed path skips the browser entirely
+        # Unbound topic — "<path> <session id>" or a bare session id resumes
+        # that session right away (last launch mode, no pickers)
+        ref = resolve_session_ref(text)
+        if ref:
+            await _launch_session_ref(update, context, ref)
+            return
+
+        # A typed path skips the browser entirely
         typed_dir = as_directory(text)
         if typed_dir:
             logger.info(
@@ -1448,6 +1480,41 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # --- Window creation helpers ---
 
 
+async def _launch_session_ref(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, ref: SessionRef
+) -> None:
+    """Resume ``ref`` in the current (unbound) topic without any picker."""
+    user = update.effective_user
+    msg = update.message
+    if user is None or msg is None:
+        return
+    thread_id = _get_thread_id(update)
+    if thread_id is None:
+        await safe_reply(msg, "❌ This only works inside a topic.")
+        return
+    if session_manager.get_window_for_thread(user.id, thread_id):
+        await safe_reply(msg, "❌ This topic already has a session (use /kill first).")
+        return
+    mode = ref.mode or session_manager.get_last_launch_mode(user.id)
+    if mode not in LAUNCH_MODES:
+        mode = "default"
+    if context.user_data is not None:
+        context.user_data["_pending_thread_id"] = thread_id
+        context.user_data.pop("_pending_thread_text", None)
+    progress = await safe_reply(
+        msg, f"⏳ Resuming `{ref.session_id[:8]}…` in `{ref.cwd}`…"
+    )
+    await _create_and_bind_window(
+        progress,
+        context,
+        user,
+        ref.cwd,
+        thread_id,
+        resume_session_id=ref.session_id,
+        mode=mode,
+    )
+
+
 async def _present(update: Update, text: str, keyboard: Any = None) -> None:
     """Edit the callback message if this is a button press, else reply."""
     if update.callback_query:
@@ -1553,6 +1620,17 @@ async def _launch_and_register(
     return ready, note
 
 
+async def _answer(target: object, text: str) -> None:
+    """query.answer() when the progress target is a CallbackQuery; no-op for a Message."""
+    from telegram import CallbackQuery
+
+    if isinstance(target, CallbackQuery):
+        try:
+            await target.answer(text)
+        except Exception:
+            pass
+
+
 async def _create_and_bind_window(
     query: object,
     context: ContextTypes.DEFAULT_TYPE,
@@ -1564,11 +1642,14 @@ async def _create_and_bind_window(
 ) -> None:
     """Create a tmux window, bind it to a topic, and forward pending text.
 
-    Shared by the mode picker (new and resumed sessions).
-    """
-    from telegram import CallbackQuery, User
+    ``query`` is the progress target: a CallbackQuery (mode picker, resume
+    button) or a Message the bot just sent (direct text launch); both are
+    edited in place via safe_edit.
 
-    assert isinstance(query, CallbackQuery)
+    Shared by the mode picker, the ▶ Resume button and `/resume`.
+    """
+    from telegram import User
+
     assert isinstance(user, User)
 
     if config.auto_trust_dirs:
@@ -1582,7 +1663,7 @@ async def _create_and_bind_window(
         if pending_thread_id is not None and context.user_data is not None:
             context.user_data.pop("_pending_thread_id", None)
             context.user_data.pop("_pending_thread_text", None)
-        await query.answer("Failed")
+        await _answer(query, "Failed")
         return
 
     logger.info(
@@ -1595,7 +1676,7 @@ async def _create_and_bind_window(
         resume_session_id,
         mode,
     )
-    await query.answer("Starting Claude Code…")
+    await _answer(query, "Starting Claude Code…")
     await safe_edit(query, f"⏳ {message}\n\nStarting Claude Code ({mode})…")
 
     # Bind first so status polling can already show what's happening
@@ -2588,6 +2669,7 @@ def create_bot() -> Application:
     application.add_handler(CommandHandler("mode", mode_command))
     application.add_handler(CommandHandler("info", info_command))
     application.add_handler(CommandHandler("settings", settings_command))
+    application.add_handler(CommandHandler("resume", resume_command))
     application.add_handler(CommandHandler("kill", kill_command))
     application.add_handler(CommandHandler("unbind", unbind_command))
     application.add_handler(CommandHandler("usage", usage_command))

@@ -16,14 +16,17 @@ Key components:
 """
 
 import os
+import re
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from ..config import config
 from ..session import ClaudeSession
-from ..tmux_manager import LAUNCH_MODE_LABELS, LAUNCH_MODES
+from ..tmux_manager import LAUNCH_MODE_LABELS, LAUNCH_MODES, normalize_launch_mode
+from ..utils import read_cwd_from_jsonl
 from .callback_data import (
     CB_DIR_CANCEL,
     CB_DIR_CONFIRM,
@@ -272,6 +275,69 @@ def as_directory(text: str) -> str | None:
     if not resolved.is_dir():
         return None
     return str(resolved)
+
+
+@dataclass(frozen=True)
+class SessionRef:
+    """A session to resume: its transcript's directory and id (+ optional mode)."""
+
+    cwd: str
+    session_id: str
+    mode: str | None = None
+
+
+_SESSION_ID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE
+)
+
+
+def find_session_cwd(session_id: str) -> str | None:
+    """Directory a session ran in, from its transcript (any project dir)."""
+    matches = list(config.claude_projects_path.glob(f"*/{session_id}.jsonl"))
+    if not matches:
+        return None
+    cwd = read_cwd_from_jsonl(matches[0])
+    return cwd or None
+
+
+def resolve_session_ref(text: str) -> SessionRef | None:
+    """Parse ``<session id>``, ``<path> <session id>`` or ``/resume …`` forms.
+
+    Accepts an optional trailing mode word (normal/accept/plan/bypass).
+    The session must have a transcript; when no path is given it is read
+    from the transcript. Returns None for anything else.
+    """
+    tokens = text.strip().split()
+    if not tokens:
+        return None
+    if tokens[0].lower() in ("/resume", "resume"):
+        tokens = tokens[1:]
+    if tokens and tokens[0] == "--resume":
+        tokens = tokens[1:]
+    tokens = [t for t in tokens if t != "--resume"]
+    mode: str | None = None
+    if len(tokens) >= 2:
+        maybe_mode = normalize_launch_mode(tokens[-1])
+        if maybe_mode:
+            mode = maybe_mode
+            tokens = tokens[:-1]
+    if not tokens or not (1 <= len(tokens) <= 2):
+        return None
+    session_id = tokens[-1].strip("`'\"")
+    if not _SESSION_ID_RE.fullmatch(session_id):
+        return None
+    session_id = session_id.lower()
+    if len(tokens) == 2:
+        cwd = as_directory(tokens[0])
+        if cwd is None:
+            return None
+    else:
+        cwd = find_session_cwd(session_id)
+        if cwd is None or not Path(cwd).is_dir():
+            return None
+    if not list(config.claude_projects_path.glob(f"*/{session_id}.jsonl")):
+        return None
+    return SessionRef(cwd=cwd, session_id=session_id, mode=mode)
 
 
 def browser_start_path() -> str:
