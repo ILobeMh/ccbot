@@ -175,7 +175,9 @@ uv run ccbot
 | `/esc`        | Send Escape to interrupt Claude |
 | `/mode [m]`   | Show the permission mode, or switch it via Shift+Tab (`normal`, `accept`, `plan`, `bypass`) |
 | `/restart [m]`| Restart Claude Code in the same window, resuming the session (optionally in mode `m`) — e.g. to apply a Claude Code update |
+| `/sessions`   | Every bound session with state (working / idle / waiting / exited), memory of its process tree, mode, cwd and last activity; 🗑 Kill buttons (the topic gets a ▶ Resume message) and ↗ links |
 | `/info`       | tmux attach command, window/session ids, launch command, transcript path, versions |
+| `/resume <id>`| In an empty topic: resume that session directly (`/resume <path> <id> [mode]` also works) |
 | `/kill`       | Kill the tmux window and forget the session |
 | `/unbind`     | Unbind the topic, keep the window running |
 | `/usage`      | Claude Code usage remaining |

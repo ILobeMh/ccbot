@@ -67,3 +67,5 @@ CB_CCC_REFRESH = "cc:ref:"  # cc:ref:net
 CB_CCC_RESTART = "cc:restart"  # restart all Claude sessions
 CB_SETTING = "st:"  # st:<setting key>  (toggle / cycle)
 CB_RESUME_SESSION = "rz:"  # rz:<session id>  (resume a killed session here)
+CB_SESSIONS_KILL = "sl:kill:"  # sl:kill:<window>  (from /sessions)
+CB_SESSIONS_REFRESH = "sl:ref"

@@ -8,6 +8,7 @@ Provides:
 
 import json
 import os
+import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -70,3 +71,45 @@ def read_cwd_from_jsonl(file_path: str | Path) -> str:
     except OSError:
         pass
     return ""
+
+
+def process_tree_rss(root_pids: list[int]) -> dict[int, int]:
+    """Resident memory (bytes) of each root pid's whole process tree.
+
+    One ``ps`` call for all processes (works on macOS and Linux); children
+    are found by walking ppid links.
+    """
+    try:
+        out = subprocess.run(
+            ["ps", "-Ao", "pid=,ppid=,rss="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    children: dict[int, list[int]] = {}
+    rss: dict[int, int] = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) != 3:
+            continue
+        try:
+            pid, ppid, kb = int(parts[0]), int(parts[1]), int(parts[2])
+        except ValueError:
+            continue
+        rss[pid] = kb * 1024
+        children.setdefault(ppid, []).append(pid)
+    totals: dict[int, int] = {}
+    for root in root_pids:
+        total, stack, seen = 0, [root], set()
+        while stack:
+            pid = stack.pop()
+            if pid in seen:
+                continue
+            seen.add(pid)
+            total += rss.get(pid, 0)
+            stack.extend(children.get(pid, []))
+        totals[root] = total
+    return totals

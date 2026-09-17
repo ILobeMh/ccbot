@@ -95,6 +95,8 @@ from .handlers.callback_data import (
     CB_SESSION_CANCEL,
     CB_SESSION_NEW,
     CB_SESSION_SELECT,
+    CB_SESSIONS_KILL,
+    CB_SESSIONS_REFRESH,
     CB_WIN_BIND,
     CB_WIN_CANCEL,
     CB_WIN_NEW,
@@ -174,6 +176,7 @@ from .terminal_parser import (
     has_update_pending,
     is_blocking_dialog,
     is_interactive_ui,
+    is_working,
     parse_permission_mode,
 )
 from .tmux_manager import (
@@ -186,7 +189,7 @@ from .tmux_manager import (
 )
 from .transcribe import close_client as close_transcribe_client
 from .transcribe import transcribe_voice
-from .utils import ccbot_dir
+from .utils import ccbot_dir, process_tree_rss
 
 logger = logging.getLogger(__name__)
 
@@ -499,6 +502,82 @@ async def _kill_window_and_offer_resume(
         if killed
         else f"⚠️ `{display}` was already gone; topic unbound"
     )
+
+
+async def _build_sessions_overview(
+    user_id: int, chat_id: int | None
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Text + keyboard listing every bound window with health, memory, age."""
+    windows = {w.window_id: w for w in await tmux_manager.list_windows()}
+    pids = await tmux_manager.pane_pids()
+    rss = await asyncio.to_thread(process_tree_rss, list(pids.values()))
+    bindings = [
+        (tid, wid)
+        for uid, tid, wid in session_manager.iter_thread_bindings()
+        if uid == user_id
+    ]
+    lines: list[str] = []
+    rows: list[list[InlineKeyboardButton]] = []
+    total_mem = 0
+    for tid, wid in sorted(bindings, key=lambda b: b[0]):
+        w = windows.get(wid)
+        display = session_manager.get_display_name(wid)
+        ws = session_manager.get_window_state(wid)
+        launch = session_manager.get_launch_info(wid)
+        mode = LAUNCH_MODE_LABELS.get(launch.get("mode", ""), launch.get("mode") or "?")
+        if w is None:
+            lines.append(f"• `{display}` — ⚠️ window gone")
+            continue
+        pane = await tmux_manager.capture_pane(wid) or ""
+        if w.pane_current_command in SHELL_COMMANDS:
+            state = "⛔ exited"
+        elif is_interactive_ui(pane):
+            state = "❓ waiting for you"
+        elif is_working(pane):
+            state = "🟢 working"
+        else:
+            state = "💤 idle"
+        mem = rss.get(pids.get(wid, -1), 0)
+        total_mem += mem
+        age = ""
+        jsonl = session_manager.resolve_session_file_for_window(wid)
+        if jsonl:
+            try:
+                age = f" · last activity {_fmt_uptime(time.time() - jsonl.stat().st_mtime)} ago"
+            except OSError:
+                pass
+        cwd = ws.cwd or w.cwd
+        lines.append(
+            f"• **{display}** — {state} · {_fmt_size(mem)} · {mode}\n  `{cwd}`{age}"
+        )
+        row = [
+            InlineKeyboardButton(
+                f"🗑 Kill {display[:14]}", callback_data=f"{CB_SESSIONS_KILL}{wid}"[:64]
+            )
+        ]
+        if chat_id is not None and str(chat_id).startswith("-100"):
+            row.append(
+                InlineKeyboardButton(
+                    "↗ open", url=f"https://t.me/c/{str(chat_id)[4:]}/{tid}"
+                )
+            )
+        rows.append(row)
+    if not lines:
+        lines.append("No sessions bound to topics.")
+    else:
+        lines.append(f"\n{len(bindings)} sessions · {_fmt_size(total_mem)} RSS total")
+    rows.append([InlineKeyboardButton("🔄 Refresh", callback_data=CB_SESSIONS_REFRESH)])
+    return "🗂 **Sessions**\n" + "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+async def sessions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List running Claude Code sessions with state, memory and kill buttons."""
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id) or not update.message:
+        return
+    chat = update.effective_chat
+    text, kb = await _build_sessions_overview(user.id, chat.id if chat else None)
+    await safe_reply(update.message, text, reply_markup=kb)
 
 
 async def kill_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2415,6 +2494,31 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await safe_edit(query, summary)
         await query.answer("Killed")
 
+    # /sessions overview: kill a window from anywhere, refresh
+    elif data.startswith(CB_SESSIONS_KILL) or data == CB_SESSIONS_REFRESH:
+        chat = update.effective_chat
+        if data.startswith(CB_SESSIONS_KILL):
+            wid = data[len(CB_SESSIONS_KILL) :]
+            bound = next(
+                (
+                    tid
+                    for uid, tid, w in session_manager.iter_thread_bindings()
+                    if uid == user.id and w == wid
+                ),
+                None,
+            )
+            if bound is None:
+                await query.answer("Not bound anymore")
+            else:
+                await query.answer("Killing…")
+                await _kill_window_and_offer_resume(
+                    context.bot, user.id, bound, wid, context.user_data
+                )
+        else:
+            await query.answer("Refreshed")
+        text, kb = await _build_sessions_overview(user.id, chat.id if chat else None)
+        await safe_edit(query, text, reply_markup=kb)
+
     # ▶ Resume this session (posted when a window was killed)
     elif data.startswith(CB_RESUME_SESSION):
         sid = data[len(CB_RESUME_SESSION) :]
@@ -2610,6 +2714,7 @@ async def post_init(application: Application) -> None:
         BotCommand("history", "Message history for this topic"),
         BotCommand("screenshot", "Terminal screenshot with control keys"),
         BotCommand("esc", "Send Escape to interrupt Claude"),
+        BotCommand("sessions", "All running sessions: state, memory, kill buttons"),
         BotCommand("info", "Session internals: tmux window, session id, launch cmd"),
         BotCommand("settings", "Bot settings: thinking, tool calls, modes, alerts"),
         BotCommand(
@@ -2751,6 +2856,7 @@ def create_bot() -> Application:
     application.add_handler(CommandHandler("info", info_command))
     application.add_handler(CommandHandler("settings", settings_command))
     application.add_handler(CommandHandler("resume", resume_command))
+    application.add_handler(CommandHandler("sessions", sessions_command))
     application.add_handler(CommandHandler("kill", kill_command))
     application.add_handler(CommandHandler("unbind", unbind_command))
     application.add_handler(CommandHandler("usage", usage_command))

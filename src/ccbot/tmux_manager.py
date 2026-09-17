@@ -220,6 +220,37 @@ class TmuxManager:
             self._windows_cache_at = now
             return list(windows)
 
+    async def pane_pids(self) -> dict[str, int]:
+        """window_id -> pid of the active pane's process (the shell)."""
+
+        def _run() -> dict[str, int]:
+            try:
+                out = subprocess.run(
+                    [
+                        "tmux",
+                        "list-panes",
+                        "-s",
+                        "-t",
+                        self.session_name,
+                        "-F",
+                        f"#{{window_id}}{self._LIST_SEP}#{{pane_pid}}{self._LIST_SEP}#{{pane_active}}",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    check=False,
+                ).stdout
+            except (OSError, subprocess.SubprocessError):
+                return {}
+            pids: dict[str, int] = {}
+            for line in out.splitlines():
+                parts = line.split(self._LIST_SEP)
+                if len(parts) == 3 and parts[2] == "1" and parts[1].isdigit():
+                    pids[parts[0]] = int(parts[1])
+            return pids
+
+        return await asyncio.to_thread(_run)
+
     def invalidate_windows_cache(self) -> None:
         """Drop the list_windows cache (after create/kill/rename)."""
         self._windows_cache = None
