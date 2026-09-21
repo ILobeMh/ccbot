@@ -127,6 +127,25 @@ def _valid_transcript_path(transcript_path: str, session_id: str) -> str:
     return transcript_path
 
 
+def _phantom_session(session_id: str, transcript_path: str, previous: dict) -> bool:
+    """True when the reported id has no transcript but the previous one does."""
+    prev_id = previous.get("session_id")
+    if not prev_id or prev_id == session_id:
+        return False
+    if transcript_path and os.path.exists(transcript_path):
+        return False
+    prev_path = previous.get("transcript_path") or ""
+    if prev_path and os.path.exists(prev_path):
+        return True
+    return _transcript_exists(prev_id) and not _transcript_exists(session_id)
+
+
+def _transcript_exists(session_id: str) -> bool:
+    from .utils import claude_projects_dir
+
+    return any(claude_projects_dir().glob(f"*/{session_id}.jsonl"))
+
+
 def _find_pane_key(
     session_id: str, cwd: str, session_map: dict
 ) -> tuple[str, str] | None:
@@ -394,15 +413,34 @@ def hook_main() -> None:
                         session_window_key,
                     )
 
+                previous = session_map.get(session_window_key) or {}
+                if not transcript_path and previous.get("session_id") == session_id:
+                    # e.g. compact re-fires without transcript_path
+                    transcript_path = previous.get("transcript_path", "")
+
+                # Claude Code >= 2.1.27x reports a *fresh* session_id on
+                # --resume / compact even though it keeps appending to the
+                # resumed transcript. Trust the window's existing mapping
+                # when the reported id has no transcript but the old one does.
+                if source in ("resume", "compact") and _phantom_session(
+                    session_id, transcript_path, previous
+                ):
+                    logger.info(
+                        "SessionStart(%s) reported %s without a transcript; "
+                        "keeping %s for %s",
+                        source,
+                        session_id,
+                        previous.get("session_id"),
+                        session_window_key,
+                    )
+                    session_id = str(previous.get("session_id"))
+                    transcript_path = str(previous.get("transcript_path") or "")
+
                 entry: dict[str, str] = {
                     "session_id": session_id,
                     "cwd": cwd,
                     "window_name": window_name,
                 }
-                previous = session_map.get(session_window_key) or {}
-                if not transcript_path and previous.get("session_id") == session_id:
-                    # e.g. compact re-fires without transcript_path
-                    transcript_path = previous.get("transcript_path", "")
                 if transcript_path:
                     entry["transcript_path"] = transcript_path
                 session_map[session_window_key] = entry

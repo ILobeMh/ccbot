@@ -1754,11 +1754,13 @@ async def _launch_and_register(
             ws.cwd = str(selected_path)
             ws.window_name = window_name
             session_manager._save_state()
+        matches = list(config.claude_projects_path.glob(f"*/{resume_session_id}.jsonl"))
         await session_manager.override_session_map_entry(
             window_id,
             resume_session_id,
             cwd=str(selected_path),
             window_name=window_name,
+            transcript_path=str(matches[0]) if matches else "",
         )
     return ready, note
 

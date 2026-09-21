@@ -22,6 +22,21 @@ def ccbot_dir() -> Path:
     return Path(raw) if raw else Path.home() / ".ccbot"
 
 
+def claude_projects_dir() -> Path:
+    """~/.claude/projects (honouring CCBOT_CLAUDE_PROJECTS_PATH / CLAUDE_CONFIG_DIR).
+
+    Duplicated from config.py on purpose: the hook must not import config
+    (it needs TELEGRAM_BOT_TOKEN).
+    """
+    custom = os.environ.get("CCBOT_CLAUDE_PROJECTS_PATH")
+    if custom:
+        return Path(custom)
+    cfg = os.environ.get("CLAUDE_CONFIG_DIR")
+    if cfg:
+        return Path(cfg) / "projects"
+    return Path.home() / ".claude" / "projects"
+
+
 def atomic_write_json(path: Path, data: Any, indent: int = 2) -> None:
     """Write JSON data to a file atomically.
 

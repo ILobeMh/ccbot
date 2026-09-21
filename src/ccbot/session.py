@@ -471,7 +471,12 @@ class SessionManager:
             return False
 
     async def override_session_map_entry(
-        self, window_id: str, session_id: str, cwd: str = "", window_name: str = ""
+        self,
+        window_id: str,
+        session_id: str,
+        cwd: str = "",
+        window_name: str = "",
+        transcript_path: str = "",
     ) -> None:
         """Force a window's session_map entry to a specific session_id.
 
@@ -489,11 +494,16 @@ class SessionManager:
                     "session_id": session_id,
                     "cwd": cwd,
                     "window_name": window_name,
+                    **({"transcript_path": transcript_path} if transcript_path else {}),
                 }
                 return True
             if info.get("session_id") == session_id:
                 return False
             info["session_id"] = session_id
+            if transcript_path:
+                info["transcript_path"] = transcript_path
+            else:
+                info.pop("transcript_path", None)
             return True
 
         if await asyncio.to_thread(self._mutate_session_map_locked, mutate):

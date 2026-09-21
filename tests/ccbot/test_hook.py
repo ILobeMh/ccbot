@@ -303,3 +303,66 @@ class TestHookMainMapping:
         )
         data = json.loads((tmp_path / "session_map.json").read_text())
         assert data["ccbot:@2"]["session_id"] == SID
+
+
+class TestPhantomResumeId:
+    """Claude Code >= 2.1.27x reports a fresh id on --resume but keeps
+    writing to the resumed transcript; the hook must keep the real one."""
+
+    NEW = "01a0c1a6-8f96-7522-ad8f-727bf194639f"
+
+    def _run(self, monkeypatch, tmp_path, source: str) -> dict:
+        monkeypatch.setenv("CCBOT_DIR", str(tmp_path))
+        projects = tmp_path / "projects"
+        real = projects / "-proj" / f"{SID}.jsonl"
+        real.parent.mkdir(parents=True)
+        real.write_text("{}\n")
+        monkeypatch.setenv("CCBOT_CLAUDE_PROJECTS_PATH", str(projects))
+        (tmp_path / "session_map.json").write_text(
+            json.dumps(
+                {
+                    "ccbot:@3": {
+                        "session_id": SID,
+                        "cwd": "/proj",
+                        "window_name": "w",
+                        "transcript_path": str(real),
+                    }
+                }
+            )
+        )
+        monkeypatch.setattr(sys, "argv", ["ccbot", "hook"])
+        monkeypatch.setattr(
+            sys,
+            "stdin",
+            io.StringIO(
+                json.dumps(
+                    {
+                        "session_id": self.NEW,
+                        "cwd": "/proj",
+                        "hook_event_name": "SessionStart",
+                        "source": source,
+                    }
+                )
+            ),
+        )
+        monkeypatch.setenv("TMUX_PANE", "%3")
+        monkeypatch.delenv("CLAUDE_CODE_ENTRYPOINT", raising=False)
+        monkeypatch.setattr(hook_mod, "_process_chain", lambda pid: [])
+        monkeypatch.setattr(
+            hook_mod.subprocess,
+            "run",
+            lambda *a, **k: subprocess.CompletedProcess(
+                a, 0, stdout="ccbot:@3:w\n", stderr=""
+            ),
+        )
+        hook_main()
+        return json.loads((tmp_path / "session_map.json").read_text())["ccbot:@3"]
+
+    def test_resume_keeps_real_session(self, monkeypatch, tmp_path):
+        entry = self._run(monkeypatch, tmp_path, "resume")
+        assert entry["session_id"] == SID
+        assert entry["transcript_path"].endswith(f"{SID}.jsonl")
+
+    def test_clear_accepts_new_session(self, monkeypatch, tmp_path):
+        entry = self._run(monkeypatch, tmp_path, "clear")
+        assert entry["session_id"] == self.NEW
