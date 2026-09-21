@@ -367,6 +367,15 @@ class TestPhantomResumeId:
         entry = self._run(monkeypatch, tmp_path, "clear")
         assert entry["session_id"] == self.NEW
 
+    @pytest.mark.parametrize("source", ["new", "startup", "fork"])
+    def test_other_sources_without_transcript_keep_real_session(
+        self, monkeypatch, tmp_path, source
+    ):
+        # e.g. Claude Code 2.1.278 fires source="new" for background sessions
+        # spawned from the pane's session, with no transcript_path
+        entry = self._run(monkeypatch, tmp_path, source)
+        assert entry["session_id"] == SID
+
 
 class TestSubagentIgnored:
     def _run(self, monkeypatch, tmp_path, payload) -> bool:

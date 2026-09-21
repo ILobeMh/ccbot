@@ -453,12 +453,15 @@ def hook_main() -> None:
                 # --resume / compact even though it keeps appending to the
                 # resumed transcript. Trust the window's existing mapping
                 # when the reported id has no transcript but the old one does.
-                # (startup too: a fresh id without any transcript path while
+                # Any other event (startup, "new" background sessions, …)
+                # that reports a fresh id without a transcript path while
                 # the window already has a live session is not the pane's
-                # session — a real restart always reports its own transcript.)
+                # session either — a real (re)start always reports its own
+                # transcript. Only /clear legitimately switches to an id
+                # whose transcript doesn't exist yet.
                 if (
                     source in ("resume", "compact")
-                    or (source == "startup" and not transcript_path)
+                    or (source != "clear" and not transcript_path)
                 ) and _phantom_session(session_id, transcript_path, previous):
                     logger.info(
                         "SessionStart(%s) reported %s without a transcript; "
