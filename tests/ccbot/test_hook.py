@@ -366,3 +366,62 @@ class TestPhantomResumeId:
     def test_clear_accepts_new_session(self, monkeypatch, tmp_path):
         entry = self._run(monkeypatch, tmp_path, "clear")
         assert entry["session_id"] == self.NEW
+
+
+class TestSubagentIgnored:
+    def _run(self, monkeypatch, tmp_path, payload) -> bool:
+        monkeypatch.setenv("CCBOT_DIR", str(tmp_path))
+        monkeypatch.setattr(sys, "argv", ["ccbot", "hook"])
+        monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+        monkeypatch.setenv("TMUX_PANE", "%3")
+        monkeypatch.delenv("CLAUDE_CODE_ENTRYPOINT", raising=False)
+        monkeypatch.setattr(hook_mod, "_process_chain", lambda pid: [])
+        monkeypatch.setattr(
+            hook_mod.subprocess,
+            "run",
+            lambda *a, **k: subprocess.CompletedProcess(
+                a, 0, stdout="ccbot:@3:w\n", stderr=""
+            ),
+        )
+        hook_main()
+        return (tmp_path / "session_map.json").exists()
+
+    def test_agent_id_payload_ignored(self, monkeypatch, tmp_path):
+        assert not self._run(
+            monkeypatch,
+            tmp_path,
+            {
+                "session_id": SID,
+                "cwd": "/proj/.claude/worktrees/x",
+                "hook_event_name": "SessionStart",
+                "source": "startup",
+                "agent_id": "af5e50618d2c061f4",
+                "agent_type": "general-purpose",
+            },
+        )
+
+    def test_sidechain_transcript_ignored(self, monkeypatch, tmp_path):
+        assert not self._run(
+            monkeypatch,
+            tmp_path,
+            {
+                "session_id": SID,
+                "cwd": "/proj",
+                "hook_event_name": "SessionStart",
+                "source": "startup",
+                "transcript_path": "/x/projects/-proj/other/subagents/agent-1.jsonl",
+            },
+        )
+
+    def test_main_session_written(self, monkeypatch, tmp_path):
+        assert self._run(
+            monkeypatch,
+            tmp_path,
+            {
+                "session_id": SID,
+                "cwd": "/proj",
+                "hook_event_name": "SessionStart",
+                "source": "startup",
+                "transcript_path": f"/x/projects/-proj/{SID}.jsonl",
+            },
+        )

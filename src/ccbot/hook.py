@@ -270,10 +270,18 @@ def _install_hook() -> int:
 def hook_main() -> None:
     """Process a Claude Code hook event from stdin, or install the hook."""
     # Configure logging for the hook subprocess (main.py logging doesn't apply here)
+    # stderr is swallowed by Claude Code; also append to <CCBOT_DIR>/hook.log
+    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stderr)]
+    try:
+        from .utils import ccbot_dir
+
+        handlers.append(logging.FileHandler(ccbot_dir() / "hook.log", encoding="utf-8"))
+    except OSError:
+        pass
     logging.basicConfig(
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         level=logging.DEBUG,
-        stream=sys.stderr,
+        handlers=handlers,
     )
 
     parser = argparse.ArgumentParser(
@@ -303,6 +311,23 @@ def hook_main() -> None:
     session_id = payload.get("session_id", "")
     cwd = payload.get("cwd", "")
     event = payload.get("hook_event_name", "")
+    logger.info(
+        "hook %s source=%s session=%s cwd=%s transcript=%s agent=%s/%s pane=%s",
+        event,
+        payload.get("source"),
+        session_id,
+        cwd,
+        payload.get("transcript_path"),
+        payload.get("agent_id"),
+        payload.get("agent_type"),
+        os.environ.get("TMUX_PANE"),
+    )
+
+    # Subagents (Agent tool, worktree isolation, teams) fire SessionStart
+    # too, inside the same pane, with their own ids and no main transcript.
+    if payload.get("agent_id") or payload.get("agent_type"):
+        logger.info("Ignoring SessionStart of subagent %s", payload.get("agent_id"))
+        return
 
     if not session_id or not event:
         logger.debug("Empty session_id or event, ignoring")
@@ -328,9 +353,15 @@ def hook_main() -> None:
         return
 
     source = payload.get("source", "")
-    transcript_path = _valid_transcript_path(
-        str(payload.get("transcript_path", "")), session_id
-    )
+    raw_transcript = str(payload.get("transcript_path", ""))
+    transcript_path = _valid_transcript_path(raw_transcript, session_id)
+    if raw_transcript and not transcript_path:
+        # A transcript that isn't <session_id>.jsonl (e.g. …/subagents/agent-*.jsonl)
+        # belongs to a sidechain, not to the window's main session.
+        logger.info(
+            "Ignoring SessionStart with sidechain transcript %s", raw_transcript
+        )
+        return
 
     # Get tmux session:window key for the pane running this hook.
     # TMUX_PANE is set by tmux for every process inside a pane — except
@@ -422,9 +453,13 @@ def hook_main() -> None:
                 # --resume / compact even though it keeps appending to the
                 # resumed transcript. Trust the window's existing mapping
                 # when the reported id has no transcript but the old one does.
-                if source in ("resume", "compact") and _phantom_session(
-                    session_id, transcript_path, previous
-                ):
+                # (startup too: a fresh id without any transcript path while
+                # the window already has a live session is not the pane's
+                # session — a real restart always reports its own transcript.)
+                if (
+                    source in ("resume", "compact")
+                    or (source == "startup" and not transcript_path)
+                ) and _phantom_session(session_id, transcript_path, previous):
                     logger.info(
                         "SessionStart(%s) reported %s without a transcript; "
                         "keeping %s for %s",
