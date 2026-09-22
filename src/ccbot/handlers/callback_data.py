@@ -55,6 +55,10 @@ CB_MODE_SELECT = "md:sel:"  # md:sel:<mode>
 CB_MODE_CANCEL = "md:cancel"
 CB_MODE_SET = "md:set:"  # md:set:<mode>:<window>  (Shift+Tab cycling)
 
+# Staged images (awaiting prompt text)
+CB_IMG_SKIP = "img:skip"  # send images without extra text
+CB_IMG_CANCEL = "img:cancel"  # discard staged images
+
 # Window lifecycle
 CB_RESTART = "rw:go:"  # rw:go:<window>[:<mode>]
 CB_KILL = "rw:kill:"  # rw:kill:<window>

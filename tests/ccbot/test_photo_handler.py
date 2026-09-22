@@ -82,8 +82,12 @@ class TestBuildImagePrompt:
 
 
 class TestPhotoHandler:
+    def setup_method(self):
+        bot_mod._pending_images.clear()
+        bot_mod._pending_albums.clear()
+
     @pytest.mark.asyncio
-    async def test_single_photo_sent_immediately(self):
+    async def test_single_photo_is_staged_not_sent(self):
         sent: list[str] = []
         update = _make_photo_update(unique_id="u1", caption="hi")
         ps = _patches(sent)
@@ -94,12 +98,66 @@ class TestPhotoHandler:
         finally:
             for p in ps:
                 p.stop()
-        assert len(sent) == 1
-        assert sent[0].startswith("hi\n\n(image attached: ")
-        assert sent[0].endswith("_u1.jpg)")
+        assert sent == []
+        pending = bot_mod._pending_images[(1, 42)]
+        assert pending["caption"] == "hi"
+        assert len(pending["paths"]) == 1
 
     @pytest.mark.asyncio
-    async def test_album_is_merged_into_one_prompt(self):
+    async def test_text_after_staging_sends_images_with_text(self):
+        sent: list[str] = []
+        photo = _make_photo_update(unique_id="u1", caption="cap")
+        ps = _patches(sent)
+        for p in ps:
+            p.start()
+        try:
+            await photo_handler(photo, MagicMock())
+            reply = MagicMock()
+            reply.chat.send_action = AsyncMock()
+            consumed = await bot_mod._deliver_pending_images(reply, 1, 42, "long text")
+        finally:
+            for p in ps:
+                p.stop()
+        assert consumed
+        assert len(sent) == 1
+        assert sent[0].startswith("cap\n\nlong text\n\n(image attached: ")
+        assert sent[0].endswith("_u1.jpg)")
+        assert (1, 42) not in bot_mod._pending_images
+
+    @pytest.mark.asyncio
+    async def test_skip_sends_images_without_text(self):
+        sent: list[str] = []
+        photo = _make_photo_update(unique_id="u1")
+        ps = _patches(sent)
+        for p in ps:
+            p.start()
+        try:
+            await photo_handler(photo, MagicMock())
+            reply = MagicMock()
+            reply.chat.send_action = AsyncMock()
+            await bot_mod._deliver_pending_images(reply, 1, 42, "")
+        finally:
+            for p in ps:
+                p.stop()
+        assert len(sent) == 1
+        assert sent[0].startswith("Please look at the attached image.")
+
+    @pytest.mark.asyncio
+    async def test_cancel_discards_images(self, tmp_path):
+        f = tmp_path / "x.jpg"
+        f.write_bytes(b"x")
+        bot_mod._pending_images[(1, 42)] = {
+            "paths": [f],
+            "caption": "",
+            "wid": "@1",
+            "prompt_msg": None,
+        }
+        assert bot_mod._discard_pending_images(1, 42) == 1
+        assert not f.exists()
+        assert (1, 42) not in bot_mod._pending_images
+
+    @pytest.mark.asyncio
+    async def test_album_is_staged_as_one_group(self):
         sent: list[str] = []
         u1 = _make_photo_update(unique_id="a1", caption="look", media_group_id="g")
         u2 = _make_photo_update(unique_id="a2", media_group_id="g")
@@ -110,14 +168,20 @@ class TestPhotoHandler:
         try:
             for u in (u1, u2, u3):
                 await photo_handler(u, MagicMock())
-            assert sent == []  # nothing delivered until the album settles
+            assert (1, 42) not in bot_mod._pending_images  # album not settled
             await asyncio.sleep(0.2)
+            pending = bot_mod._pending_images[(1, 42)]
+            assert len(pending["paths"]) == 3
+            assert pending["caption"] == "look"
+            reply = MagicMock()
+            reply.chat.send_action = AsyncMock()
+            await bot_mod._deliver_pending_images(reply, 1, 42, "compare them")
         finally:
             for p in ps:
                 p.stop()
         assert len(sent) == 1
         text = sent[0]
-        assert text.startswith("look\n\n(3 images attached:\n")
+        assert text.startswith("look\n\ncompare them\n\n(3 images attached:\n")
         for uid in ("a1", "a2", "a3"):
             assert f"_{uid}.jpg" in text
         assert not bot_mod._pending_albums

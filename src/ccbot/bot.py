@@ -86,6 +86,8 @@ from .handlers.callback_data import (
     CB_DIR_UP,
     CB_HISTORY_NEXT,
     CB_HISTORY_PREV,
+    CB_IMG_CANCEL,
+    CB_IMG_SKIP,
     CB_KEYS_PREFIX,
     CB_KILL,
     CB_MODE_CANCEL,
@@ -1170,7 +1172,38 @@ async def _download_image(message: Message) -> Path | None:
     return file_path
 
 
-async def _deliver_images(
+# Images that have been downloaded but not yet handed to Claude Code.  The bot
+# never forwards images straight away: Telegram caps captions at 1024 chars, so
+# after staging it asks the user for the prompt text (next text message in the
+# topic), or Skip (send without text) / Cancel (discard the images).
+_pending_images: dict[tuple[int, int], dict[str, Any]] = {}
+
+
+def _image_prompt_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("⏭ Skip (no text)", callback_data=CB_IMG_SKIP),
+                InlineKeyboardButton("❌ Cancel", callback_data=CB_IMG_CANCEL),
+            ]
+        ]
+    )
+
+
+def _image_prompt_text(pending: dict[str, Any]) -> str:
+    n = len(pending["paths"])
+    noun = "image" if n == 1 else "images"
+    lines = [f"📷 {n} {noun} ready."]
+    if pending["caption"]:
+        lines.append("Caption will be included.")
+    lines.append(
+        "Send the text to go with it as your next message, "
+        "or tap Skip to send without text / Cancel to discard."
+    )
+    return "\n".join(lines)
+
+
+async def _stage_images(
     message: Message,
     user_id: int,
     thread_id: int,
@@ -1178,22 +1211,86 @@ async def _deliver_images(
     caption: str,
     paths: list[Path],
 ) -> None:
-    """Send the image prompt to the bound window and confirm to the user."""
-    text_to_send = build_image_prompt(caption, paths)
+    """Park downloaded images and ask the user for the accompanying text."""
+    key = (user_id, thread_id)
+    pending = _pending_images.get(key)
+    if pending is None:
+        pending = {"paths": [], "caption": "", "wid": wid, "prompt_msg": None}
+        _pending_images[key] = pending
+    pending["paths"].extend(paths)
+    pending["wid"] = wid
+    if caption:
+        pending["caption"] = (
+            f"{pending['caption']}\n\n{caption}" if pending["caption"] else caption
+        )
+
+    text = _image_prompt_text(pending)
+    keyboard = _image_prompt_keyboard()
+    prev = pending.get("prompt_msg")
+    if prev is not None:
+        # More images arrived while waiting — drop the old prompt's buttons.
+        try:
+            await prev.edit_reply_markup(reply_markup=None)
+        except Exception as e:
+            logger.debug("Could not clear old image prompt keyboard: %s", e)
+    pending["prompt_msg"] = await safe_reply(message, text, reply_markup=keyboard)
+
+
+async def _finish_image_prompt(pending: dict[str, Any], text: str) -> None:
+    """Replace the staging prompt's buttons with a final status line."""
+    prev = pending.get("prompt_msg")
+    if prev is None:
+        return
     try:
-        await message.chat.send_action(ChatAction.TYPING)
+        await safe_edit(prev, text)
+    except Exception as e:
+        logger.debug("Could not edit image prompt: %s", e)
+
+
+async def _deliver_pending_images(
+    reply_to: Message,
+    user_id: int,
+    thread_id: int,
+    extra_text: str,
+) -> bool:
+    """Send the staged images (plus caption/extra text) to the bound window.
+
+    Returns True when there were staged images for this topic (whether or
+    not delivery succeeded), so the caller knows the text was consumed.
+    """
+    pending = _pending_images.pop((user_id, thread_id), None)
+    if pending is None:
+        return False
+    caption_parts = [t for t in (pending["caption"], extra_text) if t.strip()]
+    text_to_send = build_image_prompt("\n\n".join(caption_parts), pending["paths"])
+    try:
+        await reply_to.chat.send_action(ChatAction.TYPING)
     except Exception as e:
         logger.warning("send_action(TYPING) failed, continuing to injection: %s", e)
     clear_status_msg_info(user_id, thread_id)
 
-    success, err = await session_manager.send_to_window(wid, text_to_send)
+    success, err = await session_manager.send_to_window(pending["wid"], text_to_send)
+    n = len(pending["paths"])
+    noun = "image" if n == 1 else "images"
     if not success:
-        await safe_reply(message, f"❌ {err}")
-        return
-    if len(paths) == 1:
-        await safe_reply(message, "📷 Image sent to Claude Code.")
-    else:
-        await safe_reply(message, f"📷 {len(paths)} images sent to Claude Code.")
+        await _finish_image_prompt(pending, f"❌ {err}")
+        await safe_reply(reply_to, f"❌ {err}")
+        return True
+    await _finish_image_prompt(pending, f"📷 {n} {noun} sent to Claude Code.")
+    return True
+
+
+def _discard_pending_images(user_id: int, thread_id: int) -> int:
+    """Drop staged images for a topic and delete their files. Returns count."""
+    pending = _pending_images.pop((user_id, thread_id), None)
+    if pending is None:
+        return 0
+    for p in pending["paths"]:
+        try:
+            Path(p).unlink(missing_ok=True)
+        except OSError as e:
+            logger.debug("Could not delete %s: %s", p, e)
+    return len(pending["paths"])
 
 
 async def _flush_album(key: tuple[int, int, str]) -> None:
@@ -1203,7 +1300,7 @@ async def _flush_album(key: tuple[int, int, str]) -> None:
     if not album:
         return
     user_id, thread_id, _ = key
-    await _deliver_images(
+    await _stage_images(
         album["message"],
         user_id,
         thread_id,
@@ -1214,10 +1311,10 @@ async def _flush_album(key: tuple[int, int, str]) -> None:
 
 
 async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle photos / image files: download and forward path(s) to Claude Code.
+    """Handle photos / image files: download and stage them for Claude Code.
 
-    Albums are buffered by media_group_id and forwarded as a single prompt
-    that lists every image together with the album's caption.
+    Albums are buffered by media_group_id.  Nothing is forwarded yet: the
+    user is asked for the prompt text (or Skip / Cancel) — see _stage_images.
     """
     user = update.effective_user
     if not user or not is_user_allowed(user.id):
@@ -1273,7 +1370,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     caption = message.caption or ""
     group_id = message.media_group_id
     if not group_id:
-        await _deliver_images(message, user.id, thread_id, wid, caption, [file_path])
+        await _stage_images(message, user.id, thread_id, wid, caption, [file_path])
         return
 
     # Album piece: accumulate and (re)start the settle timer.
@@ -1359,6 +1456,12 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     except Exception as e:
         logger.error("Voice transcription failed: %s", e)
         await safe_reply(update.message, f"⚠ Transcription failed: {e}")
+        return
+
+    # A voice note can also be the prompt text for staged images.
+    if (user.id, thread_id) in _pending_images:
+        await safe_reply(update.message, f'🎤 "{text}"')
+        await _deliver_pending_images(update.message, user.id, thread_id, text)
         return
 
     try:
@@ -1556,6 +1659,13 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         clear_mode_picker_state(context.user_data)
         context.user_data.pop("_pending_thread_id", None)
         context.user_data.pop("_pending_thread_text", None)
+
+    # Staged images waiting for their prompt text — this message is it.
+    if thread_id is not None and (user.id, thread_id) in _pending_images:
+        await _deliver_pending_images(
+            update.message, user.id, thread_id, update.message.text
+        )
+        return
 
     # Must be in a named topic
     if thread_id is None:
@@ -2023,6 +2133,33 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     chat = update.effective_chat
     if chat and chat.type in ("group", "supergroup"):
         session_manager.set_group_chat_id(user.id, cb_thread_id, chat.id)
+
+    # Staged images: send without text / discard
+    if data in (CB_IMG_SKIP, CB_IMG_CANCEL):
+        if cb_thread_id is None or not query.message:
+            await query.answer("No topic")
+            return
+        if (user.id, cb_thread_id) not in _pending_images:
+            await query.answer("Nothing pending")
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            return
+        if data == CB_IMG_CANCEL:
+            n = _discard_pending_images(user.id, cb_thread_id)
+            await query.answer("Cancelled")
+            noun = "image" if n == 1 else "images"
+            try:
+                await query.edit_message_text(f"🗑 {n} {noun} discarded.")
+            except Exception as e:
+                logger.debug("Could not edit image prompt: %s", e)
+            return
+        await query.answer("Sending…")
+        msg = query.message
+        if isinstance(msg, Message):
+            await _deliver_pending_images(msg, user.id, cb_thread_id, "")
+        return
 
     # History: older/newer pagination
     # Format: hp:<page>:<window_id>:<start>:<end> or hn:<page>:<window_id>:<start>:<end>
