@@ -10,8 +10,9 @@ Core responsibilities:
     interactive UI navigation, screenshot refresh.
   - Topic-based routing: each named topic binds to one tmux window.
     Unbound topics trigger the directory browser to create a new session.
-  - Photo handling: photos sent by user are downloaded and forwarded
-    to Claude Code as file paths (photo_handler).
+  - Photo handling: photos / image files (single or album) are downloaded
+    and forwarded to Claude Code as file paths in one prompt, together with
+    the caption (photo_handler).
   - Voice handling: voice messages are transcribed via OpenAI API and
     forwarded as text (voice_handler).
   - Automatic cleanup: closing a topic kills the associated window
@@ -48,6 +49,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputMediaDocument,
+    Message,
     Update,
 )
 from telegram.constants import ChatAction
@@ -1118,19 +1120,116 @@ async def unsupported_content_handler(
 _IMAGES_DIR = ccbot_dir() / "images"
 _IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 
+# Telegram delivers an album (media group) as N separate updates that share a
+# media_group_id, with the caption attached to only one of them.  Buffer the
+# pieces per (user, thread, group) and flush once no new piece has arrived for
+# _ALBUM_FLUSH_DELAY seconds, so Claude Code gets ONE prompt with every image.
+_ALBUM_FLUSH_DELAY = 1.5
+_pending_albums: dict[tuple[int, int, str], dict[str, Any]] = {}
+
+_IMAGE_DOC_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tiff"}
+
+
+def build_image_prompt(caption: str, paths: list[Path]) -> str:
+    """Build the prompt that hands downloaded image(s) to Claude Code.
+
+    Absolute paths are listed so Claude Code can view them with its Read
+    tool; the user's caption (if any) becomes the instruction, otherwise a
+    neutral "look at these" line is used so Claude opens them proactively.
+    """
+    caption = caption.strip()
+    if len(paths) == 1:
+        attachment = f"(image attached: {paths[0]})"
+    else:
+        listing = "\n".join(f"- {p}" for p in paths)
+        attachment = f"({len(paths)} images attached:\n{listing})"
+    if caption:
+        return f"{caption}\n\n{attachment}"
+    noun = "image" if len(paths) == 1 else "images"
+    return f"Please look at the attached {noun}.\n\n{attachment}"
+
+
+async def _download_image(message: Message) -> Path | None:
+    """Download the photo or image document in *message* into _IMAGES_DIR."""
+    if message.photo:
+        photo = message.photo[-1]  # highest resolution
+        tg_file = await photo.get_file()
+        filename = f"{int(time.time())}_{photo.file_unique_id}.jpg"
+    elif message.document:
+        doc = message.document
+        ext = Path(doc.file_name or "").suffix.lower()
+        if ext not in _IMAGE_DOC_EXTENSIONS:
+            mime = doc.mime_type or ""
+            ext = "." + mime.split("/", 1)[1] if mime.startswith("image/") else ".img"
+        tg_file = await doc.get_file()
+        filename = f"{int(time.time())}_{doc.file_unique_id}{ext}"
+    else:
+        return None
+    file_path = _IMAGES_DIR / filename
+    await tg_file.download_to_drive(file_path)
+    return file_path
+
+
+async def _deliver_images(
+    message: Message,
+    user_id: int,
+    thread_id: int,
+    wid: str,
+    caption: str,
+    paths: list[Path],
+) -> None:
+    """Send the image prompt to the bound window and confirm to the user."""
+    text_to_send = build_image_prompt(caption, paths)
+    try:
+        await message.chat.send_action(ChatAction.TYPING)
+    except Exception as e:
+        logger.warning("send_action(TYPING) failed, continuing to injection: %s", e)
+    clear_status_msg_info(user_id, thread_id)
+
+    success, err = await session_manager.send_to_window(wid, text_to_send)
+    if not success:
+        await safe_reply(message, f"❌ {err}")
+        return
+    if len(paths) == 1:
+        await safe_reply(message, "📷 Image sent to Claude Code.")
+    else:
+        await safe_reply(message, f"📷 {len(paths)} images sent to Claude Code.")
+
+
+async def _flush_album(key: tuple[int, int, str]) -> None:
+    """Wait for the album to settle, then deliver all its images as one prompt."""
+    await asyncio.sleep(_ALBUM_FLUSH_DELAY)
+    album = _pending_albums.pop(key, None)
+    if not album:
+        return
+    user_id, thread_id, _ = key
+    await _deliver_images(
+        album["message"],
+        user_id,
+        thread_id,
+        album["wid"],
+        album["caption"],
+        album["paths"],
+    )
+
 
 async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle photos sent by the user: download and forward path to Claude Code."""
+    """Handle photos / image files: download and forward path(s) to Claude Code.
+
+    Albums are buffered by media_group_id and forwarded as a single prompt
+    that lists every image together with the album's caption.
+    """
     user = update.effective_user
     if not user or not is_user_allowed(user.id):
         if update.message:
             await safe_reply(update.message, "You are not authorized to use this bot.")
         return
 
-    if not update.message or not update.message.photo:
+    message = update.message
+    if not message or not (message.photo or message.document):
         return
 
-    chat = update.message.chat
+    chat = message.chat
     thread_id = _get_thread_id(update)
     if chat.type in ("group", "supergroup") and thread_id is not None:
         session_manager.set_group_chat_id(user.id, thread_id, chat.id)
@@ -1138,7 +1237,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     # Must be in a named topic
     if thread_id is None:
         await safe_reply(
-            update.message,
+            message,
             "❌ Please use a named topic. Create a new topic to start a session.",
         )
         return
@@ -1146,7 +1245,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     wid = session_manager.get_window_for_thread(user.id, thread_id)
     if wid is None:
         await safe_reply(
-            update.message,
+            message,
             "❌ No session bound to this topic. Send a text message first to create one.",
         )
         return
@@ -1156,41 +1255,45 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         display = session_manager.get_display_name(wid)
         session_manager.unbind_thread(user.id, thread_id)
         await safe_reply(
-            update.message,
+            message,
             f"❌ Window '{display}' no longer exists. Binding removed.\n"
             "Send a message to start a new session.",
         )
         return
 
-    # Download the highest-resolution photo
-    photo = update.message.photo[-1]
-    tg_file = await photo.get_file()
-
-    # Save to ~/.ccbot/images/<timestamp>_<file_unique_id>.jpg
-    filename = f"{int(time.time())}_{photo.file_unique_id}.jpg"
-    file_path = _IMAGES_DIR / filename
-    await tg_file.download_to_drive(file_path)
-
-    # Build the message to send to Claude Code
-    caption = update.message.caption or ""
-    if caption:
-        text_to_send = f"{caption}\n\n(image attached: {file_path})"
-    else:
-        text_to_send = f"(image attached: {file_path})"
-
     try:
-        await update.message.chat.send_action(ChatAction.TYPING)
+        file_path = await _download_image(message)
     except Exception as e:
-        logger.warning("send_action(TYPING) failed, continuing to injection: %s", e)
-    clear_status_msg_info(user.id, thread_id)
-
-    success, message = await session_manager.send_to_window(wid, text_to_send)
-    if not success:
-        await safe_reply(update.message, f"❌ {message}")
+        logger.error("Image download failed (user=%d): %s", user.id, e)
+        await safe_reply(message, f"❌ Failed to download image: {e}")
+        return
+    if file_path is None:
         return
 
-    # Confirm to user
-    await safe_reply(update.message, "📷 Image sent to Claude Code.")
+    caption = message.caption or ""
+    group_id = message.media_group_id
+    if not group_id:
+        await _deliver_images(message, user.id, thread_id, wid, caption, [file_path])
+        return
+
+    # Album piece: accumulate and (re)start the settle timer.
+    key = (user.id, thread_id, group_id)
+    album = _pending_albums.get(key)
+    if album is None:
+        album = {
+            "message": message,
+            "wid": wid,
+            "caption": "",
+            "paths": [],
+            "task": None,
+        }
+        _pending_albums[key] = album
+    album["paths"].append(file_path)
+    if caption:
+        album["caption"] = caption
+    if album["task"] is not None:
+        album["task"].cancel()
+    album["task"] = asyncio.create_task(_flush_album(key))
 
 
 async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2891,8 +2994,10 @@ def create_bot() -> Application:
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler)
     )
-    # Photos: download and forward file path to Claude Code
-    application.add_handler(MessageHandler(filters.PHOTO, photo_handler))
+    # Photos / image files (incl. albums): download and forward path(s) to Claude Code
+    application.add_handler(
+        MessageHandler(filters.PHOTO | filters.Document.IMAGE, photo_handler)
+    )
     # Voice: transcribe via OpenAI and forward text to Claude Code
     application.add_handler(MessageHandler(filters.VOICE, voice_handler))
     # Catch-all: non-text content (stickers, video, etc.)
