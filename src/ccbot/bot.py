@@ -101,6 +101,8 @@ from .handlers.callback_data import (
     CB_SESSION_SELECT,
     CB_SESSIONS_KILL,
     CB_SESSIONS_REFRESH,
+    CB_TXT_CANCEL,
+    CB_TXT_SEND,
     CB_WIN_BIND,
     CB_WIN_CANCEL,
     CB_WIN_NEW,
@@ -1570,7 +1572,18 @@ async def _capture_bash_output(
         _bash_capture_tasks.pop((user_id, thread_id), None)
 
 
+# Telegram clients split a paste longer than 4096 chars into several messages
+# sent back-to-back.  Text messages in a topic are buffered and joined when
+# the next one arrives within config.text_merge_window seconds, so Claude
+# Code receives the paste as one prompt.
+_pending_merges: dict[tuple[int, int | None], dict[str, Any]] = {}
+
+# Texts waiting for ✅ Send / ❌ Cancel when config.confirm_text is on.
+_pending_texts: dict[tuple[int, int], dict[str, Any]] = {}
+
+
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Entry point for text: merge rapid-fire parts, then process once."""
     user = update.effective_user
     if not user or not is_user_allowed(user.id):
         if update.message:
@@ -1578,6 +1591,43 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     if not update.message or not update.message.text:
+        return
+
+    window = float(config.text_merge_window)
+    if window <= 0:
+        await _handle_text(update, context, update.message.text)
+        return
+
+    key = (user.id, _get_thread_id(update))
+    buf = _pending_merges.get(key)
+    if buf is None:
+        buf = {"update": update, "context": context, "parts": [], "task": None}
+        _pending_merges[key] = buf
+    buf["parts"].append(update.message.text)
+    if buf["task"] is not None:
+        buf["task"].cancel()
+    buf["task"] = asyncio.create_task(_flush_text_merge(key, window))
+
+
+async def _flush_text_merge(key: tuple[int, int | None], delay: float) -> None:
+    await asyncio.sleep(delay)
+    buf = _pending_merges.pop(key, None)
+    if not buf:
+        return
+    parts: list[str] = buf["parts"]
+    if len(parts) > 1:
+        logger.info("Merged %d text parts (user=%d, thread=%s)", len(parts), *key)
+    try:
+        await _handle_text(buf["update"], buf["context"], "\n".join(parts))
+    except Exception:
+        logger.exception("Text handling failed after merge (user=%d)", key[0])
+
+
+async def _handle_text(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, text: str
+) -> None:
+    user = update.effective_user
+    if not user or not update.message:
         return
 
     thread_id = _get_thread_id(update)
@@ -1588,8 +1638,6 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     chat = update.effective_chat
     if chat and chat.type in ("group", "supergroup"):
         session_manager.set_group_chat_id(user.id, thread_id, chat.id)
-
-    text = update.message.text
 
     # Ignore text in window picker mode (only for the same thread)
     if context.user_data and context.user_data.get(STATE_KEY) == STATE_SELECTING_WINDOW:
@@ -1662,9 +1710,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     # Staged images waiting for their prompt text — this message is it.
     if thread_id is not None and (user.id, thread_id) in _pending_images:
-        await _deliver_pending_images(
-            update.message, user.id, thread_id, update.message.text
-        )
+        await _deliver_pending_images(update.message, user.id, thread_id, text)
         return
 
     # Must be in a named topic
@@ -1775,24 +1821,101 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
 
+    if config.confirm_text:
+        await _stage_text(update.message, user.id, thread_id, wid, text)
+        return
+
+    await _forward_text(update.message, context, user.id, thread_id, wid, text)
+
+
+def _text_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ Send", callback_data=CB_TXT_SEND),
+                InlineKeyboardButton("❌ Cancel", callback_data=CB_TXT_CANCEL),
+            ]
+        ]
+    )
+
+
+_TEXT_PREVIEW_CHARS = 400
+
+
+def _text_confirm_prompt(text: str) -> str:
+    preview = (
+        text
+        if len(text) <= _TEXT_PREVIEW_CHARS
+        else (text[:_TEXT_PREVIEW_CHARS].rstrip() + " …")
+    )
+    return f"📝 Send to Claude Code? ({len(text)} chars)\n\n{preview}"
+
+
+async def _stage_text(
+    message: Message, user_id: int, thread_id: int, wid: str, text: str
+) -> None:
+    """Park *text* and ask for confirmation; further text is appended."""
+    key = (user_id, thread_id)
+    pending = _pending_texts.get(key)
+    if pending is None:
+        pending = {"text": text, "wid": wid, "message": message, "prompt_msg": None}
+        _pending_texts[key] = pending
+    else:
+        pending["text"] = f"{pending['text']}\n\n{text}"
+        pending["wid"] = wid
+        prev = pending["prompt_msg"]
+        if prev is not None:
+            try:
+                await prev.edit_reply_markup(reply_markup=None)
+            except Exception as e:
+                logger.debug("Could not clear old confirm keyboard: %s", e)
+    pending["prompt_msg"] = await _reply_plain(
+        message, _text_confirm_prompt(pending["text"]), _text_confirm_keyboard()
+    )
+
+
+async def _reply_plain(
+    message: Message, text: str, keyboard: InlineKeyboardMarkup
+) -> Message:
+    """Plain-text reply (user text is shown verbatim, not as Markdown)."""
+    return await message.reply_text(
+        text, reply_markup=keyboard, link_preview_options=NO_LINK_PREVIEW
+    )
+
+
+async def _forward_text(
+    message: Message,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    thread_id: int,
+    wid: str,
+    text: str,
+) -> None:
+    """Inject *text* into the bound window (bound-topic tail of text handling)."""
+    w = await tmux_manager.find_window_by_id(wid)
+    if not w:
+        display = session_manager.get_display_name(wid)
+        await safe_reply(message, f"❌ Window '{display}' no longer exists.")
+        return
+
     # Cosmetic / outbound-Telegram steps below must NEVER abort the handler
     # before the message is injected into tmux. On flaky networks the "typing…"
     # indicator (send_action) and status enqueue time out (telegram.error.TimedOut);
     # since the update offset has already advanced, Telegram won't redeliver, so
     # any exception here silently drops the user's message and forces a resend.
     try:
-        await update.message.chat.send_action(ChatAction.TYPING)
+        await message.chat.send_action(ChatAction.TYPING)
     except Exception as e:
         logger.warning("send_action(TYPING) failed, continuing to injection: %s", e)
     try:
         await enqueue_status_update(
-            context.bot, user.id, wid, None, thread_id=thread_id
+            context.bot, user_id, wid, None, thread_id=thread_id
         )
     except Exception as e:
         logger.warning("enqueue_status_update failed, continuing to injection: %s", e)
 
     # Cancel any running bash capture — new message pushes pane content down
-    _cancel_bash_capture(user.id, thread_id)
+    _cancel_bash_capture(user_id, thread_id)
 
     # Check for pending interactive UI before sending text.
     # This catches UIs (permission prompts, etc.) that status polling might have missed.
@@ -1804,33 +1927,33 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             # UI detected — show it to user, then send text (acts as Enter)
             logger.info(
                 "Detected pending interactive UI before sending text (user=%d, thread=%s)",
-                user.id,
+                user_id,
                 thread_id,
             )
-            await handle_interactive_ui(context.bot, user.id, wid, thread_id)
+            await handle_interactive_ui(context.bot, user_id, wid, thread_id)
             # Small delay to let UI render in Telegram before text arrives
             await asyncio.sleep(0.3)
     except Exception as e:
         logger.warning("interactive-UI precheck failed, continuing to injection: %s", e)
 
-    success, message = await session_manager.send_to_window(wid, text)
+    success, err = await session_manager.send_to_window(wid, text)
     if not success:
-        await safe_reply(update.message, f"❌ {message}")
+        await safe_reply(message, f"❌ {err}")
         return
 
     # Start background capture for ! bash command output
     if text.startswith("!") and len(text) > 1:
         bash_cmd = text[1:]  # strip leading "!"
         task = asyncio.create_task(
-            _capture_bash_output(context.bot, user.id, thread_id, wid, bash_cmd)
+            _capture_bash_output(context.bot, user_id, thread_id, wid, bash_cmd)
         )
-        _bash_capture_tasks[(user.id, thread_id)] = task
+        _bash_capture_tasks[(user_id, thread_id)] = task
 
     # If in interactive mode, refresh the UI after sending text
-    interactive_window = get_interactive_window(user.id, thread_id)
+    interactive_window = get_interactive_window(user_id, thread_id)
     if interactive_window and interactive_window == wid:
         await asyncio.sleep(0.2)
-        await handle_interactive_ui(context.bot, user.id, wid, thread_id)
+        await handle_interactive_ui(context.bot, user_id, wid, thread_id)
 
 
 # --- Window creation helpers ---
@@ -2133,6 +2256,42 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     chat = update.effective_chat
     if chat and chat.type in ("group", "supergroup"):
         session_manager.set_group_chat_id(user.id, cb_thread_id, chat.id)
+
+    # Text awaiting confirmation (confirm_text setting)
+    if data in (CB_TXT_SEND, CB_TXT_CANCEL):
+        pending = (
+            _pending_texts.pop((user.id, cb_thread_id), None)
+            if cb_thread_id is not None
+            else None
+        )
+        if pending is None:
+            await query.answer("Nothing pending")
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            return
+        n = len(pending["text"])
+        if data == CB_TXT_CANCEL:
+            await query.answer("Cancelled")
+            status = f"🗑 Cancelled ({n} chars not sent)."
+        else:
+            await query.answer("Sending…")
+            status = f"✅ Sent to Claude Code ({n} chars)."
+        try:
+            await query.edit_message_text(status)
+        except Exception as e:
+            logger.debug("Could not edit confirm prompt: %s", e)
+        if data == CB_TXT_SEND and cb_thread_id is not None:
+            await _forward_text(
+                pending["message"],
+                context,
+                user.id,
+                cb_thread_id,
+                pending["wid"],
+                pending["text"],
+            )
+        return
 
     # Staged images: send without text / discard
     if data in (CB_IMG_SKIP, CB_IMG_CANCEL):

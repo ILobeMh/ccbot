@@ -137,6 +137,12 @@ class Config:
         # Max thinking chars per turn; 0 = send everything, split into parts
         self.thinking_max_chars = int(os.getenv("CCBOT_MAX_THINKING_CHARS", "500"))
 
+        # Ask ✅ Send / ❌ Cancel before forwarding a text message to Claude
+        self.confirm_text = os.getenv("CCBOT_CONFIRM_TEXT", "false").lower() == "true"
+        # Join text messages arriving within this many seconds (Telegram
+        # splits pastes over 4096 chars into several messages); 0 = off
+        self.text_merge_window = float(os.getenv("CCBOT_TEXT_MERGE_WINDOW", "1.0"))
+
         # Send the live status line ("Moseying… (7s)") as an edited message
         self.status_updates = (
             os.getenv("CCBOT_STATUS_UPDATES", "true").lower() != "false"

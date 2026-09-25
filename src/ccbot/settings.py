@@ -102,6 +102,22 @@ SETTINGS: list[Setting] = [
         help="'Moseying… (7s)' progress edits",
     ),
     Setting(
+        "confirm_text",
+        "Confirm before sending",
+        "Input",
+        "bool",
+        help="Ask ✅ Send / ❌ Cancel before a text goes to Claude",
+    ),
+    Setting(
+        "text_merge_window",
+        "Merge split messages",
+        "Input",
+        "choice",
+        choices=[0.0, 0.5, 1.0, 1.5, 2.0],
+        fmt=lambda v: "off" if not float(v) else f"{float(v):g}s",
+        help="Texts sent within this gap are joined into one prompt (4096-char splits)",
+    ),
+    Setting(
         "claude_permission_mode",
         "Default launch mode",
         "Sessions",
