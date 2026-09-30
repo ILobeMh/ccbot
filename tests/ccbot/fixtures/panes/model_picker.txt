@@ -1,0 +1,40 @@
+
+ ▐▛███▛█   Claude Code v2.1.278
+▝▜██████▀  Opus 5 with high effort · API Usage Billing
+  ▝▝ ▝▝    /private/var/tmp/ccbot-cap
+
+  Updated to latest. Got 30 features, 168 bugfixes, and 70 other changes.
+  code.claude.com/docs/en/changelog for details
+
+  Opus 5.5 is now your default model and it draws down usage faster than Sonnet 5. Switch anytime with /model.
+
+❯ /effort
+  ⎿  Cancelled
+
+
+
+
+
+
+
+
+
+
+
+
+
+▔▔▔▔▔▔▔ tmux focus-events off · add 'set -g focus-events on' to ~/.tmux.conf and reattach for focus tracking ▔
+   Select model
+   Switch between Claude models. Your pick becomes the default for new sessions. For other/previous model
+   names, specify with --model.
+
+     1. Default (recommended)  Use the default model (currently Opus 5 (1M context)) · $5/$25 per Mtok
+     2. Opus (1M context)      Opus 5 with 1M context · Best for everyday, complex tasks · $5/$25 per Mtok
+     3. Fable                  Fable 5.1 · Most capable for your hardest and longest-running tasks
+     4. Sonnet                 Sonnet 5 · Efficient for routine tasks · $2/$10 per Mtok
+     5. Haiku                  Haiku 4.5 · Fastest for quick answers · $1/$5 per Mtok
+   ❯ 6. Opus ✔                 Opus 5 · Best for everyday, complex tasks
+
+   ● High effort (default) ←/→ to adjust
+
+   Enter to set as default · s to use this session only · Esc to cancel
