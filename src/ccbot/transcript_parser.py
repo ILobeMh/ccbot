@@ -10,7 +10,9 @@ tool_result blocks in subsequent user messages via tool_use_id.
 Shared by both session.py (history) and session_monitor.py (real-time).
 Format reference: https://github.com/desis123/claude-code-viewer
 
-Key classes: TranscriptParser (static methods), ParsedEntry, ParsedMessage, PendingToolInfo.
+Key classes: TranscriptParser (static methods), ParsedEntry (pre-formatted
+``text`` plus ``raw`` / ``tool`` structured data), ToolCall, ParsedMessage,
+PendingToolInfo.
 """
 
 import base64
@@ -18,7 +20,7 @@ import difflib
 import json
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -31,6 +33,27 @@ class ParsedMessage:
     message_type: str  # "user", "assistant", "tool_use", "tool_result", etc.
     text: str  # Extracted text content
     tool_name: str | None = None  # For tool_use messages
+
+
+@dataclass
+class ToolCall:
+    """Structured data of one tool call, for renderers that lay it out
+    themselves (rich messages) instead of using ``ParsedEntry.text``.
+
+    On a tool_use entry only the call side is set; on the tool_result entry
+    the result side is filled in as well.
+    """
+
+    name: str
+    input: dict[str, Any] = field(default_factory=dict)
+    started_at: str | None = None  # tool_use timestamp
+    result_text: str | None = None
+    is_error: bool = False
+    interrupted: bool = False
+    # Claude Code's structured result (JSONL "toolUseResult"): Bash
+    # stdout/stderr, Edit structuredPatch, Agent status, …
+    result_meta: dict[str, Any] | None = None
+    finished_at: str | None = None  # tool_result timestamp
 
 
 @dataclass
@@ -56,6 +79,10 @@ class ParsedEntry:
     # one API message)
     stop_reason: str | None = None
     api_message_id: str | None = None
+    # Unformatted body of text / thinking entries (``text`` may carry
+    # expandable-quote sentinels) and structured tool data (tool entries)
+    raw: str | None = None
+    tool: ToolCall | None = None
 
 
 @dataclass
@@ -65,6 +92,8 @@ class PendingToolInfo:
     summary: str  # Formatted tool summary (e.g. "**Read**(file.py)")
     tool_name: str  # Tool name (e.g. "Read", "Edit")
     input_data: Any = None  # Tool input parameters (for Edit to generate diff)
+    started_at: str | None = None  # tool_use timestamp
+    full_input: dict[str, Any] | None = None  # every tool's input (rich rendering)
 
 
 class TranscriptParser:
@@ -643,6 +672,7 @@ class TranscriptParser:
                                     text=f"🚨 {t}" if is_error else t,
                                     content_type="error" if is_error else "text",
                                     timestamp=entry_timestamp,
+                                    raw=t,
                                 )
                             )
 
@@ -676,6 +706,8 @@ class TranscriptParser:
                                 summary=summary,
                                 tool_name=name,
                                 input_data=input_data,
+                                started_at=entry_timestamp,
+                                full_input=inp if isinstance(inp, dict) else None,
                             )
                             # Also emit tool_use entry with tool_name for immediate handling
                             result.append(
@@ -686,6 +718,11 @@ class TranscriptParser:
                                     tool_use_id=tool_id,
                                     timestamp=entry_timestamp,
                                     tool_name=name,
+                                    tool=ToolCall(
+                                        name=name,
+                                        input=inp if isinstance(inp, dict) else {},
+                                        started_at=entry_timestamp,
+                                    ),
                                 )
                             )
                         else:
@@ -697,6 +734,11 @@ class TranscriptParser:
                                     tool_use_id=tool_id or None,
                                     timestamp=entry_timestamp,
                                     tool_name=name,
+                                    tool=ToolCall(
+                                        name=name,
+                                        input=inp if isinstance(inp, dict) else {},
+                                        started_at=entry_timestamp,
+                                    ),
                                 )
                             )
 
@@ -713,6 +755,7 @@ class TranscriptParser:
                                     text=quoted,
                                     content_type="thinking",
                                     timestamp=entry_timestamp,
+                                    raw=thinking_text,
                                 )
                             )
 
@@ -746,6 +789,7 @@ class TranscriptParser:
                             tool_summary = tool_info.summary
                             tool_name = tool_info.tool_name
                             tool_input_data = tool_info.input_data
+                        n_before = len(result)
 
                         if is_interrupted:
                             # Show interruption inline with tool summary
@@ -854,6 +898,20 @@ class TranscriptParser:
                                     image_data=result_images,
                                 )
                             )
+
+                        meta = data.get("toolUseResult")
+                        call = ToolCall(
+                            name=tool_name or "",
+                            input=(tool_info.full_input if tool_info else None) or {},
+                            started_at=tool_info.started_at if tool_info else None,
+                            result_text=result_text,
+                            is_error=bool(is_error),
+                            interrupted=is_interrupted,
+                            result_meta=meta if isinstance(meta, dict) else None,
+                            finished_at=entry_timestamp,
+                        )
+                        for emitted in result[n_before:]:
+                            emitted.tool = call
 
                     elif btype == "text":
                         t = block.get("text", "").strip()

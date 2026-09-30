@@ -841,3 +841,89 @@ class TestSystemNotices:
             ("text", "end_turn"),
             ("info", None),
         ]
+
+
+class TestStructuredToolData:
+    """ParsedEntry.tool / .raw carry what rich rendering needs, untruncated."""
+
+    def _bash_entries(self, command: str):
+        return [
+            {
+                "type": "assistant",
+                "timestamp": "2026-09-30T10:00:00.000Z",
+                "message": {
+                    "id": "m1",
+                    "content": [
+                        {"type": "thinking", "thinking": "let me test **all** configs"},
+                        {
+                            "type": "tool_use",
+                            "id": "t1",
+                            "name": "Bash",
+                            "input": {
+                                "command": command,
+                                "description": "Testing every subscription config",
+                            },
+                        },
+                    ],
+                },
+            },
+            {
+                "type": "user",
+                "timestamp": "2026-09-30T10:06:19.000Z",
+                "toolUseResult": {
+                    "stdout": "ok\nok",
+                    "stderr": "warn",
+                    "interrupted": False,
+                },
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "t1",
+                            "content": "ok\nok",
+                        }
+                    ]
+                },
+            },
+        ]
+
+    def test_bash_call_and_result_are_structured(self):
+        command = "python3 - <<'EOF'\n" + "x = 1\n" * 100 + "EOF"
+        entries, pending = TranscriptParser.parse_entries(self._bash_entries(command))
+        assert pending == {}
+        thinking, use, res = entries
+        assert thinking.raw == "let me test **all** configs"
+        assert use.tool is not None
+        assert use.tool.input["command"] == command  # full, not cut at 200
+        assert use.tool.input["description"] == "Testing every subscription config"
+        assert use.tool.started_at == "2026-09-30T10:00:00.000Z"
+        assert res.tool is not None
+        assert res.tool.name == "Bash"
+        assert res.tool.input["command"] == command
+        assert res.tool.result_text == "ok\nok"
+        assert res.tool.result_meta == {
+            "stdout": "ok\nok",
+            "stderr": "warn",
+            "interrupted": False,
+        }
+        assert res.tool.started_at == "2026-09-30T10:00:00.000Z"
+        assert res.tool.finished_at == "2026-09-30T10:06:19.000Z"
+
+    def test_carry_over_keeps_input_across_polls(self):
+        first, second = self._bash_entries("ls")
+        _, pending = TranscriptParser.parse_entries([first], pending_tools={})
+        entries, _ = TranscriptParser.parse_entries([second], pending_tools=pending)
+        (res,) = entries
+        assert res.tool is not None and res.tool.input == {
+            "command": "ls",
+            "description": "Testing every subscription config",
+        }
+
+    def test_error_result_is_flagged(self):
+        first, second = self._bash_entries("false")
+        second["message"]["content"][0]["is_error"] = True
+        second["toolUseResult"] = "Error: exit code 1"  # string, not a dict
+        entries, _ = TranscriptParser.parse_entries([first, second])
+        res = entries[-1]
+        assert res.tool is not None and res.tool.is_error
+        assert res.tool.result_meta is None

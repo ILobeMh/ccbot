@@ -27,7 +27,7 @@ import aiofiles
 
 from .config import config
 from .monitor_state import MonitorState, TrackedSession
-from .transcript_parser import TranscriptParser
+from .transcript_parser import ToolCall, TranscriptParser
 from .utils import read_json_cached
 
 logger = logging.getLogger(__name__)
@@ -61,6 +61,8 @@ class NewMessage:
     timestamp: str | None = None  # ISO timestamp of the JSONL entry
     stop_reason: str | None = None  # "end_turn" on the last message of a turn
     api_message_id: str | None = None
+    raw: str | None = None  # unformatted text / thinking body
+    tool: ToolCall | None = None  # structured tool_use / tool_result data
 
 
 class SessionMonitor:
@@ -365,6 +367,8 @@ class SessionMonitor:
                             timestamp=entry.timestamp,
                             stop_reason=entry.stop_reason,
                             api_message_id=entry.api_message_id,
+                            raw=entry.raw,
+                            tool=entry.tool,
                         )
                     )
 
