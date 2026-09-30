@@ -1,12 +1,16 @@
 """Session monitoring service — watches JSONL files for new messages.
 
-Runs an async polling loop that:
+Runs an async polling loop; each cycle (poll_once, serialised by a lock) does:
   1. Loads the current session_map to know which sessions to watch.
   2. Detects session_map changes (new/changed/deleted windows) and cleans up.
-  3. Reads new JSONL lines from each session file using byte-offset tracking.
-  4. Parses entries via TranscriptParser and emits NewMessage objects to a callback.
+  3. Locates the transcript of exactly those sessions (hook-reported path,
+     in-memory cache, one glob per session id with a negative-cache retry).
+  4. Reads new JSONL lines from each session file using byte-offset tracking.
+  5. Parses entries via TranscriptParser and emits NewMessage objects to a callback.
 
-Optimizations: mtime cache skips unchanged files; byte offset avoids re-reading.
+poll_now() lets other code force a cycle on demand (e.g. right before reading
+fresh output). Optimizations: no directory scan (cost tracks active sessions,
+not history); mtime cache skips unchanged files; byte offset avoids re-reading.
 
 Key classes: SessionMonitor, NewMessage, SessionInfo.
 """
@@ -14,6 +18,7 @@ Key classes: SessionMonitor, NewMessage, SessionInfo.
 import asyncio
 import json
 import logging
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -22,11 +27,13 @@ import aiofiles
 
 from .config import config
 from .monitor_state import MonitorState, TrackedSession
-from .tmux_manager import tmux_manager
 from .transcript_parser import TranscriptParser
-from .utils import read_cwd_from_jsonl
+from .utils import read_json_cached
 
 logger = logging.getLogger(__name__)
+
+# Minimum gap between glob lookups for a session whose transcript wasn't found
+TRANSCRIPT_RETRY_SECONDS = 5.0
 
 
 @dataclass
@@ -90,6 +97,12 @@ class SessionMonitor:
         # Sessions that entered session_map while running, before their JSONL
         # existed: every byte is new, so they are tracked from offset 0.
         self._fresh_sessions: set[str] = set()
+        # session_id -> resolved transcript path (avoids re-globbing)
+        self._transcript_cache: dict[str, Path] = {}
+        # session_id -> monotonic time before which a failed lookup isn't retried
+        self._transcript_retry_at: dict[str, float] = {}
+        # Serialises poll cycles: offsets/pending tools must not race
+        self._poll_lock = asyncio.Lock()
 
     def set_message_callback(
         self, callback: Callable[[NewMessage], Awaitable[None]]
@@ -97,132 +110,70 @@ class SessionMonitor:
         self._message_callback = callback
 
     @staticmethod
-    def _add_hook_reported_sessions(
-        sessions: list[SessionInfo], active_session_ids: set[str]
-    ) -> list[SessionInfo]:
-        """Add sessions whose JSONL the hook told us about directly.
-
-        scan_projects() matches project dirs by the pane's current cwd, which
-        misses transcripts after `cd` / `/cd` or when the project dir was
-        renamed. transcript_path from the SessionStart hook is authoritative.
-        """
+    def _hook_transcript_paths() -> dict[str, str]:
+        """session_id -> transcript_path as reported by the SessionStart hook."""
         # Deferred import to avoid circular dependency
         from .session import session_manager
 
-        known = {s.session_id for s in sessions}
-        for state in session_manager.window_states.values():
-            sid = state.session_id
-            if not sid or sid in known or sid not in active_session_ids:
-                continue
-            if not state.transcript_path:
-                continue
-            path = Path(state.transcript_path)
+        return {
+            st.session_id: st.transcript_path
+            for st in session_manager.window_states.values()
+            if st.session_id and st.transcript_path
+        }
+
+    def _find_transcript(
+        self, session_id: str, hook_paths: dict[str, str]
+    ) -> Path | None:
+        """Locate a session's transcript without scanning the projects tree.
+
+        Order: transcript_path reported by the SessionStart hook (authoritative,
+        survives `cd` and renamed project dirs), the in-memory cache, then one
+        glob for `*/<session_id>.jsonl`. Misses (a fresh session whose file
+        doesn't exist yet) are negative-cached and the glob retried at most
+        every TRANSCRIPT_RETRY_SECONDS.
+        """
+        hook_path = hook_paths.get(session_id)
+        if hook_path:
+            path = Path(hook_path)
             if path.exists():
-                sessions.append(SessionInfo(session_id=sid, file_path=path))
-                known.add(sid)
-        return sessions
+                self._transcript_cache[session_id] = path
+                self._transcript_retry_at.pop(session_id, None)
+                return path
 
-    async def _get_active_cwds(self) -> set[str]:
-        """Get normalized cwds of all active tmux windows."""
-        cwds = set()
-        windows = await tmux_manager.list_windows()
-        for w in windows:
-            try:
-                cwds.add(str(Path(w.cwd).resolve()))
-            except (OSError, ValueError):
-                cwds.add(w.cwd)
-        return cwds
+        cached = self._transcript_cache.get(session_id)
+        if cached is not None:
+            if cached.exists():
+                return cached
+            del self._transcript_cache[session_id]  # moved/deleted: look again
 
-    async def scan_projects(self) -> list[SessionInfo]:
-        """Scan projects that have active tmux windows."""
-        active_cwds = await self._get_active_cwds()
-        if not active_cwds:
-            return []
+        now = time.monotonic()
+        if now < self._transcript_retry_at.get(session_id, 0.0):
+            return None
+        try:
+            found = next(iter(self.projects_path.glob(f"*/{session_id}.jsonl")), None)
+        except OSError as e:
+            logger.debug("Error looking up transcript for %s: %s", session_id, e)
+            found = None
+        if found is None:
+            self._transcript_retry_at[session_id] = now + TRANSCRIPT_RETRY_SECONDS
+            return None
+        self._transcript_cache[session_id] = found
+        self._transcript_retry_at.pop(session_id, None)
+        return found
+
+    def _find_session_files(self, active_session_ids: set[str]) -> list[SessionInfo]:
+        """Resolve transcript files for exactly the sessions in session_map."""
+        hook_paths = self._hook_transcript_paths()
+        # Drop lookup state for sessions that are no longer active
+        for cache in (self._transcript_cache, self._transcript_retry_at):
+            for sid in [k for k in cache if k not in active_session_ids]:
+                del cache[sid]
 
         sessions = []
-
-        if not self.projects_path.exists():
-            return sessions
-
-        for project_dir in self.projects_path.iterdir():
-            if not project_dir.is_dir():
-                continue
-
-            index_file = project_dir / "sessions-index.json"
-            original_path = ""
-            indexed_ids: set[str] = set()
-
-            if index_file.exists():
-                try:
-                    async with aiofiles.open(index_file, "r") as f:
-                        content = await f.read()
-                    index_data = json.loads(content)
-                    entries = index_data.get("entries", [])
-                    original_path = index_data.get("originalPath", "")
-
-                    for entry in entries:
-                        session_id = entry.get("sessionId", "")
-                        full_path = entry.get("fullPath", "")
-                        project_path = entry.get("projectPath", original_path)
-
-                        if not session_id or not full_path:
-                            continue
-
-                        try:
-                            norm_pp = str(Path(project_path).resolve())
-                        except (OSError, ValueError):
-                            norm_pp = project_path
-                        if norm_pp not in active_cwds:
-                            continue
-
-                        indexed_ids.add(session_id)
-                        file_path = Path(full_path)
-                        if file_path.exists():
-                            sessions.append(
-                                SessionInfo(
-                                    session_id=session_id,
-                                    file_path=file_path,
-                                )
-                            )
-
-                except (json.JSONDecodeError, OSError) as e:
-                    logger.debug(f"Error reading index {index_file}: {e}")
-
-            # Pick up un-indexed .jsonl files
-            try:
-                for jsonl_file in project_dir.glob("*.jsonl"):
-                    session_id = jsonl_file.stem
-                    if session_id in indexed_ids:
-                        continue
-
-                    # Determine project_path for this file
-                    file_project_path = original_path
-                    if not file_project_path:
-                        file_project_path = await asyncio.to_thread(
-                            read_cwd_from_jsonl, jsonl_file
-                        )
-                    if not file_project_path:
-                        dir_name = project_dir.name
-                        if dir_name.startswith("-"):
-                            file_project_path = dir_name.replace("-", "/")
-
-                    try:
-                        norm_fp = str(Path(file_project_path).resolve())
-                    except (OSError, ValueError):
-                        norm_fp = file_project_path
-
-                    if norm_fp not in active_cwds:
-                        continue
-
-                    sessions.append(
-                        SessionInfo(
-                            session_id=session_id,
-                            file_path=jsonl_file,
-                        )
-                    )
-            except OSError as e:
-                logger.debug(f"Error scanning jsonl files in {project_dir}: {e}")
-
+        for sid in active_session_ids:
+            path = self._find_transcript(sid, hook_paths)
+            if path is not None:
+                sessions.append(SessionInfo(session_id=sid, file_path=path))
         return sessions
 
     async def _read_new_lines(
@@ -323,14 +274,10 @@ class SessionMonitor:
         """
         new_messages = []
 
-        # Scan projects to get available session files
-        sessions = await self.scan_projects()
-        sessions = self._add_hook_reported_sessions(sessions, active_session_ids)
+        # Look up the transcript of each session in session_map (no dir scan)
+        sessions = self._find_session_files(active_session_ids)
 
-        # Only process sessions that are in session_map
         for session_info in sessions:
-            if session_info.session_id not in active_session_ids:
-                continue
             try:
                 tracked = self.state.get_session(session_info.session_id)
 
@@ -436,9 +383,7 @@ class SessionMonitor:
         window_to_session: dict[str, str] = {}
         if config.session_map_file.exists():
             try:
-                async with aiofiles.open(config.session_map_file, "r") as f:
-                    content = await f.read()
-                session_map = json.loads(content)
+                session_map = await read_json_cached(config.session_map_file)
                 prefix = f"{config.tmux_session_name}:"
                 for key, info in session_map.items():
                     # Only process entries for our tmux session
@@ -512,9 +457,12 @@ class SessionMonitor:
         # the file. Sessions whose file already exists (e.g. --resume) still
         # start at EOF so their history isn't replayed.
         known_session_ids = set(self._last_session_map.values())
-        for session_id in set(current_map.values()) - known_session_ids:
-            if self.state.get_session(session_id) is None and not any(
-                self.projects_path.glob(f"*/{session_id}.jsonl")
+        new_session_ids = set(current_map.values()) - known_session_ids
+        hook_paths = self._hook_transcript_paths() if new_session_ids else {}
+        for session_id in new_session_ids:
+            if (
+                self.state.get_session(session_id) is None
+                and self._find_transcript(session_id, hook_paths) is None
             ):
                 self._fresh_sessions.add(session_id)
 
@@ -531,22 +479,16 @@ class SessionMonitor:
 
         return current_map
 
-    async def _monitor_loop(self) -> None:
-        """Background loop for checking session updates.
+    async def poll_once(self) -> None:
+        """Run one full monitor cycle and deliver its messages, in order.
 
-        Uses simple async polling with aiofiles for non-blocking I/O.
+        Serialised by a lock so cycles never overlap (offsets would race).
+        Errors are logged, never raised.
         """
-        logger.info("Session monitor started, polling every %ss", self.poll_interval)
-
-        # Deferred import to avoid circular dependency (cached once)
+        # Deferred import to avoid circular dependency
         from .session import session_manager
 
-        # Clean up all stale sessions on startup
-        await self._cleanup_all_stale_sessions()
-        # Initialize last known session_map
-        self._last_session_map = await self._load_current_session_map()
-
-        while self._running:
+        async with self._poll_lock:
             try:
                 # Load hook-based session map updates
                 await session_manager.load_session_map()
@@ -571,6 +513,26 @@ class SessionMonitor:
             except Exception as e:
                 logger.error(f"Monitor loop error: {e}")
 
+    async def poll_now(self) -> None:
+        """Run a monitor cycle on demand and wait for it to finish.
+
+        If a cycle is already in progress this waits for it, then runs a fresh
+        one — the caller wants anything written after the call started.
+        """
+        await self.poll_once()
+
+    async def _monitor_loop(self) -> None:
+        """Background loop: poll_once() every poll_interval seconds."""
+        logger.info("Session monitor started, polling every %ss", self.poll_interval)
+
+        async with self._poll_lock:
+            # Clean up all stale sessions on startup
+            await self._cleanup_all_stale_sessions()
+            # Initialize last known session_map
+            self._last_session_map = await self._load_current_session_map()
+
+        while self._running:
+            await self.poll_once()
             await asyncio.sleep(self.poll_interval)
 
         logger.info("Session monitor stopped")

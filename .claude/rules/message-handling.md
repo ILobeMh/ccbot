@@ -34,6 +34,12 @@ Per-user message queues + worker pattern for all send tasks:
 
 **mtime cache**: The monitoring loop maintains an in-memory file mtime cache, skipping reads for unchanged files.
 
+**Targeted transcript lookup**: the monitor resolves transcripts only for session ids in `session_map` (hook `transcript_path` → in-memory cache → one glob, negative-cached ~5 s); it never scans `~/.claude/projects`. `session_map.json` is re-parsed only when its (mtime, size, inode) changes. `poll_now()` runs an on-demand cycle (lock-serialised with the loop).
+
+**Debounced state saves**: `update_user_window_offset` schedules one `state.json` write ~1 s later; direct `_save_state()` calls write immediately; `SessionManager.flush()` runs on shutdown.
+
+**Single-fork pane capture**: `capture_pane` is one `tmux capture-pane -p` subprocess (5 s timeout).
+
 **Byte offset incremental reads**: Each tracked session records `last_byte_offset`, reading only new content. File truncation (offset > file_size) is detected and offset is auto-reset.
 
 ## No Message Truncation

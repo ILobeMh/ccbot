@@ -1,11 +1,16 @@
-"""Tests for ccbot.utils: ccbot_dir, atomic_write_json, read_cwd_from_jsonl."""
+"""Tests for ccbot.utils: ccbot_dir, atomic_write_json, read_cwd_from_jsonl, read_json_cached."""
 
 import json
 from pathlib import Path
 
 import pytest
 
-from ccbot.utils import atomic_write_json, ccbot_dir, read_cwd_from_jsonl
+from ccbot.utils import (
+    atomic_write_json,
+    ccbot_dir,
+    read_cwd_from_jsonl,
+    read_json_cached,
+)
 
 
 class TestCcbotDir:
@@ -70,3 +75,39 @@ class TestReadCwdFromJsonl:
 
     def test_missing_file_returns_empty(self, tmp_path: Path):
         assert read_cwd_from_jsonl(tmp_path / "nonexistent.jsonl") == ""
+
+
+class TestReadJsonCached:
+    @pytest.mark.asyncio
+    async def test_unchanged_file_is_not_reparsed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        f = tmp_path / "m.json"
+        f.write_text('{"a": 1}')
+        first = await read_json_cached(f)
+
+        def boom(_):
+            raise AssertionError("re-parsed an unchanged file")
+
+        monkeypatch.setattr("ccbot.utils.json.loads", boom)
+        assert await read_json_cached(f) is first
+
+    @pytest.mark.asyncio
+    async def test_changed_file_is_reread(self, tmp_path: Path):
+        f = tmp_path / "m.json"
+        f.write_text('{"a": 1}')
+        assert await read_json_cached(f) == {"a": 1}
+        # Same size, atomic replace (new inode) — must still be noticed
+        atomic_write_json(f, {"a": 2}, indent=0)
+        assert await read_json_cached(f) == {"a": 2}
+
+    @pytest.mark.asyncio
+    async def test_missing_and_corrupt_raise(self, tmp_path: Path):
+        with pytest.raises(OSError):
+            await read_json_cached(tmp_path / "nope.json")
+        bad = tmp_path / "bad.json"
+        bad.write_text("{oops")
+        with pytest.raises(json.JSONDecodeError):
+            await read_json_cached(bad)
+        bad.write_text('{"ok": true}')
+        assert await read_json_cached(bad) == {"ok": True}

@@ -4,6 +4,7 @@ Provides:
   - ccbot_dir(): resolve config directory from CCBOT_DIR env var.
   - atomic_write_json(): crash-safe JSON file writes via temp+rename.
   - read_cwd_from_jsonl(): extract the cwd field from the first JSONL entry.
+  - read_json_cached(): parse a JSON file, re-reading only when it changed on disk.
 """
 
 import json
@@ -12,6 +13,8 @@ import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any
+
+import aiofiles
 
 CCBOT_DIR_ENV = "CCBOT_DIR"
 
@@ -65,10 +68,35 @@ def atomic_write_json(path: Path, data: Any, indent: int = 2) -> None:
         raise
 
 
+# path -> ((mtime_ns, size, inode), parsed JSON)
+_json_cache: dict[str, tuple[tuple[int, int, int], Any]] = {}
+
+
+async def read_json_cached(path: Path) -> Any:
+    """Parse a JSON file, re-reading it only when (mtime_ns, size, inode) changed.
+
+    The returned object is shared with the cache: callers must not mutate it
+    (deep-copy first). Raises OSError / json.JSONDecodeError like a plain read;
+    a failed read leaves the previous cache entry alone (it can no longer
+    match the file's stat, so the next call re-reads).
+    """
+    key = str(path)
+    st = path.stat()
+    sig = (st.st_mtime_ns, st.st_size, st.st_ino)
+    cached = _json_cache.get(key)
+    if cached is not None and cached[0] == sig:
+        return cached[1]
+    async with aiofiles.open(path, "r") as f:
+        content = await f.read()
+    data = json.loads(content)
+    _json_cache[key] = (sig, data)
+    return data
+
+
 def read_cwd_from_jsonl(file_path: str | Path) -> str:
     """Read the cwd field from the first JSONL entry that has one.
 
-    Shared by session.py and session_monitor.py.
+    Used by the directory browser to find a session's project directory.
     """
     try:
         with open(file_path, "r", encoding="utf-8", errors="replace") as f:

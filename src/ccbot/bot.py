@@ -3047,6 +3047,8 @@ async def post_shutdown(application: Application) -> None:
         session_monitor.stop()
         logger.info("Session monitor stopped")
 
+    session_manager.flush()
+
     await close_transcribe_client()
 
 
