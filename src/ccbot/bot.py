@@ -78,6 +78,7 @@ from .handlers.callback_data import (
     CB_ASK_SPACE,
     CB_ASK_TAB,
     CB_ASK_UP,
+    CB_CHOICE,
     CB_DIR_CANCEL,
     CB_DIR_CONFIRM,
     CB_DIR_PAGE,
@@ -87,6 +88,7 @@ from .handlers.callback_data import (
     CB_HISTORY_PREV,
     CB_IMG_CANCEL,
     CB_IMG_SKIP,
+    CB_KEYPAD,
     CB_KEYS_PREFIX,
     CB_KILL,
     CB_MODE_CANCEL,
@@ -138,9 +140,12 @@ from .handlers.directory_browser import (
 from .handlers.history import send_history
 from .handlers.interactive_ui import (
     INTERACTIVE_TOOL_NAMES,
+    answer_choice,
     clear_interactive_msg,
     get_interactive_window,
     handle_interactive_ui,
+    remember_questions,
+    toggle_keypad,
 )
 from .handlers.message_queue import (
     clear_status_msg_info,
@@ -2807,6 +2812,27 @@ async def callback_handler(
             await handle_interactive_ui(bot, user.id, window_id, thread_id)
         await query.answer("⇥ Tab")
 
+    # Interactive UI: tap-to-answer option button
+    elif data.startswith(CB_CHOICE):
+        window_id, _, rest = data[len(CB_CHOICE) :].partition(":")
+        number_s, _, label_h = rest.partition(":")
+        thread_id = _get_thread_id(query)
+        if not number_s.isdigit():
+            await query.answer("Invalid option")
+            return
+        toast = await answer_choice(
+            bot, user.id, thread_id, window_id, int(number_s), label_h
+        )
+        await query.answer(toast)
+
+    # Interactive UI: switch option buttons ↔ raw keypad
+    elif data.startswith(CB_KEYPAD):
+        window_id = data[len(CB_KEYPAD) :]
+        thread_id = _get_thread_id(query)
+        keypad = toggle_keypad(user.id, thread_id)
+        await handle_interactive_ui(bot, user.id, window_id, thread_id)
+        await query.answer("⌨️ Keys" if keypad else "Choices")
+
     # Interactive UI: refresh display
     elif data.startswith(CB_ASK_REFRESH):
         window_id = data[len(CB_ASK_REFRESH) :]
@@ -2994,6 +3020,8 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
         # out of order.)
         rich = config.message_format == "rich"
         if msg.tool_name in INTERACTIVE_TOOL_NAMES and msg.content_type == "tool_use":
+            if msg.tool is not None and msg.tool.name == "AskUserQuestion":
+                remember_questions(wid, msg.tool.input)
             await enqueue_interactive(
                 bot,
                 user_id,

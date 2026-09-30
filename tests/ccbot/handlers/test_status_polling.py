@@ -185,12 +185,12 @@ class TestStatusPollerSettingsDetection:
             finally:
                 await message_queue.shutdown_workers()
 
-            mock_bot.send_message.assert_called_once()
-            call_kwargs = mock_bot.send_message.call_args.kwargs
+            mock_bot.send_rich_message.assert_called_once()
+            call_kwargs = mock_bot.send_rich_message.call_args.kwargs
             assert call_kwargs["chat_id"] == 100
             assert call_kwargs["message_thread_id"] == 42
             assert call_kwargs["reply_markup"] is not None
-            assert "Select model" in call_kwargs["text"]
+            assert "Select model" in call_kwargs["rich_message"].markdown
 
 
 class TestVanishedWindow:

@@ -14,15 +14,30 @@ Provides:
 State dicts are keyed by (user_id, thread_id_or_0) for Telegram topic support.
 """
 
+import asyncio
 import logging
+import re
+from typing import Any
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 
+from ..config import config
 from ..session import session_manager
 from ..terminal_parser import extract_interactive_content, is_interactive_ui
 from ..tmux_manager import tmux_manager
+from ..ui_choices import (
+    DIGIT_UIS,
+    Choice,
+    ChoiceView,
+    button_style,
+    button_text,
+    escape_literal,
+    label_hash,
+    parse_choices,
+    render_view,
+)
 from .callback_data import (
     CB_ASK_DOWN,
     CB_ASK_ENTER,
@@ -33,8 +48,16 @@ from .callback_data import (
     CB_ASK_SPACE,
     CB_ASK_TAB,
     CB_ASK_UP,
+    CB_CHOICE,
+    CB_KEYPAD,
 )
-from .message_sender import NO_LINK_PREVIEW
+from .message_sender import (
+    NO_LINK_PREVIEW,
+    edit_rich,
+    edit_with_fallback,
+    send_rich,
+    send_with_fallback,
+)
 from .notifications_topic import mark_ui
 
 logger = logging.getLogger(__name__)
@@ -47,6 +70,13 @@ _interactive_msgs: dict[tuple[int, int], int] = {}
 
 # Track interactive mode: (user_id, thread_id_or_0) -> window_id
 _interactive_mode: dict[tuple[int, int], str] = {}
+
+# Topics showing the raw keypad instead of option buttons
+_keypad_mode: set[tuple[int, int]] = set()
+# Last parsed view per topic (for the answered-summary)
+_last_views: dict[tuple[int, int], ChoiceView | None] = {}
+# window_id -> AskUserQuestion "questions" input (titles for tabs)
+_questions: dict[str, list[dict[str, Any]]] = {}
 
 
 def get_interactive_window(user_id: int, thread_id: int | None = None) -> str | None:
@@ -83,6 +113,7 @@ def get_interactive_msg_id(user_id: int, thread_id: int | None = None) -> int | 
 def _build_interactive_keyboard(
     window_id: str,
     ui_name: str = "",
+    back_to_choices: bool = False,
 ) -> InlineKeyboardMarkup:
     """Build keyboard for interactive UI navigation.
 
@@ -142,6 +173,14 @@ def _build_interactive_keyboard(
             ),
         ]
     )
+    if back_to_choices:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="« Choices", callback_data=f"{CB_KEYPAD}{window_id}"[:64]
+                )
+            ]
+        )
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -187,78 +226,256 @@ async def handle_interactive_ui(
     if not content:
         return False
 
-    # Build message with navigation keyboard
-    keyboard = _build_interactive_keyboard(window_id, ui_name=content.name)
+    view = parse_choices(content, pane_text, _questions.get(window_id))
+    use_choices = (
+        view is not None and content.name in DIGIT_UIS and ikey not in _keypad_mode
+    )
+    if use_choices and view is not None:
+        text = render_view(view)
+        keyboard = _choice_keyboard(window_id, view)
+    else:
+        # Raw terminal text + arrow keypad (unknown UI, or the user asked
+        # for the keys); plain text: terminal content is not markdown
+        text = content.content
+        keyboard = _build_interactive_keyboard(
+            window_id, ui_name=content.name, back_to_choices=view is not None
+        )
 
-    # Send as plain text (no markdown conversion)
-    text = content.content
-
-    # Build thread kwargs for send_message
-    thread_kwargs: dict[str, int] = {}
-    if thread_id is not None:
-        thread_kwargs["message_thread_id"] = thread_id
-
-    # Check if we have an existing interactive message to edit
     existing_msg_id = _interactive_msgs.get(ikey)
     if existing_msg_id and not force_new:
+        if await _edit(bot, chat_id, existing_msg_id, text, keyboard, use_choices):
+            _interactive_mode[ikey] = window_id
+            _last_views[ikey] = view
+            await mark_ui(window_id, content.name, content.content, existing_msg_id)
+            return True
+        logger.debug("Edit failed for interactive msg %s, sending new", existing_msg_id)
+
+    logger.info(
+        "Sending interactive UI to user %d for window_id %s", user_id, window_id
+    )
+    sent = await _send(bot, chat_id, thread_id, text, keyboard, use_choices)
+    if sent is None:
+        return False
+    _interactive_msgs[ikey] = sent.message_id
+    _interactive_mode[ikey] = window_id
+    _last_views[ikey] = view
+    await mark_ui(window_id, content.name, content.content, sent.message_id)
+    # New message sent successfully — now safe to delete the old one
+    if existing_msg_id:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=existing_msg_id)
+        except Exception:
+            pass  # Old message may already be gone
+    return True
+
+
+async def _send(
+    bot: Bot,
+    chat_id: int,
+    thread_id: int | None,
+    text: str,
+    keyboard: InlineKeyboardMarkup,
+    markdown: bool,
+) -> Message | None:
+    kwargs: dict[str, Any] = {"reply_markup": keyboard}
+    if thread_id is not None:
+        kwargs["message_thread_id"] = thread_id
+    if not markdown:
+        try:
+            return await bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                link_preview_options=NO_LINK_PREVIEW,
+                **kwargs,
+            )
+        except Exception as e:
+            logger.error("Failed to send interactive UI: %s", e)
+            return None
+    if config.message_format == "rich":
+        return await send_rich(bot, chat_id, text, **kwargs)
+    return await send_with_fallback(bot, chat_id, text, **kwargs)
+
+
+async def _edit(
+    bot: Bot,
+    chat_id: int,
+    message_id: int,
+    text: str,
+    keyboard: InlineKeyboardMarkup | None,
+    markdown: bool,
+) -> bool:
+    if not markdown:
         try:
             await bot.edit_message_text(
                 chat_id=chat_id,
-                message_id=existing_msg_id,
+                message_id=message_id,
                 text=text,
                 reply_markup=keyboard,
                 link_preview_options=NO_LINK_PREVIEW,
             )
-            _interactive_mode[ikey] = window_id
-            await mark_ui(window_id, content.name, content.content, existing_msg_id)
             return True
         except TelegramBadRequest as e:
-            if "message is not modified" in str(e).lower():
-                # Content unchanged — keep existing message as-is
-                _interactive_mode[ikey] = window_id
-                await mark_ui(window_id, content.name, content.content, existing_msg_id)
-                return True
-            # Other edit failure — fall through to send new message,
-            # but keep old message until replacement succeeds
-            logger.debug(
-                "Edit failed for interactive msg %s: %s, sending new",
-                existing_msg_id,
-                e,
-            )
+            return "message is not modified" in str(e).lower()
         except Exception as e:
-            logger.debug(
-                "Edit failed for interactive msg %s: %s, sending new",
-                existing_msg_id,
-                e,
-            )
-
-    # Send new message (plain text — terminal content is not markdown)
-    logger.info(
-        "Sending interactive UI to user %d for window_id %s", user_id, window_id
+            logger.debug("Edit failed for interactive msg %s: %s", message_id, e)
+            return False
+    if config.message_format == "rich":
+        return await edit_rich(bot, chat_id, message_id, text, reply_markup=keyboard)
+    return await edit_with_fallback(
+        bot, chat_id, message_id, text, reply_markup=keyboard
     )
-    try:
-        sent = await bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            reply_markup=keyboard,
-            link_preview_options=NO_LINK_PREVIEW,
-            **thread_kwargs,  # type: ignore[arg-type]
+
+
+def _choice_keyboard(window_id: str, view: ChoiceView) -> InlineKeyboardMarkup:
+    """One button per option (tap = answer), plus navigation and escape."""
+
+    def cb(c: Choice) -> str:
+        return f"{CB_CHOICE}{window_id}:{c.number}:{label_hash(c.label)}"[:64]
+
+    options = [c for c in view.choices if c.number <= 9]
+    main = [
+        InlineKeyboardButton(
+            text=button_text(c), callback_data=cb(c), style=button_style(c)
         )
-    except Exception as e:
-        logger.error("Failed to send interactive UI: %s", e)
+        for c in options
+        if c.kind == "option"
+    ]
+    per_row = 1 if any(len(b.text) > 16 for b in main) else 2
+    rows = [main[i : i + per_row] for i in range(0, len(main), per_row)]
+    extra = [
+        InlineKeyboardButton(text=button_text(c), callback_data=cb(c))
+        for c in options
+        if c.kind != "option"
+    ]
+    if extra:
+        rows.append(extra)
+    if view.tabs or view.multi:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="‹ Prev", callback_data=f"{CB_ASK_LEFT}{window_id}"[:64]
+                ),
+                InlineKeyboardButton(
+                    text="Next ›", callback_data=f"{CB_ASK_RIGHT}{window_id}"[:64]
+                ),
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="⌨️ Keys", callback_data=f"{CB_KEYPAD}{window_id}"[:64]
+            ),
+            InlineKeyboardButton(
+                text="🔄", callback_data=f"{CB_ASK_REFRESH}{window_id}"[:64]
+            ),
+            InlineKeyboardButton(
+                text="⎋ Esc",
+                callback_data=f"{CB_ASK_ESC}{window_id}"[:64],
+                style="danger",
+            ),
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def remember_questions(window_id: str, tool_input: dict[str, Any] | None) -> None:
+    """Keep the AskUserQuestion input so tabs can be titled by their header."""
+    questions = (tool_input or {}).get("questions")
+    if isinstance(questions, list):
+        _questions[window_id] = [q for q in questions if isinstance(q, dict)]
+
+
+def toggle_keypad(user_id: int, thread_id: int | None) -> bool:
+    """Switch between option buttons and the raw keypad; True = keypad now."""
+    ikey = (user_id, thread_id or 0)
+    if ikey in _keypad_mode:
+        _keypad_mode.discard(ikey)
         return False
-    if sent:
-        _interactive_msgs[ikey] = sent.message_id
-        _interactive_mode[ikey] = window_id
-        await mark_ui(window_id, content.name, content.content, sent.message_id)
-        # New message sent successfully — now safe to delete the old one
-        if existing_msg_id:
-            try:
-                await bot.delete_message(chat_id=chat_id, message_id=existing_msg_id)
-            except Exception:
-                pass  # Old message may already be gone
-        return True
-    return False
+    _keypad_mode.add(ikey)
+    return True
+
+
+# UIs where a digit may only move the cursor (pickers): confirm with Enter
+_CONFIRM_AFTER_DIGIT = {"Settings", "Modal", "SwitchModel", "RestoreCheckpoint"}
+_CURSOR_ON_RE = r"^\s*❯\s*{n}\."
+
+
+async def answer_choice(
+    bot: Bot,
+    user_id: int,
+    thread_id: int | None,
+    window_id: str,
+    number: int,
+    expected_hash: str,
+) -> str:
+    """Type option ``number`` into the UI, after checking it's still the same.
+
+    Returns the toast to show on the tapped button.
+    """
+    pane = await tmux_manager.capture_pane(window_id)
+    ui = extract_interactive_content(pane) if pane else None
+    view = parse_choices(ui, pane, _questions.get(window_id)) if ui else None
+    choice = (
+        next((c for c in view.choices if c.number == number), None) if view else None
+    )
+    if view is None or choice is None or label_hash(choice.label) != expected_hash:
+        if not await handle_interactive_ui(bot, user_id, window_id, thread_id):
+            await clear_interactive_msg(user_id, bot, thread_id)
+        return "That question has changed — showing the current one"
+
+    await tmux_manager.send_keys(window_id, str(number), enter=False, literal=True)
+    await asyncio.sleep(0.5)
+    if (
+        view.ui_name in _CONFIRM_AFTER_DIGIT
+        and not view.multi
+        and choice.kind == "option"
+    ):
+        pane2 = await tmux_manager.capture_pane(window_id) or ""
+        ui2 = extract_interactive_content(pane2)
+        view2 = parse_choices(ui2, pane2) if ui2 else None
+        if (
+            view2 is not None
+            and view2.signature == view.signature
+            and re.search(_CURSOR_ON_RE.format(n=number), pane2, re.MULTILINE)
+        ):
+            await tmux_manager.send_keys(window_id, "Enter", enter=False, literal=False)
+            await asyncio.sleep(0.4)
+
+    if choice.kind == "other":
+        await handle_interactive_ui(bot, user_id, window_id, thread_id)
+        return "✍️ Now type your answer as a message"
+    if not await handle_interactive_ui(bot, user_id, window_id, thread_id):
+        await _finalize(bot, user_id, thread_id, view, choice)
+    return f"✓ {choice.label[:40]}"
+
+
+async def _finalize(
+    bot: Bot,
+    user_id: int,
+    thread_id: int | None,
+    view: ChoiceView,
+    choice: Choice,
+) -> None:
+    """The UI is gone (answered): turn its message into a one-line record."""
+    ikey = (user_id, thread_id or 0)
+    msg_id = _interactive_msgs.pop(ikey, None)
+    _interactive_mode.pop(ikey, None)
+    _last_views.pop(ikey, None)
+    if msg_id is None:
+        return
+    title = view.title or "Question"
+    if view.review:
+        answer = "; ".join(f"{q} → {a}" for q, a in view.review)
+        summary = (
+            f"✅ {title}: {answer}"
+            if choice.label.startswith("Submit")
+            else "✖ Cancelled"
+        )
+    else:
+        icon = "❌" if button_style(choice) == "danger" else "✅"
+        summary = f"{icon} {title} → {choice.label}"
+    chat_id = session_manager.resolve_chat_id(user_id, thread_id)
+    await _edit(bot, chat_id, msg_id, escape_literal(summary), None, True)
 
 
 async def clear_interactive_msg(

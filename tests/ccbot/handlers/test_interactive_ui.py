@@ -65,11 +65,18 @@ class TestHandleInteractiveUI:
             )
 
         assert result is True
-        mock_bot.send_message.assert_called_once()
-        call_kwargs = mock_bot.send_message.call_args
-        assert call_kwargs.kwargs["chat_id"] == 100
-        assert call_kwargs.kwargs["message_thread_id"] == 42
-        assert call_kwargs.kwargs["reply_markup"] is not None
+        # A picker with numbered options is rendered as a message with one
+        # button per option (tap-to-answer), sent as a rich message
+        mock_bot.send_rich_message.assert_called_once()
+        call_kwargs = mock_bot.send_rich_message.call_args.kwargs
+        assert call_kwargs["chat_id"] == 100
+        assert call_kwargs["message_thread_id"] == 42
+        labels = [
+            b.text for row in call_kwargs["reply_markup"].inline_keyboard for b in row
+        ]
+        assert "1 · Default (recommended)" in labels
+        assert "⌨️ Keys" in labels
+        assert "**Select model**" in call_kwargs["rich_message"].markdown
 
     @pytest.mark.asyncio
     async def test_handle_no_ui_returns_false(self, mock_bot: AsyncMock):
