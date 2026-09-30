@@ -258,7 +258,7 @@ def _get_thread_id(event: Message | CallbackQuery) -> int | None:
 
 def _command_args(command: CommandObject | None) -> list[str]:
     """Whitespace-split arguments after the command (PTB's context.args)."""
-    return (command.args or "").split() if command else []
+    return command.args.split() if command and command.args else []
 
 
 def _query_message(query: CallbackQuery) -> Message:
@@ -1222,10 +1222,9 @@ async def _stage_images(
 ) -> None:
     """Park downloaded images and ask the user for the accompanying text."""
     key = (user_id, thread_id)
-    pending = _pending_images.get(key)
-    if pending is None:
-        pending = {"paths": [], "caption": "", "wid": wid, "prompt_msg": None}
-        _pending_images[key] = pending
+    pending = _pending_images.setdefault(
+        key, {"paths": [], "caption": "", "wid": wid, "prompt_msg": None}
+    )
     pending["paths"].extend(paths)
     pending["wid"] = wid
     if caption:
@@ -1383,16 +1382,9 @@ async def photo_handler(message: Message, bot: Bot) -> None:
 
     # Album piece: accumulate and (re)start the settle timer.
     key = (user.id, thread_id, group_id)
-    album = _pending_albums.get(key)
-    if album is None:
-        album = {
-            "message": message,
-            "wid": wid,
-            "caption": "",
-            "paths": [],
-            "task": None,
-        }
-        _pending_albums[key] = album
+    album = _pending_albums.setdefault(
+        key, {"message": message, "wid": wid, "caption": "", "paths": [], "task": None}
+    )
     album["paths"].append(file_path)
     if caption:
         album["caption"] = caption
@@ -1605,16 +1597,16 @@ async def text_handler(message: Message, bot: Bot, user_data: dict[str, Any]) ->
         return
 
     key = (user.id, _get_thread_id(message))
-    buf = _pending_merges.get(key)
-    if buf is None:
-        buf = {
+    buf = _pending_merges.setdefault(
+        key,
+        {
             "message": message,
             "bot": bot,
             "user_data": user_data,
             "parts": [],
             "task": None,
-        }
-        _pending_merges[key] = buf
+        },
+    )
     buf["parts"].append(message.text)
     if buf["task"] is not None:
         buf["task"].cancel()

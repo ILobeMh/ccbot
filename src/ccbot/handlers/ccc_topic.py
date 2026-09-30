@@ -22,6 +22,7 @@ Key components:
 from __future__ import annotations
 
 import asyncio
+import builtins
 import json
 import logging
 import shutil
@@ -101,7 +102,7 @@ class CccClient:
         except json.JSONDecodeError as e:
             raise CccError(f"ccc returned invalid JSON: {e}: {text[:200]}")
 
-    async def list(self, cached: bool = True) -> list[Account]:
+    async def list(self, cached: bool = True) -> builtins.list[Account]:
         args = ["list"] + (["--cached"] if cached else [])
         return parse_accounts(await self.run(*args))
 

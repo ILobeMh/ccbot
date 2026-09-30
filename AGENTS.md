@@ -7,9 +7,9 @@ Tech stack: Python, aiogram 3, tmux, uv.
 ## Common Commands
 
 ```bash
-uv run ruff check src/ tests/         # Lint — MUST pass before committing
-uv run ruff format src/ tests/        # Format — auto-fix, then verify with --check
-uv run pyright src/ccbot/             # Type check — MUST be 0 errors before committing
+uv run ruff check .                   # Lint — MUST pass before committing
+uv run ruff format .                  # Format (incl. code blocks in *.md) — then verify with --check
+uv run ty check                       # Type check (src/, see [tool.ty]) — MUST be 0 errors before committing
 ./scripts/restart.sh                  # Restart the ccbot service after code changes
 ccbot hook --install                  # Auto-install Codex SessionStart hook
 ```

@@ -20,7 +20,7 @@ Window IDs (e.g. `@0`, `@12`) are guaranteed unique within a tmux server session
 ```python
 # session.py: SessionManager
 thread_bindings: dict[int, dict[int, str]]  # user_id → {thread_id → window_id}
-window_display_names: dict[str, str]        # window_id → window_name (for display)
+window_display_names: dict[str, str]  # window_id → window_name (for display)
 ```
 
 - Storage: memory + `state.json`
@@ -29,8 +29,8 @@ window_display_names: dict[str, str]        # window_id → window_name (for dis
 
 ## Mapping 2: Window ID → Session (session_map.json)
 
-```python
-# session_map.json (key format: "tmux_session:window_id")
+```jsonc
+// session_map.json (key format: "tmux_session:window_id")
 {
   "ccbot:@0": {"session_id": "uuid-xxx", "cwd": "/path/to/project", "window_name": "project"},
   "ccbot:@5": {"session_id": "uuid-yyy", "cwd": "/path/to/project", "window_name": "project-2"}
