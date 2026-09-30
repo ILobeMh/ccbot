@@ -551,6 +551,16 @@ class CccTopic:
     def set_restart_handler(self, fn: RestartAll) -> None:
         self._restart_all = fn
 
+    async def stop(self) -> None:
+        """Cancel the quota watcher (bot shutdown)."""
+        task, self._task = self._task, None
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
     async def on_ready(self, bot: Bot, chat_id: int, thread_id: int) -> None:
         self._bot, self._chat_id, self._thread_id = bot, chat_id, thread_id
         if not self.client.available():

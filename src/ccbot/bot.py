@@ -3216,6 +3216,7 @@ async def on_shutdown(bot: Bot) -> None:
 
     # Stop all queue workers
     await shutdown_workers()
+    await ccc_topic.stop()
 
     if session_monitor:
         session_monitor.stop()
