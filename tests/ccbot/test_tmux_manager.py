@@ -1,5 +1,6 @@
 """Tests for TmuxManager.list_windows parsing and caching (tmux is mocked)."""
 
+import asyncio
 import subprocess
 from unittest.mock import MagicMock
 
@@ -139,3 +140,79 @@ class TestNormalizeLaunchMode:
     )
     def test_aliases(self, raw, expected):
         assert tm.normalize_launch_mode(raw) == expected
+
+
+class _FakeProc:
+    def __init__(self, stdout=b"", stderr=b"", rc=0, hang=False):
+        self._out, self._err, self.returncode = stdout, stderr, rc
+        self._hang = hang
+        self.killed = False
+
+    async def communicate(self):
+        if self._hang:
+            await asyncio.sleep(3600)
+        return self._out, self._err
+
+    def kill(self):
+        self.killed = True
+
+    async def wait(self):
+        return self.returncode
+
+
+class TestCapturePane:
+    @pytest.fixture
+    def spawn(self, monkeypatch):
+        calls: list[tuple] = []
+        result: dict = {"proc": _FakeProc()}
+
+        async def fake_exec(*args, **kwargs):
+            calls.append(args)
+            return result["proc"]
+
+        monkeypatch.setattr(tm.asyncio, "create_subprocess_exec", fake_exec)
+        return calls, result
+
+    @pytest.mark.asyncio
+    async def test_plain_single_fork_trims_trailing_empty_lines(self, mgr, spawn):
+        calls, result = spawn
+        result["proc"] = _FakeProc(stdout=b"hello  \n\n  indented\nlast\n\n\n")
+
+        out = await mgr.capture_pane("@3")
+
+        assert out == "hello  \n\n  indented\nlast"
+        assert calls == [("tmux", "capture-pane", "-p", "-t", "@3")]
+
+    @pytest.mark.asyncio
+    async def test_ansi_passes_dash_e_and_keeps_output(self, mgr, spawn):
+        calls, result = spawn
+        result["proc"] = _FakeProc(stdout=b"\x1b[31mred\x1b[0m\n")
+
+        out = await mgr.capture_pane("@3", with_ansi=True)
+
+        assert out == "\x1b[31mred\x1b[0m\n"
+        assert calls == [("tmux", "capture-pane", "-e", "-p", "-t", "@3")]
+
+    @pytest.mark.asyncio
+    async def test_nonzero_exit_returns_none(self, mgr, spawn):
+        _, result = spawn
+        result["proc"] = _FakeProc(stderr=b"can't find window: @9", rc=1)
+        assert await mgr.capture_pane("@9") is None
+
+    @pytest.mark.asyncio
+    async def test_timeout_kills_process(self, mgr, spawn, monkeypatch):
+        _, result = spawn
+        proc = _FakeProc(hang=True)
+        result["proc"] = proc
+        monkeypatch.setattr(tm, "CAPTURE_TIMEOUT_SECONDS", 0.01)
+
+        assert await mgr.capture_pane("@3") is None
+        assert proc.killed
+
+    @pytest.mark.asyncio
+    async def test_spawn_error_returns_none(self, mgr, monkeypatch):
+        async def boom(*a, **k):
+            raise FileNotFoundError("tmux")
+
+        monkeypatch.setattr(tm.asyncio, "create_subprocess_exec", boom)
+        assert await mgr.capture_pane("@3") is None

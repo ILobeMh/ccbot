@@ -8,7 +8,7 @@ Responsibilities:
   - Persist/load state to ~/.ccbot/state.json.
   - Sync window↔session bindings from session_map.json (written by hook).
   - Resolve window IDs to ClaudeSession objects (JSONL file reading).
-  - Track per-user read offsets for unread-message detection.
+  - Track per-user read offsets for unread-message detection (saved debounced).
   - Manage thread↔window bindings for Telegram topic routing.
   - Send keystrokes to tmux windows and retrieve message history.
   - Maintain window_id→display name mapping for UI display.
@@ -24,6 +24,7 @@ Key methods for thread binding access:
 """
 
 import asyncio
+import copy
 import fcntl
 import json
 import logging
@@ -38,9 +39,12 @@ import aiofiles
 from .config import config
 from .tmux_manager import _UUID_RE, SHELL_COMMANDS, tmux_manager
 from .transcript_parser import TranscriptParser
-from .utils import atomic_write_json
+from .utils import atomic_write_json, read_json_cached
 
 logger = logging.getLogger(__name__)
+
+# Delay before a debounced state save (read offsets) hits the disk
+SAVE_DEBOUNCE_SECONDS = 1.0
 
 
 @dataclass
@@ -153,9 +157,58 @@ class SessionManager:
     lost_bindings: list[LostBinding] = field(default_factory=list)
 
     def __post_init__(self) -> None:
+        # Debounced-save bookkeeping (see _schedule_save)
+        self._dirty = False
+        self._save_handle: asyncio.TimerHandle | None = None
+        self._save_loop: asyncio.AbstractEventLoop | None = None
         self._load_state()
 
+    def _cancel_pending_save(self) -> None:
+        if self._save_handle is not None:
+            self._save_handle.cancel()
+            self._save_handle = None
+            self._save_loop = None
+
+    def _schedule_save(self) -> None:
+        """Save state ~SAVE_DEBOUNCE_SECONDS from now, coalescing repeat calls.
+
+        For hot, low-value updates (read offsets). Without a running event loop
+        (sync tests, CLI) it saves immediately. Direct _save_state() calls
+        write at once and drop the pending timer; flush() writes on shutdown.
+        """
+        self._dirty = True
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._save_state()
+            return
+        if (
+            self._save_handle is not None
+            and self._save_loop is loop
+            and not self._save_handle.cancelled()
+        ):
+            return  # already scheduled on this loop
+        self._cancel_pending_save()
+        self._save_handle = loop.call_later(SAVE_DEBOUNCE_SECONDS, self._debounced_save)
+        self._save_loop = loop
+
+    def _debounced_save(self) -> None:
+        self._save_handle = None
+        self._save_loop = None
+        if not self._dirty:
+            return
+        try:
+            self._save_state()
+        except OSError as e:
+            logger.error("Debounced state save failed: %s", e)
+
+    def flush(self) -> None:
+        """Write pending (debounced) state immediately, if any."""
+        if self._dirty:
+            self._save_state()
+
     def _save_state(self) -> None:
+        self._cancel_pending_save()
         state: dict[str, Any] = {
             "window_states": {k: v.to_dict() for k, v in self.window_states.items()},
             "user_window_offsets": {
@@ -176,6 +229,7 @@ class SessionManager:
             "tmux_server_started": self.tmux_server_started,
         }
         atomic_write_json(config.state_file, state)
+        self._dirty = False
         logger.debug("State saved to %s", config.state_file)
 
     def _is_window_id(self, key: str) -> bool:
@@ -758,12 +812,10 @@ class SessionManager:
         Also cleans up window_states entries not in current session_map.
         Updates window_display_names from the "window_name" field in values.
         """
-        if not config.session_map_file.exists():
-            return
         try:
-            async with aiofiles.open(config.session_map_file, "r") as f:
-                content = await f.read()
-            session_map = json.loads(content)
+            # Parsed JSON is cached by (mtime, size, inode); the sync below is
+            # cheap and idempotent, so only the read+parse is skipped.
+            session_map = await read_json_cached(config.session_map_file)
         except (json.JSONDecodeError, OSError):
             return
 
@@ -780,6 +832,7 @@ class SessionManager:
         ):
             windows = await tmux_manager.list_windows()
             live_by_name = {w.window_name: w.window_id for w in windows}
+            session_map = copy.deepcopy(session_map)  # cached object: don't mutate
             if self._migrate_old_format_map(session_map, live_by_name):
                 atomic_write_json(config.session_map_file, session_map)
                 logger.info("Migrated old-format session_map keys during load")
@@ -1076,7 +1129,7 @@ class SessionManager:
         if user_id not in self.user_window_offsets:
             self.user_window_offsets[user_id] = {}
         self.user_window_offsets[user_id][window_id] = offset
-        self._save_state()
+        self._schedule_save()
 
     # --- Thread binding management ---
 

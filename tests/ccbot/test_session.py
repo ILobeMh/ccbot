@@ -1,5 +1,6 @@
 """Tests for SessionManager pure dict operations."""
 
+import asyncio
 import json
 
 import pytest
@@ -7,6 +8,7 @@ import pytest
 import ccbot.session as session_mod
 from ccbot.session import SessionManager
 from ccbot.tmux_manager import TmuxWindow
+from ccbot.utils import atomic_write_json
 
 
 @pytest.fixture
@@ -519,3 +521,117 @@ class TestListSessionsForDirectory:
         assert set(by_id) == {sid_a, sid_b}
         assert by_id[sid_a].summary == "My name"
         assert by_id[sid_b].summary == "first prompt here"
+
+
+class TestDebouncedStateSave:
+    """update_user_window_offset is debounced; other mutations save at once."""
+
+    @pytest.fixture
+    def real_mgr(self, monkeypatch, tmp_path) -> SessionManager:
+        monkeypatch.setattr(session_mod.config, "state_file", tmp_path / "state.json")
+        monkeypatch.setattr(session_mod, "SAVE_DEBOUNCE_SECONDS", 0.05)
+        return SessionManager()
+
+    @staticmethod
+    def _offsets(tmp_path) -> dict:
+        return json.loads((tmp_path / "state.json").read_text())["user_window_offsets"]
+
+    def test_saves_immediately_without_event_loop(self, real_mgr, tmp_path) -> None:
+        real_mgr.update_user_window_offset(1, "@1", 10)
+        assert self._offsets(tmp_path) == {"1": {"@1": 10}}
+
+    @pytest.mark.asyncio
+    async def test_coalesces_into_one_delayed_write(
+        self, real_mgr, tmp_path, monkeypatch
+    ) -> None:
+        writes: list[int] = []
+        real_write = session_mod.atomic_write_json
+
+        def counting(path, data, *a, **k):
+            writes.append(1)
+            real_write(path, data, *a, **k)
+
+        monkeypatch.setattr(session_mod, "atomic_write_json", counting)
+
+        for off in (1, 2, 3):
+            real_mgr.update_user_window_offset(1, "@1", off)
+        assert writes == []
+        assert not (tmp_path / "state.json").exists()
+
+        await asyncio.sleep(0.15)
+
+        assert len(writes) == 1
+        assert self._offsets(tmp_path) == {"1": {"@1": 3}}
+        assert real_mgr._save_handle is None
+
+    @pytest.mark.asyncio
+    async def test_direct_save_writes_now_and_cancels_pending(
+        self, real_mgr, tmp_path
+    ) -> None:
+        real_mgr.update_user_window_offset(1, "@1", 7)
+        assert not (tmp_path / "state.json").exists()
+
+        real_mgr.bind_thread(1, 5, "@1")  # direct _save_state
+
+        assert self._offsets(tmp_path) == {"1": {"@1": 7}}
+        assert real_mgr._save_handle is None
+        assert real_mgr._dirty is False
+
+    @pytest.mark.asyncio
+    async def test_flush_writes_pending_and_is_noop_when_clean(
+        self, real_mgr, tmp_path
+    ) -> None:
+        real_mgr.flush()  # clean: nothing written
+        assert not (tmp_path / "state.json").exists()
+
+        real_mgr.update_user_window_offset(1, "@1", 9)
+        real_mgr.flush()
+
+        assert self._offsets(tmp_path) == {"1": {"@1": 9}}
+        assert real_mgr._save_handle is None
+        await asyncio.sleep(0.1)  # cancelled timer must not fire a second write
+
+    @pytest.mark.asyncio
+    async def test_reschedules_after_write(self, real_mgr, tmp_path) -> None:
+        real_mgr.update_user_window_offset(1, "@1", 1)
+        await asyncio.sleep(0.12)
+        real_mgr.update_user_window_offset(1, "@1", 2)
+        await asyncio.sleep(0.12)
+        assert self._offsets(tmp_path) == {"1": {"@1": 2}}
+
+
+class TestLoadSessionMapCache:
+    @pytest.mark.asyncio
+    async def test_unchanged_file_not_reparsed_but_changes_picked_up(
+        self, mgr: SessionManager, monkeypatch, tmp_path
+    ) -> None:
+        map_file = tmp_path / "session_map.json"
+        atomic_write_json(
+            map_file, {"ccbot:@4": {"session_id": "sid-1", "cwd": "/proj"}}
+        )
+        monkeypatch.setattr(session_mod.config, "session_map_file", map_file)
+        monkeypatch.setattr(session_mod.config, "tmux_session_name", "ccbot")
+
+        await mgr.load_session_map()
+        assert mgr.get_window_state("@4").session_id == "sid-1"
+
+        real_loads = json.loads
+        parses: list[int] = []
+
+        def counting(*a, **k):
+            parses.append(1)
+            return real_loads(*a, **k)
+
+        monkeypatch.setattr("ccbot.utils.json.loads", counting)
+        mgr.get_window_state("@4").session_id = "tampered"
+
+        await mgr.load_session_map()  # file unchanged: no parse, state re-synced
+        assert parses == []
+        assert mgr.get_window_state("@4").session_id == "sid-1"
+
+        atomic_write_json(
+            map_file, {"ccbot:@4": {"session_id": "sid-2", "cwd": "/proj"}}
+        )
+        await mgr.load_session_map()
+        assert parses == [1]
+        assert mgr.get_window_state("@4").session_id == "sid-2"

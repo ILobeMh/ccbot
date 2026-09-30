@@ -2,7 +2,7 @@
 
 Wraps libtmux to provide async-friendly operations on a single tmux session:
   - list_windows / find_window_by_name: discover Claude Code windows.
-  - capture_pane: read terminal content (plain or with ANSI colors).
+  - capture_pane: read terminal content (plain or with ANSI colors) in one tmux fork.
   - send_keys: forward user input or control keys to a window.
   - create_window / kill_window: lifecycle management.
 
@@ -97,6 +97,9 @@ SHELL_COMMANDS = frozenset(
 )
 
 logger = logging.getLogger(__name__)
+
+# Upper bound for one `tmux capture-pane` call
+CAPTURE_TIMEOUT_SECONDS = 5.0
 
 # Claude session IDs are UUIDs (JSONL filename stems)
 _UUID_RE = re.compile(
@@ -381,49 +384,41 @@ class TmuxManager:
         Returns:
             The captured text, or None on failure.
         """
+        args = ["tmux", "capture-pane", "-p", "-t", window_id]
         if with_ansi:
-            # Use async subprocess to call tmux capture-pane -e for ANSI colors
+            args.insert(2, "-e")  # keep ANSI color escapes
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
             try:
-                proc = await asyncio.create_subprocess_exec(
-                    "tmux",
-                    "capture-pane",
-                    "-e",
-                    "-p",
-                    "-t",
-                    window_id,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=CAPTURE_TIMEOUT_SECONDS
                 )
-                stdout, stderr = await proc.communicate()
-                if proc.returncode == 0:
-                    return stdout.decode("utf-8")
-                logger.error(
-                    f"Failed to capture pane {window_id}: {stderr.decode('utf-8')}"
-                )
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                logger.error("Timed out capturing pane %s", window_id)
                 return None
-            except Exception as e:
-                logger.error(f"Unexpected error capturing pane {window_id}: {e}")
-                return None
+        except Exception as e:
+            logger.error(f"Unexpected error capturing pane {window_id}: {e}")
+            return None
 
-        # Original implementation for plain text - wrap in thread
-        def _sync_capture() -> str | None:
-            session = self.get_session()
-            if not session:
-                return None
-            try:
-                window = session.windows.get(window_id=window_id)
-                if not window:
-                    return None
-                pane = window.active_pane
-                if not pane:
-                    return None
-                lines = pane.capture_pane()
-                return "\n".join(lines) if isinstance(lines, list) else str(lines)
-            except Exception as e:
-                logger.error(f"Failed to capture pane {window_id}: {e}")
-                return None
-
-        return await asyncio.to_thread(_sync_capture)
+        if proc.returncode != 0:
+            err = stderr.decode("utf-8", errors="replace").strip()
+            if "can't find" in err:
+                logger.debug("Failed to capture pane %s: %s", window_id, err)
+            else:
+                logger.error("Failed to capture pane %s: %s", window_id, err)
+            return None
+        text = stdout.decode("utf-8")
+        if with_ansi:
+            return text
+        # Match the old libtmux behaviour: trailing empty lines dropped, no
+        # trailing newline, spaces inside lines untouched.
+        return text.rstrip("\n")
 
     async def send_key(self, window_id: str, key: str) -> bool:
         """Send a single tmux key name (``Down``, ``Enter``, ``Escape``, ``BTab``)."""
