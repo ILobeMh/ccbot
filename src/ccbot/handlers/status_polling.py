@@ -50,6 +50,7 @@ from .message_queue import (
     enqueue_status_update,
     get_message_queue,
     has_pending_interactive,
+    interactive_backoff_active,
 )
 from .message_sender import safe_send
 from .notifications_topic import mark_ui, notify
@@ -246,7 +247,9 @@ async def update_status_message(
         # queued first, then queue the UI behind them.
         if _transcript_poller is not None:
             await _transcript_poller()
-        if get_interactive_window(user_id, thread_id) != window_id:
+        if get_interactive_window(
+            user_id, thread_id
+        ) != window_id and not interactive_backoff_active(user_id, thread_id):
             await enqueue_interactive(bot, user_id, window_id, thread_id)
         return
 
@@ -274,11 +277,14 @@ async def _handle_vanished_window(
     bot: Bot, user_id: int, thread_id: int, window_id: str
 ) -> None:
     """Unbind a topic whose window disappeared and offer ▶ Resume in it."""
+    if session_manager.get_window_for_thread(user_id, thread_id) != window_id:
+        return  # unbound meanwhile (e.g. /kill) — whoever did it reports it
     ws = session_manager.window_states.get(window_id)
     sid, cwd = (ws.session_id, ws.cwd) if ws else ("", "")
     mode = session_manager.get_launch_info(window_id).get("mode") or "default"
     display = session_manager.get_display_name(window_id)
     session_manager.unbind_thread(user_id, thread_id)
+    await session_manager.remove_session_map_entry(window_id)
     await clear_topic_state(user_id, thread_id, bot)
     logger.info(
         "Cleaned up stale binding: user=%d thread=%d window_id=%s",

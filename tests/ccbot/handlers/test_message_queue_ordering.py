@@ -26,6 +26,7 @@ def env(events, monkeypatch):
     interactive_ui._interactive_mode.clear()
     interactive_ui._interactive_msgs.clear()
     message_queue._pending_interactive.clear()
+    message_queue._ui_send_failed_at.clear()
 
     next_id = iter(range(1000, 2000))
 
@@ -66,6 +67,7 @@ def env(events, monkeypatch):
     interactive_ui._interactive_mode.clear()
     interactive_ui._interactive_msgs.clear()
     message_queue._pending_interactive.clear()
+    message_queue._ui_send_failed_at.clear()
 
 
 async def _drain(user_id: int = 1) -> None:
@@ -124,6 +126,7 @@ async def test_answered_ui_is_deleted_before_new_content(env, events):
 async def test_ui_that_never_renders_falls_back_to_tool_use_text(env, events):
     bot = AsyncMock()
     env["ui_result"]["value"] = False
+    env["tmux"].capture_pane.return_value = "no dialog on screen\n"
     await message_queue.enqueue_interactive(
         bot, 1, "@5", 42, fallback_parts=["**AskUserQuestion**(Pick one)"]
     )
@@ -181,3 +184,67 @@ async def test_merge_keeps_text_of_all_parts():
     assert count == 1
     assert merged.parts == ["a", "b"]
     assert merged.text == "a\n\nb"
+
+
+@pytest.mark.asyncio
+async def test_drawn_ui_telegram_refuses_does_not_hold_queue(env, events):
+    """UI on screen but the send fails: give up at once, back off the poller."""
+    bot = AsyncMock()
+    env["ui_result"]["value"] = False  # handle_interactive_ui fails to send
+    await message_queue.enqueue_interactive(
+        bot, 1, "@5", 42, fallback_parts=["**AskUserQuestion**(Pick one)"]
+    )
+    await message_queue.enqueue_content_message(
+        bot, 1, "@5", ["next"], content_type="text", thread_id=42
+    )
+    await _drain()
+    assert events == [("ui", False), ("send", "next")]
+    assert interactive_ui.get_interactive_window(1, 42) is None
+    assert message_queue.interactive_backoff_active(1, 42)
+    message_queue.clear_pending_interactive(1, 42)
+    assert not message_queue.interactive_backoff_active(1, 42)
+
+
+@pytest.mark.asyncio
+async def test_flood_control_waits_for_interactive_instead_of_dropping(
+    env, events, monkeypatch
+):
+    """A flood ban drops status updates only; a queued UI still shows."""
+    import time
+
+    bot = AsyncMock()
+    monkeypatch.setattr(message_queue.asyncio, "sleep", AsyncMock())
+    message_queue._flood_until[1] = time.monotonic() + 30
+    try:
+        await message_queue.enqueue_interactive(bot, 1, "@5", 42)
+        await _drain()
+    finally:
+        message_queue._flood_until.pop(1, None)
+    assert events == [("ui", False)]
+    assert not message_queue.has_pending_interactive(1, 42)
+
+
+@pytest.mark.asyncio
+async def test_retry_after_reposts_ui_once_after_content(env, events, monkeypatch):
+    """A 429 on the content send: retry sends content, then re-posts UI once."""
+    from telegram.error import RetryAfter
+
+    bot = AsyncMock()
+    interactive_ui._interactive_msgs[(1, 42)] = 55
+    interactive_ui._interactive_mode[(1, 42)] = "@5"
+    real_send = message_queue.send_with_fallback
+    calls = {"n": 0}
+
+    async def flaky_send(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RetryAfter(1)
+        return await real_send(*args, **kwargs)
+
+    monkeypatch.setattr(message_queue, "send_with_fallback", flaky_send)
+    monkeypatch.setattr(message_queue.asyncio, "sleep", AsyncMock())
+    await message_queue.enqueue_content_message(
+        bot, 1, "@5", ["late thinking"], content_type="thinking", thread_id=42
+    )
+    await _drain()
+    assert events == [("send", "late thinking"), ("ui", True)]

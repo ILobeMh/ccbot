@@ -98,6 +98,9 @@ _status_msg_info: dict[tuple[int, int], tuple[int, str, str]] = {}
 
 # Interactive tasks queued but not yet processed: (user_id, thread_id_or_0)
 _pending_interactive: dict[tuple[int, int], int] = {}
+# Last time a drawn UI could not be sent to Telegram, per topic
+_ui_send_failed_at: dict[tuple[int, int], float] = {}
+UI_SEND_BACKOFF = 10.0
 
 # Flood control: user_id -> monotonic time when ban expires
 _flood_until: dict[int, float] = {}
@@ -285,10 +288,10 @@ async def _message_queue_worker(bot: Bot, user_id: int) -> None:
                 if flood_end > 0:
                     remaining = flood_end - time.monotonic()
                     if remaining > 0:
-                        if task.task_type != "content":
+                        if task.task_type in ("status_update", "status_clear"):
                             # Status is ephemeral — safe to drop
                             continue
-                        # Content is actual Claude output — wait then send
+                        # Content / UIs are real output — wait, then send
                         logger.debug(
                             "Flood controlled: waiting %.0fs for content (user %d)",
                             remaining,
@@ -380,13 +383,13 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
     this content when the UI is still waiting — the question stays last.
     """
     ui_waiting = await _settle_open_ui(bot, user_id, task)
-    try:
-        await _send_content_task(bot, user_id, task)
-    finally:
-        if ui_waiting:
-            await handle_interactive_ui(
-                bot, user_id, task.window_id or "", task.thread_id, force_new=True
-            )
+    # A RetryAfter here propagates before the re-post: the retry settles the
+    # (still open) UI again and re-posts it exactly once, after the content.
+    await _send_content_task(bot, user_id, task)
+    if ui_waiting:
+        await handle_interactive_ui(
+            bot, user_id, task.window_id or "", task.thread_id, force_new=True
+        )
 
 
 async def _settle_open_ui(bot: Bot, user_id: int, task: MessageTask) -> bool:
@@ -400,7 +403,9 @@ async def _settle_open_ui(bot: Bot, user_id: int, task: MessageTask) -> bool:
     if get_interactive_window(user_id, task.thread_id) != task.window_id:
         return False
     pane = await tmux_manager.capture_pane(task.window_id or "")
-    if pane and is_interactive_ui(pane):
+    if pane is None:
+        return False  # capture failed: unknown, leave the UI message alone
+    if is_interactive_ui(pane):
         return True
     await clear_interactive_msg(user_id, bot, task.thread_id)
     return False
@@ -435,11 +440,33 @@ def has_pending_interactive(user_id: int, thread_id: int | None) -> bool:
     return (user_id, thread_id or 0) in _pending_interactive
 
 
+def interactive_backoff_active(user_id: int, thread_id: int | None) -> bool:
+    """True shortly after Telegram refused to show a drawn UI (poller waits)."""
+    failed_at = _ui_send_failed_at.get((user_id, thread_id or 0))
+    return failed_at is not None and time.monotonic() - failed_at < UI_SEND_BACKOFF
+
+
+def clear_pending_interactive(user_id: int, thread_id: int | None) -> None:
+    """Forget queued-UI bookkeeping for a topic (topic closed / unbound)."""
+    _pending_interactive.pop((user_id, thread_id or 0), None)
+    _ui_send_failed_at.pop((user_id, thread_id or 0), None)
+
+
 async def _show_interactive(bot: Bot, user_id: int, task: MessageTask) -> None:
     wid = task.window_id or ""
+    key = (user_id, task.thread_id or 0)
     waited = 0.0
     while True:
         if await handle_interactive_ui(bot, user_id, wid, task.thread_id):
+            _ui_send_failed_at.pop(key, None)
+            return
+        pane = await tmux_manager.capture_pane(wid)
+        if pane and is_interactive_ui(pane):
+            # Drawn, but Telegram refused the message: don't hold the queue
+            # (and let the poller retry only after UI_SEND_BACKOFF)
+            logger.warning("Interactive UI for %s could not be sent", wid)
+            _ui_send_failed_at[key] = time.monotonic()
+            clear_interactive_mode(user_id, task.thread_id)
             return
         if waited >= INTERACTIVE_RENDER_WAIT:
             break

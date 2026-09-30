@@ -34,6 +34,8 @@ logger = logging.getLogger(__name__)
 
 # Minimum gap between glob lookups for a session whose transcript wasn't found
 TRANSCRIPT_RETRY_SECONDS = 5.0
+# Longest a poll_now() caller (the status poller) waits for its cycle
+POLL_NOW_TIMEOUT = 5.0
 
 
 @dataclass
@@ -103,6 +105,9 @@ class SessionMonitor:
         self._transcript_retry_at: dict[str, float] = {}
         # Serialises poll cycles: offsets/pending tools must not race
         self._poll_lock = asyncio.Lock()
+        # poll_now() requests that haven't started their cycle yet share it
+        self._requested: asyncio.Future[None] | None = None
+        self._requested_tasks: set[asyncio.Task[None]] = set()
 
     def set_message_callback(
         self, callback: Callable[[NewMessage], Awaitable[None]]
@@ -485,41 +490,69 @@ class SessionMonitor:
         Serialised by a lock so cycles never overlap (offsets would race).
         Errors are logged, never raised.
         """
+        async with self._poll_lock:
+            await self._cycle()
+
+    async def _cycle(self) -> None:
+        """Body of one poll cycle; the caller holds ``_poll_lock``."""
         # Deferred import to avoid circular dependency
         from .session import session_manager
 
-        async with self._poll_lock:
-            try:
-                # Load hook-based session map updates
-                await session_manager.load_session_map()
+        try:
+            # Load hook-based session map updates
+            await session_manager.load_session_map()
 
-                # Detect session_map changes and cleanup replaced/removed sessions
-                current_map = await self._detect_and_cleanup_changes()
-                active_session_ids = set(current_map.values())
+            # Detect session_map changes and cleanup replaced/removed sessions
+            current_map = await self._detect_and_cleanup_changes()
+            active_session_ids = set(current_map.values())
 
-                # Check for new messages (all I/O is async)
-                new_messages = await self.check_for_updates(active_session_ids)
+            # Check for new messages (all I/O is async)
+            new_messages = await self.check_for_updates(active_session_ids)
 
-                for msg in new_messages:
-                    status = "complete" if msg.is_complete else "streaming"
-                    preview = msg.text[:80] + ("..." if len(msg.text) > 80 else "")
-                    logger.info("[%s] session=%s: %s", status, msg.session_id, preview)
-                    if self._message_callback:
-                        try:
-                            await self._message_callback(msg)
-                        except Exception as e:
-                            logger.error(f"Message callback error: {e}")
+            for msg in new_messages:
+                status = "complete" if msg.is_complete else "streaming"
+                preview = msg.text[:80] + ("..." if len(msg.text) > 80 else "")
+                logger.info("[%s] session=%s: %s", status, msg.session_id, preview)
+                if self._message_callback:
+                    try:
+                        await self._message_callback(msg)
+                    except Exception as e:
+                        logger.error(f"Message callback error: {e}")
 
-            except Exception as e:
-                logger.error(f"Monitor loop error: {e}")
+        except Exception as e:
+            logger.error(f"Monitor loop error: {e}")
 
-    async def poll_now(self) -> None:
-        """Run a monitor cycle on demand and wait for it to finish.
+    async def poll_now(self, timeout: float = POLL_NOW_TIMEOUT) -> None:
+        """Run a monitor cycle on demand and wait (at most ``timeout``) for it.
 
-        If a cycle is already in progress this waits for it, then runs a fresh
-        one — the caller wants anything written after the call started.
+        The cycle starts after this call, so it sees anything written before
+        the call — a cycle already in progress doesn't count. Callers that
+        arrive while a requested cycle is still waiting for the lock share
+        it instead of queueing one cycle each.
         """
-        await self.poll_once()
+        fut = self._requested
+        if fut is None:
+            fut = asyncio.get_running_loop().create_future()
+            self._requested = fut
+            task = asyncio.create_task(self._run_requested(fut))
+            self._requested_tasks.add(task)
+            task.add_done_callback(self._requested_tasks.discard)
+        try:
+            await asyncio.wait_for(asyncio.shield(fut), timeout)
+        except TimeoutError:
+            logger.warning("On-demand transcript poll still running after %ss", timeout)
+
+    async def _run_requested(self, fut: asyncio.Future[None]) -> None:
+        try:
+            async with self._poll_lock:
+                if self._requested is fut:
+                    self._requested = None  # later callers need a newer cycle
+                await self._cycle()
+        finally:
+            if self._requested is fut:
+                self._requested = None
+            if not fut.done():
+                fut.set_result(None)
 
     async def _monitor_loop(self) -> None:
         """Background loop: poll_once() every poll_interval seconds."""

@@ -24,13 +24,18 @@ def mock_bot():
 @pytest.fixture
 def _clear_interactive_state():
     """Ensure interactive state is clean before and after each test."""
+    from ccbot.handlers import message_queue
     from ccbot.handlers.interactive_ui import _interactive_mode, _interactive_msgs
 
-    _interactive_mode.clear()
-    _interactive_msgs.clear()
+    def reset() -> None:
+        _interactive_mode.clear()
+        _interactive_msgs.clear()
+        message_queue._pending_interactive.clear()
+        message_queue._ui_send_failed_at.clear()
+
+    reset()
     yield
-    _interactive_mode.clear()
-    _interactive_msgs.clear()
+    reset()
 
 
 @pytest.mark.usefixtures("_clear_interactive_state")
@@ -199,6 +204,8 @@ class TestVanishedWindow:
         ws = WindowState(session_id="sid-9", cwd="/proj")
         sm = MagicMock()
         sm.window_states = {"@4": ws}
+        sm.get_window_for_thread.return_value = "@4"
+        sm.remove_session_map_entry = AsyncMock()
         sm.get_launch_info.return_value = {"mode": "plan"}
         sm.get_display_name.return_value = "proj"
         with (
@@ -224,6 +231,8 @@ class TestVanishedWindow:
 
         sm = MagicMock()
         sm.window_states = {}
+        sm.get_window_for_thread.return_value = "@4"
+        sm.remove_session_map_entry = AsyncMock()
         sm.get_launch_info.return_value = {}
         sm.get_display_name.return_value = "x"
         with (
@@ -234,4 +243,19 @@ class TestVanishedWindow:
             await status_polling._handle_vanished_window(AsyncMock(), 1, 42, "@4")
 
         sm.unbind_thread.assert_called_once_with(1, 42)
+        offer.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_already_unbound_is_left_alone(self):
+        """/kill unbinds first; the poller then must not post a second notice."""
+        from ccbot.handlers import status_polling
+
+        sm = MagicMock()
+        sm.get_window_for_thread.return_value = None
+        with (
+            patch.object(status_polling, "session_manager", sm),
+            patch.object(status_polling, "offer_resume", AsyncMock()) as offer,
+        ):
+            await status_polling._handle_vanished_window(AsyncMock(), 1, 42, "@4")
+        sm.unbind_thread.assert_not_called()
         offer.assert_not_awaited()

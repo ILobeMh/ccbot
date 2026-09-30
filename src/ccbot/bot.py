@@ -163,7 +163,7 @@ from .handlers.notifications_topic import (
     record_turn_start,
 )
 from .handlers.response_builder import build_response_parts
-from .handlers.resume_offer import offer_resume
+from .handlers.resume_offer import offer_lost_bindings, offer_resume
 from .handlers.settings_topic import settings_command
 from .handlers.special_topics import (
     ensure_special_topics,
@@ -471,8 +471,10 @@ async def _kill_window_and_offer_resume(
     sid, cwd = ws.session_id, ws.cwd
     mode = launch.get("mode") or "default"
 
-    killed = await tmux_manager.kill_window(wid)
+    # Unbind before killing: the status poller must not see the window gone
+    # while it is still bound (it would post its own "window is gone" offer).
     session_manager.unbind_thread(user_id, thread_id)
+    killed = await tmux_manager.kill_window(wid)
     await session_manager.remove_session_map_entry(wid)
     await clear_topic_state(user_id, thread_id, bot, user_data)
     chat_id = session_manager.resolve_chat_id(user_id, thread_id)
@@ -3146,18 +3148,7 @@ async def post_init(application: Application) -> None:
     # Re-resolve stale window IDs from persisted state against live tmux windows
     await session_manager.resolve_stale_ids()
     # Topics whose window died with the server (reboot, tmux crash): offer ▶
-    for lost in session_manager.pop_lost_bindings():
-        await offer_resume(
-            application.bot,
-            lost.user_id,
-            lost.thread_id,
-            headline=f"⚠️ `{lost.name}` stopped while the bot was down "
-            "(server reboot or tmux restart).",
-            session_id=lost.session_id,
-            cwd=lost.cwd,
-            mode=lost.mode,
-            name=lost.name,
-        )
+    await offer_lost_bindings(application.bot, session_manager.pop_lost_bindings())
 
     # Pre-fill global rate limiter bucket on restart.
     # AsyncLimiter starts at _level=0 (full burst capacity), but Telegram's
