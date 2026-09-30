@@ -31,6 +31,7 @@ from pathlib import PurePosixPath
 from typing import Any
 
 from .transcript_parser import ToolCall
+from .utils import format_duration
 
 # Telegram allows 32768 characters and 500 blocks per rich message; stay
 # clear of both (escapes and our own chrome add a little on top).
@@ -277,17 +278,6 @@ def _parse_ts(ts: str | None) -> datetime | None:
         return datetime.fromisoformat(ts.replace("Z", "+00:00"))
     except ValueError:
         return None
-
-
-def format_duration(seconds: float) -> str:
-    seconds = int(round(seconds))
-    if seconds < 60:
-        return f"{seconds}s"
-    minutes, secs = divmod(seconds, 60)
-    if minutes < 60:
-        return f"{minutes}m {secs}s" if secs else f"{minutes}m"
-    hours, minutes = divmod(minutes, 60)
-    return f"{hours}h {minutes}m" if minutes else f"{hours}h"
 
 
 def _duration(call: ToolCall) -> str | None:

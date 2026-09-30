@@ -3038,6 +3038,11 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
             _mark_read(user_id, wid)
             continue
 
+        # "✻ Worked for 27s" footers only in rich style (appended to the reply)
+        if msg.content_type == "turn_duration" and not rich:
+            _mark_read(user_id, wid)
+            continue
+
         # Skip tool call notifications when CCBOT_SHOW_TOOL_CALLS=false
         if not config.show_tool_calls and msg.content_type in (
             "tool_use",

@@ -4,6 +4,7 @@ Provides:
   - ccbot_dir(): resolve config directory from CCBOT_DIR env var.
   - atomic_write_json(): crash-safe JSON file writes via temp+rename.
   - read_cwd_from_jsonl(): extract the cwd field from the first JSONL entry.
+  - format_duration(): "6m 19s"-style durations (Claude Code's own style).
   - read_json_cached(): parse a JSON file, re-reading only when it changed on disk.
 """
 
@@ -156,3 +157,15 @@ def process_tree_rss(root_pids: list[int]) -> dict[int, int]:
             stack.extend(children.get(pid, []))
         totals[root] = total
     return totals
+
+
+def format_duration(seconds: float) -> str:
+    """Compact duration like Claude Code prints it: 5s, 6m 19s, 1h 2m."""
+    seconds = int(round(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, secs = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {secs}s" if secs else f"{minutes}m"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes}m" if minutes else f"{hours}h"

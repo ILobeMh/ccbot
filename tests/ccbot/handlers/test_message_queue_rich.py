@@ -180,3 +180,32 @@ class TestBuildRichParts:
         assert build_rich_parts("⚠️ API error: x", "warning", "assistant") == [
             "⚠️ API error: x"
         ]
+
+
+def test_turn_footer_threshold():
+    assert build_rich_parts(
+        "✻ Worked for 27s", "turn_duration", "assistant", raw="27.4"
+    ) == ["_✻ Worked for 27s_"]
+    assert (
+        build_rich_parts("✻ Worked for 3s", "turn_duration", "assistant", raw="3")
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_turn_footer_is_packed_onto_the_reply(calls):
+    bot = AsyncMock()
+    await message_queue.enqueue_content_message(
+        bot, 1, "@5", ["Done: all tests pass."], thread_id=42, rich=True, ends_turn=True
+    )
+    await message_queue.enqueue_content_message(
+        bot,
+        1,
+        "@5",
+        ["_✻ Worked for 27s_"],
+        content_type="turn_duration",
+        thread_id=42,
+        rich=True,
+    )
+    await _drain()
+    assert calls == [("send_rich", "Done: all tests pass.\n\n_✻ Worked for 27s_", 42)]

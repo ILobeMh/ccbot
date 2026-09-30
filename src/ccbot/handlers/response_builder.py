@@ -22,6 +22,9 @@ from ..markdown_v2 import convert_markdown_tables
 from ..telegram_sender import split_message
 from ..transcript_parser import ToolCall, TranscriptParser
 
+# Shorter turns don't get a "✻ Worked for …" footer (noise on quick answers)
+TURN_FOOTER_MIN_SECONDS = 10
+
 
 def render_options() -> rich_render.RenderOptions:
     return rich_render.RenderOptions(
@@ -54,6 +57,13 @@ def build_rich_parts(
     (e.g. TodoWrite), so the caller sends nothing.
     """
     opts = render_options()
+    if content_type == "turn_duration":
+        # "✻ Worked for 27s" — packed onto the turn's last message by the queue
+        try:
+            seconds = float(raw or 0)
+        except ValueError:
+            seconds = 0.0
+        return [f"_{text}_"] if seconds >= TURN_FOOTER_MIN_SECONDS else None
     if role == "user":
         return rich_render.render_user_text(raw or text)
     if content_type == "thinking":

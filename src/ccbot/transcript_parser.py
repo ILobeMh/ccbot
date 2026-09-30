@@ -23,6 +23,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from .utils import format_duration
+
 logger = logging.getLogger(__name__)
 
 
@@ -358,7 +360,8 @@ class TranscriptParser:
         """Turn a `type: "system"` entry into a display entry, or None.
 
         Only subtypes users need to see are surfaced; bookkeeping entries
-        (turn_duration, stop_hook_summary, unknown subtypes) are ignored.
+        (stop_hook_summary, unknown subtypes) are ignored; turn_duration becomes
+        a "✻ Worked for 27s" footer entry (content_type "turn_duration").
         local_command is handled by the caller (it needs invoke/stdout pairing).
         """
         subtype = data.get("subtype")
@@ -410,6 +413,16 @@ class TranscriptParser:
 
         if subtype == "away_summary":
             return entry(f"📋 {content}", "info") if content else None
+
+        if subtype == "turn_duration":
+            ms = data.get("durationMs")
+            if not isinstance(ms, (int, float)) or isinstance(ms, bool):
+                return None
+            footer = entry(
+                f"✻ Worked for {format_duration(ms / 1000)}", "turn_duration"
+            )
+            footer.raw = str(ms / 1000)  # seconds, for the display threshold
+            return footer
 
         return None
 

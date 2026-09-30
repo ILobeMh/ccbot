@@ -671,6 +671,7 @@ class TestSystemLocalCommand:
             _sys("something_new", content="x"),
             _sys("local_command", content=self.STDOUT),
         )
+        result = [r for r in result if r.content_type == "local_command"]
         assert len(result) == 1
         assert result[0].text.startswith("❯ `/model`")
 
@@ -820,15 +821,21 @@ class TestSystemNotices:
     @pytest.mark.parametrize(
         "entry",
         [
-            _sys("turn_duration", durationMs=27432, messageCount=927),
             _sys("stop_hook_summary", hookCount=1),
             _sys("brand_new_subtype", content="whatever"),
+            _sys("turn_duration", durationMs="bad"),
             {"type": "system"},
         ],
-        ids=["turn_duration", "stop_hook_summary", "unknown", "no_subtype"],
+        ids=["stop_hook_summary", "unknown", "bad_duration", "no_subtype"],
     )
     def test_ignored_subtypes(self, entry: dict):
         assert _parse(entry) == []
+
+    def test_turn_duration_footer(self):
+        (footer,) = _parse(_sys("turn_duration", durationMs=27432, messageCount=927))
+        assert footer.content_type == "turn_duration"
+        assert footer.text == "✻ Worked for 27s"
+        assert footer.raw == "27.432"
 
     def test_system_entries_do_not_tag_turn_state(
         self, make_jsonl_entry, make_text_block
