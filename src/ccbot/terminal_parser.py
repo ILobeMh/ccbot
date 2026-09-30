@@ -152,6 +152,13 @@ UI_PATTERNS: list[UIPattern] = [
             re.compile(r"^\s*Type to filter"),
         ),
     ),
+    UIPattern(
+        # /effort slider: no ❯ cursor, adjusted with ←/→ (so the generic
+        # Modal fallback cannot catch it)
+        name="EffortPicker",
+        top=(re.compile(r"^\s*Effort\s*$"),),
+        bottom=(re.compile(r"←/→ to adjust"),),
+    ),
 ]
 
 # Dialogs the bot answers on its own (startup chores that would otherwise

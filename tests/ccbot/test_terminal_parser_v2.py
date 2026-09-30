@@ -99,6 +99,27 @@ class TestBusyWithTipBlock:
         assert not is_interactive_ui(pane)
 
 
+class TestPickers:
+    def test_effort_picker_detected(self):
+        pane = load("effort_picker.txt")
+        ui = extract_interactive_content(pane)
+        assert ui is not None
+        assert ui.name == "EffortPicker"
+        assert ui.content.startswith("   Effort")
+        assert "ultracode" in ui.content
+        assert "←/→ to adjust" in ui.content
+        assert is_blocking_dialog(pane)
+
+    def test_model_picker_detected(self):
+        pane = load("model_picker.txt")
+        ui = extract_interactive_content(pane)
+        assert ui is not None
+        assert ui.name == "Settings"
+        assert "Select model" in ui.content
+        assert "Esc to cancel" in ui.content
+        assert is_blocking_dialog(pane)
+
+
 class TestMisc:
     def test_update_pending(self):
         assert has_update_pending("  ✔ Update installed · Restart to update\n────")

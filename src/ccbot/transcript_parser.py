@@ -1,7 +1,9 @@
 """JSONL transcript parser for Claude Code session files.
 
 Parses Claude Code session JSONL files and extracts structured messages.
-Handles: text, thinking, tool_use, tool_result, local_command, and user messages.
+Handles: text, thinking, tool_use, tool_result, local_command, and user messages,
+plus `type: "system"` entries that matter to the user (local command output,
+API error retries, usage-limit notices, compaction, model refusals, recaps).
 Tool pairing: tool_use blocks in assistant messages are matched with
 tool_result blocks in subsequent user messages via tool_use_id.
 
@@ -39,6 +41,7 @@ class ParsedEntry:
     text: str  # Already formatted text
     content_type: (
         str  # "text" | "thinking" | "tool_use" | "tool_result" | "local_command"
+        # | "error" | "warning" | "info"
     )
     tool_use_id: str | None = None
     timestamp: str | None = None  # ISO timestamp from JSONL
@@ -68,8 +71,10 @@ class TranscriptParser:
     """Parser for Claude Code JSONL session files.
 
     Expected JSONL entry structure:
-    - type: "user" | "assistant" | "summary" | "file-history-snapshot" | ...
+    - type: "user" | "assistant" | "system" | "summary" | "file-history-snapshot" | ...
     - message.content: list of blocks (text, tool_use, tool_result, thinking)
+    - system entries carry a `subtype` (local_command, api_error, informational,
+      compact_boundary, ...) and a plain-string `content` instead of `message`
     - sessionId, cwd, timestamp, uuid: metadata fields
 
     Tool pairing model: tool_use blocks appear in assistant messages,
@@ -144,7 +149,10 @@ class TranscriptParser:
 
         return "\n".join(texts)
 
-    _RE_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
+    # CSI sequences, OSC sequences (BEL or ST terminated), and stray lone ESC
+    _RE_ANSI_ESCAPE = re.compile(
+        r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b"
+    )
 
     _RE_COMMAND_NAME = re.compile(r"<command-name>(.*?)</command-name>")
     _RE_LOCAL_STDOUT = re.compile(
@@ -197,7 +205,7 @@ class TranscriptParser:
             summary = input_data.get("command", "")
         elif name == "Grep":
             summary = input_data.get("pattern", "")
-        elif name == "Task":
+        elif name in ("Task", "Agent"):
             summary = input_data.get("description", "")
         elif name == "WebFetch":
             summary = input_data.get("url", "")
@@ -278,6 +286,105 @@ class TranscriptParser:
         return images if images else None
 
     @classmethod
+    def _parse_local_command(cls, text: str) -> ParsedMessage | None:
+        """Recognise local-command XML (invoke or stdout) in message text."""
+        stdout_match = cls._RE_LOCAL_STDOUT.search(text)
+        if stdout_match:
+            stdout = stdout_match.group(1).strip()
+            cmd_match = cls._RE_COMMAND_NAME.search(text)
+            cmd = cmd_match.group(1) if cmd_match else None
+            return ParsedMessage(
+                message_type="local_command",
+                text=stdout,
+                tool_name=cmd,  # reuse field for command name
+            )
+        # Pure command invocation (no stdout) — carry command name
+        cmd_match = cls._RE_COMMAND_NAME.search(text)
+        if cmd_match:
+            return ParsedMessage(
+                message_type="local_command_invoke",
+                text="",
+                tool_name=cmd_match.group(1),
+            )
+        return None
+
+    @staticmethod
+    def _format_local_command(cmd: str, text: str) -> str:
+        """Format local command output: "❯ `/cmd`" + code block / inline code."""
+        multiline = "\n" in text
+        body = f"```\n{text}\n```" if multiline else f"`{text}`"
+        return f"❯ `{cmd}`\n{body}" if cmd else body
+
+    @staticmethod
+    def _format_token_count(n: int | float) -> str:
+        """Compact token count: 16162 -> "16.2k", 1_250_000 -> "1.2M"."""
+        if n >= 1_000_000:
+            return f"{n / 1_000_000:.1f}M"
+        if n >= 1_000:
+            return f"{n / 1_000:.1f}k"
+        return str(int(n))
+
+    @classmethod
+    def _parse_system_entry(cls, data: dict) -> ParsedEntry | None:
+        """Turn a `type: "system"` entry into a display entry, or None.
+
+        Only subtypes users need to see are surfaced; bookkeeping entries
+        (turn_duration, stop_hook_summary, unknown subtypes) are ignored.
+        local_command is handled by the caller (it needs invoke/stdout pairing).
+        """
+        subtype = data.get("subtype")
+        raw = data.get("content")
+        content = raw.strip() if isinstance(raw, str) else ""
+        ts = cls.get_timestamp(data)
+
+        def entry(text: str, content_type: str) -> ParsedEntry:
+            return ParsedEntry(
+                role="assistant", text=text, content_type=content_type, timestamp=ts
+            )
+
+        if subtype == "api_error":
+            # Written once per retry attempt: one notice per failure streak
+            attempt = data.get("retryAttempt")
+            if attempt is not None and attempt != 1:
+                return None
+            err = data.get("error")
+            err = err if isinstance(err, dict) else {}
+            detail = err.get("formatted") or err.get("message") or "unknown error"
+            text = f"⚠️ API error: {detail}"
+            max_retries = data.get("maxRetries")
+            if isinstance(max_retries, int) and not isinstance(max_retries, bool):
+                text += f" — retrying (up to {max_retries}×)"
+            return entry(text, "warning")
+
+        if subtype == "informational":
+            return entry(f"ℹ️ {content}", "info") if content else None
+
+        if subtype == "compact_boundary":
+            text = "🗜 Conversation compacted"
+            meta = data.get("compactMetadata")
+            if isinstance(meta, dict):
+                pre, post = meta.get("preTokens"), meta.get("postTokens")
+                if (
+                    isinstance(pre, (int, float))
+                    and isinstance(post, (int, float))
+                    and not isinstance(pre, bool)
+                    and not isinstance(post, bool)
+                ):
+                    text += (
+                        f" ({cls._format_token_count(pre)} → "
+                        f"{cls._format_token_count(post)} tokens)"
+                    )
+            return entry(text, "info")
+
+        if subtype in ("model_refusal_fallback", "model_refusal_no_fallback"):
+            return entry(f"⚠️ {content}", "warning") if content else None
+
+        if subtype == "away_summary":
+            return entry(f"📋 {content}", "info") if content else None
+
+        return None
+
+    @classmethod
     def parse_message(cls, data: dict) -> ParsedMessage | None:
         """Parse a message entry from the JSONL data.
 
@@ -306,24 +413,9 @@ class TranscriptParser:
         # Detect local command responses in user messages.
         # These are rendered as bot replies: "❯ /cmd\n  ⎿  output"
         if msg_type == "user" and text:
-            stdout_match = cls._RE_LOCAL_STDOUT.search(text)
-            if stdout_match:
-                stdout = stdout_match.group(1).strip()
-                cmd_match = cls._RE_COMMAND_NAME.search(text)
-                cmd = cmd_match.group(1) if cmd_match else None
-                return ParsedMessage(
-                    message_type="local_command",
-                    text=stdout,
-                    tool_name=cmd,  # reuse field for command name
-                )
-            # Pure command invocation (no stdout) — carry command name
-            cmd_match = cls._RE_COMMAND_NAME.search(text)
-            if cmd_match:
-                return ParsedMessage(
-                    message_type="local_command_invoke",
-                    text="",
-                    tool_name=cmd_match.group(1),
-                )
+            local = cls._parse_local_command(text)
+            if local:
+                return local
 
         return ParsedMessage(
             message_type=msg_type,
@@ -403,8 +495,8 @@ class TranscriptParser:
             stats = f"  ⎿  Found {files} files"
             return stats + "\n" + cls._format_expandable_quote(text)
 
-        elif tool_name == "Task":
-            # Task: show output length
+        elif tool_name in ("Task", "Agent"):
+            # Task/Agent (renamed in newer Claude Code): show output length
             if line_count > 0:
                 stats = f"  ⎿  Agent output {line_count} lines"
                 return stats + "\n" + cls._format_expandable_quote(text)
@@ -469,11 +561,38 @@ class TranscriptParser:
             _tag()
             tag_from, tag_with = len(result), None
             msg_type = cls.get_message_type(data)
-            if msg_type not in ("user", "assistant"):
+            entry_timestamp = cls.get_timestamp(data)
+
+            if msg_type == "system":
+                # Deliberately leaves last_cmd_name alone: unrelated system
+                # entries may sit between a command invoke and its stdout.
+                if data.get("subtype") == "local_command":
+                    raw = data.get("content")
+                    text = (
+                        cls._RE_ANSI_ESCAPE.sub("", raw) if isinstance(raw, str) else ""
+                    )
+                    local = cls._parse_local_command(text) if text else None
+                    if local and local.message_type == "local_command_invoke":
+                        last_cmd_name = local.tool_name
+                    elif local:
+                        cmd = local.tool_name or last_cmd_name or ""
+                        result.append(
+                            ParsedEntry(
+                                role="assistant",
+                                text=cls._format_local_command(cmd, local.text),
+                                content_type="local_command",
+                                timestamp=entry_timestamp,
+                            )
+                        )
+                        last_cmd_name = None
+                    continue
+                sys_entry = cls._parse_system_entry(data)
+                if sys_entry:
+                    result.append(sys_entry)
                 continue
 
-            # Extract timestamp for this entry
-            entry_timestamp = cls.get_timestamp(data)
+            if msg_type not in ("user", "assistant"):
+                continue
 
             message = data.get("message")
             if not isinstance(message, dict):
@@ -493,21 +612,10 @@ class TranscriptParser:
                     continue
                 if parsed.message_type == "local_command":
                     cmd = parsed.tool_name or last_cmd_name or ""
-                    text = parsed.text
-                    if cmd:
-                        if "\n" in text:
-                            formatted = f"❯ `{cmd}`\n```\n{text}\n```"
-                        else:
-                            formatted = f"❯ `{cmd}`\n`{text}`"
-                    else:
-                        if "\n" in text:
-                            formatted = f"```\n{text}\n```"
-                        else:
-                            formatted = f"`{text}`"
                     result.append(
                         ParsedEntry(
                             role="assistant",
-                            text=formatted,
+                            text=cls._format_local_command(cmd, parsed.text),
                             content_type="local_command",
                             timestamp=entry_timestamp,
                         )

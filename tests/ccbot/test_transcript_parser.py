@@ -71,6 +71,11 @@ class TestFormatToolUseSummary:
             ("Glob", {"pattern": "*.py"}, "**Glob**(*.py)"),
             ("Task", {"description": "analyze code"}, "**Task**(analyze code)"),
             (
+                "Agent",
+                {"description": "analyze code", "subagent_type": "Explore"},
+                "**Agent**(analyze code)",
+            ),
+            (
                 "WebFetch",
                 {"url": "https://example.com"},
                 "**WebFetch**(https://example.com)",
@@ -98,6 +103,7 @@ class TestFormatToolUseSummary:
             "Grep",
             "Glob",
             "Task",
+            "Agent",
             "WebFetch",
             "WebSearch",
             "TodoWrite",
@@ -548,4 +554,290 @@ class TestTurnTagging:
         assert [(r.stop_reason, r.api_message_id) for r in result] == [
             ("tool_use", "msg_a"),
             ("end_turn", "msg_b"),
+        ]
+
+
+# ── system entries ───────────────────────────────────────────────────────
+
+TS = "2026-09-30T12:00:00.000Z"
+
+
+def _sys(subtype: str, **fields) -> dict:
+    return {"type": "system", "subtype": subtype, "timestamp": TS, **fields}
+
+
+def _parse(*entries: dict):
+    result, _ = TranscriptParser.parse_entries(list(entries))
+    return result
+
+
+class TestAgentToolAlias:
+    def test_agent_result_formatted_like_task(self):
+        text = "line1\nline2"
+        assert TranscriptParser._format_tool_result_text(
+            text, "Agent"
+        ) == TranscriptParser._format_tool_result_text(text, "Task")
+        assert "Agent output 2 lines" in TranscriptParser._format_tool_result_text(
+            text, "Agent"
+        )
+
+
+class TestAnsiStripping:
+    @pytest.mark.parametrize(
+        "raw, expected",
+        [
+            ("\x1b[1mbold\x1b[22m", "bold"),
+            ("\x1b[38;2;136;136;136m⛁ \x1b[39m", "⛁ "),
+            ("a\x1b[2Kb\x1b[?25lc\x1b[3;4H", "abc"),
+            ("\x1b]0;title\x07text", "text"),
+            ("\x1b]8;;http://x\x1b\\link\x1b]8;;\x1b\\", "link"),
+            ("stray\x1bescape", "strayescape"),
+        ],
+        ids=["sgr", "24bit", "csi_general", "osc_bel", "osc_st", "lone_esc"],
+    )
+    def test_strip(self, raw: str, expected: str):
+        assert TranscriptParser._RE_ANSI_ESCAPE.sub("", raw) == expected
+
+    def test_user_local_command_stdout_stripped(
+        self, make_jsonl_entry, make_text_block
+    ):
+        xml = (
+            "<local-command-stdout>\x1b[38;2;1;2;3mhi\x1b[39m\x1b[2K"
+            "</local-command-stdout>"
+        )
+        result = _parse(make_jsonl_entry("user", [make_text_block(xml)]))
+        assert len(result) == 1
+        assert "\x1b" not in result[0].text
+        assert "hi" in result[0].text
+
+
+class TestSystemLocalCommand:
+    INVOKE = (
+        "<command-name>/model</command-name>\n"
+        "            <command-message>model</command-message>\n"
+        "            <command-args></command-args>"
+    )
+    STDOUT = "<local-command-stdout>Kept model as `Opus 5`</local-command-stdout>"
+
+    def test_system_invoke_and_stdout(self):
+        result = _parse(
+            _sys("local_command", content=self.INVOKE),
+            _sys("local_command", content=self.STDOUT),
+        )
+        assert len(result) == 1
+        assert result[0].content_type == "local_command"
+        assert result[0].role == "assistant"
+        assert result[0].timestamp == TS
+        assert result[0].text == "❯ `/model`\n`Kept model as `Opus 5``"
+
+    def test_user_invoke_system_stdout(self, make_jsonl_entry, make_text_block):
+        result = _parse(
+            make_jsonl_entry("user", [make_text_block(self.INVOKE)]),
+            _sys("local_command", content=self.STDOUT),
+        )
+        assert [r.content_type for r in result] == ["local_command"]
+        assert result[0].text.startswith("❯ `/model`")
+
+    def test_system_invoke_user_stdout(self, make_jsonl_entry, make_text_block):
+        result = _parse(
+            _sys("local_command", content=self.INVOKE),
+            make_jsonl_entry("user", [make_text_block(self.STDOUT)]),
+        )
+        assert [r.content_type for r in result] == ["local_command"]
+        assert result[0].text.startswith("❯ `/model`")
+
+    def test_user_invoke_user_stdout(self, make_jsonl_entry, make_text_block):
+        result = _parse(
+            make_jsonl_entry(
+                "user", [make_text_block("<command-name>/effort</command-name>")]
+            ),
+            make_jsonl_entry(
+                "user",
+                [
+                    make_text_block(
+                        "<local-command-stdout>Cancelled</local-command-stdout>"
+                    )
+                ],
+            ),
+        )
+        assert len(result) == 1
+        assert result[0].text == "❯ `/effort`\n`Cancelled`"
+
+    def test_unrelated_system_entries_do_not_reset_command(self):
+        result = _parse(
+            _sys("local_command", content=self.INVOKE),
+            _sys("turn_duration", durationMs=5, messageCount=3),
+            _sys("stop_hook_summary", hookCount=1),
+            _sys("something_new", content="x"),
+            _sys("local_command", content=self.STDOUT),
+        )
+        assert len(result) == 1
+        assert result[0].text.startswith("❯ `/model`")
+
+    def test_multiline_ansi_stdout(self):
+        content = (
+            "<local-command-stdout> \x1b[1mContext Usage\x1b[22m\n"
+            "\x1b[38;2;136;136;136m⛁ \x1b[38;2;153;153;153m⛁ ⛁ \x1b[39m  Opus 5\n"
+            " 140.6k/1m tokens (14%)\x1b[39m</local-command-stdout>"
+        )
+        result = _parse(
+            _sys("local_command", content="<command-name>/context</command-name>"),
+            _sys("local_command", content=content),
+        )
+        assert len(result) == 1
+        text = result[0].text
+        assert "\x1b" not in text and "[38;2" not in text
+        assert text.startswith("❯ `/context`\n```\n")
+        assert "Context Usage" in text
+        assert "140.6k/1m tokens (14%)" in text
+        assert text.endswith("\n```")
+
+    def test_stdout_without_invoke(self):
+        result = _parse(_sys("local_command", content=self.STDOUT))
+        assert result[0].text == "`Kept model as `Opus 5``"
+
+
+class TestSystemNotices:
+    def test_api_error_first_attempt(self):
+        result = _parse(
+            _sys(
+                "api_error",
+                level="error",
+                error={"message": "Connection error.", "formatted": "Proxy refused"},
+                retryInMs=584,
+                retryAttempt=1,
+                maxRetries=10,
+            )
+        )
+        assert len(result) == 1
+        e = result[0]
+        assert e.role == "assistant"
+        assert e.content_type == "warning"
+        assert e.timestamp == TS
+        assert e.text == "⚠️ API error: Proxy refused — retrying (up to 10×)"
+
+    def test_api_error_falls_back_to_message(self):
+        result = _parse(
+            _sys("api_error", error={"message": "Connection error."}, maxRetries=3)
+        )
+        assert result[0].text == (
+            "⚠️ API error: Connection error. — retrying (up to 3×)"
+        )
+
+    def test_api_error_without_max_retries(self):
+        result = _parse(_sys("api_error", error={"message": "Boom"}, retryAttempt=1))
+        assert result[0].text == "⚠️ API error: Boom"
+
+    def test_api_error_retry_streak_emits_once(self):
+        entries = [
+            _sys("api_error", error={"message": "x"}, retryAttempt=n, maxRetries=10)
+            for n in range(1, 6)
+        ]
+        assert len(_parse(*entries)) == 1
+
+    def test_api_error_later_attempt_alone_ignored(self):
+        assert _parse(_sys("api_error", error={"message": "x"}, retryAttempt=4)) == []
+
+    def test_api_error_then_final_error_message(
+        self, make_jsonl_entry, make_text_block
+    ):
+        final = make_jsonl_entry("assistant", [make_text_block("Connection error.")])
+        final["isApiErrorMessage"] = True
+        result = _parse(
+            _sys("api_error", error={"message": "x"}, retryAttempt=1, maxRetries=2),
+            _sys("api_error", error={"message": "x"}, retryAttempt=2, maxRetries=2),
+            final,
+        )
+        assert [r.content_type for r in result] == ["warning", "error"]
+
+    def test_informational(self):
+        result = _parse(
+            _sys(
+                "informational",
+                content="Usage limit reached · continuing automatically at 5:20pm",
+                level="notice",
+            )
+        )
+        assert result[0].content_type == "info"
+        assert result[0].role == "assistant"
+        assert result[0].timestamp == TS
+        assert result[0].text == (
+            "ℹ️ Usage limit reached · continuing automatically at 5:20pm"
+        )
+
+    def test_compact_boundary_with_tokens(self):
+        result = _parse(
+            _sys(
+                "compact_boundary",
+                content="Conversation compacted",
+                compactMetadata={
+                    "trigger": "manual",
+                    "preTokens": 670887,
+                    "postTokens": 16162,
+                },
+            )
+        )
+        assert result[0].content_type == "info"
+        assert result[0].timestamp == TS
+        assert result[0].text == "🗜 Conversation compacted (670.9k → 16.2k tokens)"
+
+    def test_compact_boundary_millions(self):
+        result = _parse(
+            _sys(
+                "compact_boundary",
+                compactMetadata={"preTokens": 1_250_000, "postTokens": 900},
+            )
+        )
+        assert result[0].text == "🗜 Conversation compacted (1.2M → 900 tokens)"
+
+    def test_compact_boundary_without_metadata(self):
+        result = _parse(_sys("compact_boundary", content="Conversation compacted"))
+        assert result[0].text == "🗜 Conversation compacted"
+
+    @pytest.mark.parametrize(
+        "subtype", ["model_refusal_fallback", "model_refusal_no_fallback"]
+    )
+    def test_model_refusal(self, subtype: str):
+        result = _parse(
+            _sys(subtype, content="Opus 5.5's safeguards flagged this session.")
+        )
+        assert result[0].content_type == "warning"
+        assert result[0].text == "⚠️ Opus 5.5's safeguards flagged this session."
+        assert result[0].timestamp == TS
+
+    def test_model_refusal_empty_content_skipped(self):
+        assert _parse(_sys("model_refusal_fallback", content="")) == []
+        assert _parse(_sys("model_refusal_no_fallback")) == []
+
+    def test_away_summary(self):
+        result = _parse(
+            _sys("away_summary", content="You're upgrading your ccbot fork.")
+        )
+        assert result[0].content_type == "info"
+        assert result[0].text == "📋 You're upgrading your ccbot fork."
+        assert result[0].timestamp == TS
+
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            _sys("turn_duration", durationMs=27432, messageCount=927),
+            _sys("stop_hook_summary", hookCount=1),
+            _sys("brand_new_subtype", content="whatever"),
+            {"type": "system"},
+        ],
+        ids=["turn_duration", "stop_hook_summary", "unknown", "no_subtype"],
+    )
+    def test_ignored_subtypes(self, entry: dict):
+        assert _parse(entry) == []
+
+    def test_system_entries_do_not_tag_turn_state(
+        self, make_jsonl_entry, make_text_block
+    ):
+        a = make_jsonl_entry("assistant", [make_text_block("final")])
+        a["message"]["stop_reason"] = "end_turn"
+        a["message"]["id"] = "msg_x"
+        result = _parse(a, _sys("informational", content="note"))
+        assert [(r.content_type, r.stop_reason) for r in result] == [
+            ("text", "end_turn"),
+            ("info", None),
         ]
