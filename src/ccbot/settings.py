@@ -122,7 +122,7 @@ SETTINGS: list[Setting] = [
         "choice",
         choices=[500, 1500, 3000, 0],
         fmt=_thinking,
-        help="Truncate thinking, or 'full' to send it all in [i/N] parts",
+        help="Cut long thinking here, or 'full' to keep all of it (collapsed)",
     ),
     Setting(
         "show_tool_calls",
@@ -259,6 +259,16 @@ def settings_file():
 
 def get(key: str) -> Any:
     return getattr(config, key)
+
+
+def setting(key: str) -> Setting:
+    """The Setting registered under ``key`` (KeyError if unknown)."""
+    return _BY_KEY[key]
+
+
+def same(a: Any, b: Any) -> bool:
+    """Choice equality that treats 1 and 1.0 alike (settings.json round-trips)."""
+    return _same(a, b)
 
 
 def load() -> None:
