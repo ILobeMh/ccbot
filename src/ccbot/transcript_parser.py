@@ -17,6 +17,7 @@ PendingToolInfo.
 
 import base64
 import difflib
+import html
 import json
 import logging
 import re
@@ -56,6 +57,42 @@ class ToolCall:
     # stdout/stderr, Edit structuredPatch, Agent status, …
     result_meta: dict[str, Any] | None = None
     finished_at: str | None = None  # tool_result timestamp
+
+
+@dataclass
+class TaskNotice:
+    """A ``<task-notification>`` prompt: a background command, agent or
+    monitor reporting back (Claude Code injects it as a user turn)."""
+
+    kind: str  # "command" | "agent" | "monitor" | "other"
+    status: str  # completed | failed | killed | stopped | "" (monitor events)
+    headline: str  # "Background command finished", "Agent failed", …
+    subject: str = ""  # the command / agent or monitor description
+    outcome: str = ""  # "exit 0", "because the system is running low on memory"
+    ok: bool = True
+    body: str = ""  # agent result / monitor event
+    stats: str = ""  # "10m 32s · 115 tool uses · 281.1k tokens"
+    worktree: str = ""  # worktree branch of an isolated agent
+    tool_use_id: str = ""  # the tool call that started the task
+    verb: str = "finished"  # finished | failed | stopped
+
+    @property
+    def subject_is_command(self) -> bool:
+        """Command text, not the Bash description newer Claude Code reports."""
+        s = self.subject.strip()
+        return bool(s) and (
+            s[0].islower() or s[0] in "./~$" or any(c in s for c in "/|&;<>$=`")
+        )
+
+    @property
+    def icon(self) -> str:
+        if self.status in ("killed", "stopped"):
+            return "⏹"
+        if self.status == "failed":
+            return "❌"
+        if self.status == "completed":
+            return "✅" if self.ok else "⚠️"
+        return "📡" if self.kind == "monitor" else "🔔"
 
 
 @dataclass
@@ -192,6 +229,120 @@ class TranscriptParser:
     _RE_SYSTEM_TAGS = re.compile(
         r"<(bash-input|bash-stdout|bash-stderr|local-command-caveat|system-reminder)"
     )
+    _RE_TASK_NOTIFICATION = re.compile(
+        r"^\s*<task-notification>([\s\S]*?)</task-notification>"
+    )
+    _RE_XML_FIELD = re.compile(r"<([a-zA-Z][\w-]*)>([\s\S]*?)</\1>")
+    _RE_TN_COMMAND = re.compile(r'^Background command "([\s\S]*)" ([^"]*)$')
+    _RE_TN_AGENT = re.compile(r'^Agent "([\s\S]*?)" (\w+(?: \w+)?)(?::\s*([\s\S]*))?$')
+    _RE_TN_MONITOR_EVENT = re.compile(r'^Monitor event: "([\s\S]*)"$')
+    _RE_TN_MONITOR = re.compile(r'^Monitor "([\s\S]*?)" ([\s\S]*)$')
+    _RE_EXIT_CODE = re.compile(r"exit code (\d+)(?::\s*([^)]*))?")
+
+    @classmethod
+    def _xml_fields(cls, text: str) -> dict[str, str]:
+        fields: dict[str, str] = {}
+        for m in cls._RE_XML_FIELD.finditer(text):
+            fields.setdefault(m.group(1), html.unescape(m.group(2).strip()))
+        return fields
+
+    @classmethod
+    def parse_task_notification(cls, text: str) -> TaskNotice | None:
+        """Structured view of a ``<task-notification>`` prompt, or None."""
+        m = cls._RE_TASK_NOTIFICATION.match(text)
+        if not m:
+            return None
+        f = cls._xml_fields(m.group(1))
+        summary = f.get("summary", "")
+        status = f.get("status", "")
+        notice = TaskNotice(
+            kind="other",
+            status=status,
+            headline=summary or "Background task update",
+            body=f.get("result") or f.get("event", ""),
+            tool_use_id=f.get("tool-use-id", ""),
+        )
+        verb = {"failed": "failed", "killed": "stopped", "stopped": "stopped"}.get(
+            status, "finished"
+        )
+        notice.verb = verb
+        if cm := cls._RE_TN_COMMAND.match(summary):
+            notice.kind, notice.subject = "command", cm.group(1)
+            notice.headline = f"Background command {verb}"
+            if not notice.subject_is_command:
+                notice.headline, notice.subject = notice.subject, ""
+            rest = cm.group(2).strip()
+            code = cls._RE_EXIT_CODE.search(rest)
+            if code:
+                notice.ok = code.group(1) == "0"
+                notice.outcome = f"exit {code.group(1)}" + (
+                    f": {code.group(2)}" if code.group(2) else ""
+                )
+            elif rest.startswith("was stopped"):
+                notice.outcome = rest.removeprefix("was stopped").strip()
+            elif rest not in ("completed", "finished"):
+                notice.outcome = rest
+        elif am := cls._RE_TN_AGENT.match(summary):
+            notice.kind, notice.subject = "agent", am.group(1)
+            notice.headline = f"Agent {verb}"
+            notice.outcome = (am.group(3) or "").strip()
+        elif mm := cls._RE_TN_MONITOR_EVENT.match(summary):
+            notice.kind, notice.subject, notice.headline = (
+                "monitor",
+                mm.group(1),
+                "Monitor",
+            )
+        elif mm := cls._RE_TN_MONITOR.match(summary):
+            notice.kind, notice.subject = "monitor", mm.group(1)
+            rest = mm.group(2).strip()
+            code = cls._RE_EXIT_CODE.search(rest) or re.search(r"exit (\d+)", rest)
+            notice.headline = (
+                "Monitor failed" if status == "failed" else "Monitor ended"
+            )
+            if status in ("killed", "stopped"):
+                notice.headline = "Monitor stopped"
+            notice.outcome = f"exit {code.group(1)}" if code else ""
+        usage = cls._xml_fields(f.get("usage", "")) if "usage" in f else {}
+        stats = []
+        try:
+            if usage.get("duration_ms"):
+                stats.append(format_duration(int(usage["duration_ms"]) / 1000))
+            if usage.get("tool_uses"):
+                n = int(usage["tool_uses"])
+                stats.append(f"{n} tool use{'s' if n != 1 else ''}")
+            if usage.get("subagent_tokens"):
+                tokens = cls._format_token_count(int(usage["subagent_tokens"]))
+                stats.append(f"{tokens} tokens")
+        except ValueError:
+            pass
+        notice.stats = " · ".join(stats)
+        if "worktree" in f:
+            wt = cls._xml_fields(f["worktree"])
+            notice.worktree = wt.get("worktreeBranch") or wt.get("worktreePath", "")
+        return notice
+
+    @classmethod
+    def format_task_notice(cls, notice: TaskNotice) -> str:
+        """Markdown (classic messages, /history) for a task notification."""
+        if notice.kind == "other":
+            head = f"{notice.icon} {notice.headline}"
+        else:
+            head = f"{notice.icon} **{notice.headline}**"
+        if notice.kind == "command" and not notice.subject:
+            head += f" · {notice.verb}"  # headline is the Bash description
+        if notice.kind != "command" and notice.subject:
+            head += f" · {notice.subject}"
+        for extra in (notice.outcome, notice.stats):
+            if extra:
+                head += f" · {extra}"
+        lines = [head]
+        if notice.kind == "command" and notice.subject:
+            lines.append(f"```bash\n{notice.subject}\n```")
+        if notice.worktree:
+            lines.append(f"🌿 `{notice.worktree}`")
+        if notice.body:
+            lines.append(cls._format_expandable_quote(notice.body))
+        return "\n".join(lines)
 
     @staticmethod
     def _format_edit_diff(old_string: str, new_string: str) -> str:
@@ -934,8 +1085,22 @@ class TranscriptParser:
                 # Add user text if present (skip if message was only tool_results)
                 if user_text_parts:
                     combined = "\n".join(user_text_parts)
+                    notice = cls.parse_task_notification(combined)
+                    if notice is not None:
+                        # Not the user's words: a background task reporting
+                        # back (it still starts a turn)
+                        result.append(
+                            ParsedEntry(
+                                role="assistant",
+                                text=cls.format_task_notice(notice),
+                                content_type="task_notification",
+                                tool_use_id=notice.tool_use_id or None,
+                                timestamp=entry_timestamp,
+                                raw=combined,
+                            )
+                        )
                     # Skip if it looks like local command XML
-                    if not cls._RE_LOCAL_STDOUT.search(
+                    elif not cls._RE_LOCAL_STDOUT.search(
                         combined
                     ) and not cls._RE_COMMAND_NAME.search(combined):
                         result.append(

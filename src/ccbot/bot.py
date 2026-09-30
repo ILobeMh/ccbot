@@ -166,7 +166,11 @@ from .handlers.notifications_topic import (
     record_assistant_text,
     record_turn_start,
 )
-from .handlers.response_builder import build_response_parts, build_rich_parts
+from .handlers.response_builder import (
+    build_response_parts,
+    build_rich_parts,
+    thinking_body,
+)
 from .handlers.resume_offer import offer_lost_bindings, offer_resume
 from .handlers.settings_topic import settings_command
 from .handlers.special_topics import (
@@ -182,6 +186,7 @@ from .handlers.status_polling import (
     status_poll_loop,
 )
 from .markdown_v2 import convert_markdown
+from .rich_render import text_caption
 from .screenshot import text_to_image
 from .session import session_manager
 from .session_monitor import NewMessage, SessionMonitor
@@ -3057,7 +3062,9 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
         if not config.show_thinking and msg.content_type == "thinking":
             continue
 
-        if msg.role == "user" and msg.content_type == "text":
+        if msg.content_type == "task_notification":
+            record_turn_start(wid, msg.timestamp)  # it starts a turn too
+        elif msg.role == "user" and msg.content_type == "text":
             record_turn_start(wid, msg.timestamp)
             if not config.show_user_messages:
                 continue
@@ -3068,6 +3075,19 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
         if parts is None:  # a tool result that adds nothing (e.g. TodoWrite)
             _mark_read(user_id, wid)
             continue
+
+        # Rich: a one-part thinking block may later be titled by the short
+        # reply line that follows it (see message_queue)
+        thinking = caption = None
+        if rich and len(parts) == 1:
+            if msg.content_type == "thinking":
+                thinking = thinking_body(msg.text, msg.raw)
+            elif (
+                msg.content_type == "text"
+                and msg.role == "assistant"
+                and msg.stop_reason != "end_turn"
+            ):
+                caption = text_caption(msg.raw or msg.text)
 
         if msg.is_complete:
             # Enqueue content message task
@@ -3087,6 +3107,8 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
                 turn_key=msg.api_message_id,
                 entry_ts=msg.timestamp,
                 rich=rich,
+                thinking=thinking,
+                caption=caption,
             )
 
             _mark_read(user_id, wid)

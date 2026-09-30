@@ -117,7 +117,7 @@ def _bash(command: str, **res) -> ToolCall:
 
 class TestBash:
     def test_header_has_description_and_full_command(self):
-        cmd = "cat > /opt/probe.py <<'EOF'\n" + "x = 1\n" * 10 + "EOF"
+        cmd = "uv run pytest -q\nuv run pyright"
         (msg,) = rr.render_tool_use(_bash(cmd))
         assert msg.startswith("⚙️ **Testing every config**\n```bash\n")
         assert cmd in msg
@@ -125,8 +125,28 @@ class TestBash:
     def test_long_command_is_folded(self):
         cmd = "\n".join(f"echo {i}" for i in range(60))
         (msg,) = rr.render_tool_use(_bash(cmd))
-        assert "<details><summary>`echo 0` · 60 lines</summary>" in msg
+        assert "<details><summary>$ `echo 0` · 60 lines</summary>" in msg
         assert cmd in msg
+
+    def test_described_command_folds_sooner(self):
+        cmd = "cat > /opt/probe.py <<'EOF'\n" + "x = 1\n" * 4 + "EOF"
+        (described,) = rr.render_tool_use(_bash(cmd))
+        assert (
+            "<details><summary>$ `cat > /opt/probe.py <<'EOF'` · 6 lines" in described
+        )
+        (bare,) = rr.render_tool_use(
+            ToolCall(name="Bash", input={"command": cmd}, started_at=None)
+        )
+        assert bare.startswith("⚙️ **Bash**\n```bash\n")  # nothing else explains it
+
+    def test_one_long_line_preview_drops_cd_and_session_tmp(self):
+        tmp = "/tmp/claude-1000/-root-dev-x/533274d3-bf4b-4bc7-9b16-d3ba2e2d824b/"
+        cmd = f"cd /root/dev/x && ./scripts/test-fast > {tmp}gate.log 2>&1; " * 4
+        (msg,) = rr.render_tool_use(_bash(cmd))
+        summary = msg.split("</summary>")[0]
+        assert "$ `./scripts/test-fast > …/gate.log" in summary
+        assert "lines" not in summary
+        assert cmd.strip() in msg  # the full command is untouched
 
     def test_result_status_duration_and_output(self):
         call = _bash(

@@ -12,6 +12,8 @@ Per-user message queues + worker pattern for all send tasks:
 - tool_use breaks the merge chain and is sent separately (message ID recorded for later editing)
 - tool_result breaks the merge chain and is edited into the tool_use message (preventing order confusion)
 - Merging stops when combined length exceeds 3800 characters (to avoid pagination)
+- Rich style: a short one-line reply right after a thinking block (not the turn's final text) becomes that block's `<summary>` instead of a thinking preview — merged when both are queued together, otherwise edited into the thinking message if it is still the topic's last content (≤20 s)
+- `<task-notification>` prompts (background command / agent / monitor done) are parsed into `task_notification` notices, never merged, and sent as a reply to the tool call that started the task when its message id is known
 
 ## Status Message Handling
 

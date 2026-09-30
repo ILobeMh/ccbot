@@ -12,8 +12,11 @@ Pure functions only (no Telegram I/O); the queue decides how to send.
 Key components:
   - RenderOptions: display knobs (from settings)
   - render_text / render_thinking / render_user_text / render_notice /
-    render_local_command / render_tool_use / render_tool_result:
-    entry → list of message texts (first one first)
+    render_local_command / render_tool_use / render_tool_result /
+    render_task_notice: entry → list of message texts (first one first)
+  - text_caption(): a short narration line ("Now running the tests:") that
+    can title the thinking block before it instead of a thinking preview
+  - command_block(): shell command, folded behind a one-line preview when long
   - escape_prose(): neutralise Rich-Markdown-only syntax ($math$, ==mark==,
     ||spoiler||, raw HTML) in Claude's prose, leaving code untouched
   - split_rich(): fence-aware splitting within the size / block budgets
@@ -30,15 +33,20 @@ from datetime import datetime
 from pathlib import PurePosixPath
 from typing import Any
 
-from .transcript_parser import ToolCall
+from .transcript_parser import TaskNotice, ToolCall
 from .utils import format_duration
 
 # Telegram allows 32768 characters and 500 blocks per rich message; stay
 # clear of both (escapes and our own chrome add a little on top).
 RICH_CHAR_BUDGET = 30000
 RICH_LINE_BUDGET = 400  # non-empty prose lines ≈ upper bound on blocks
-# Long commands are folded into a <details> block past this many lines
-COMMAND_INLINE_LINES = 25
+# A command is folded behind a one-line preview past these sizes; tighter
+# when a Bash description already says what it does
+COMMAND_INLINE = (8, 500)  # (lines, chars)
+COMMAND_INLINE_DESCRIBED = (3, 200)
+COMMAND_PREVIEW_CHARS = 60
+# Longest reply text that may title the thinking block before it
+CAPTION_MAX_CHARS = 280
 
 
 @dataclass(frozen=True)
@@ -357,8 +365,29 @@ def render_text(text: str) -> list[str]:
     return split_rich(escape_prose(text.strip()))
 
 
-def render_thinking(text: str, opts: RenderOptions) -> list[str]:
-    """Thinking as a collapsed block whose summary previews the first line."""
+_BLOCK_START_RE = re.compile(r"^\s*(?:[-*+>#|]|\d+[.)]\s|`{3}|~{3})")
+
+
+def text_caption(text: str) -> str | None:
+    """Inline markdown for a short one-line reply, else None.
+
+    Narration like "Now running the tests:" titles the thinking block that
+    led to it better than a preview of the thinking's own first line.
+    """
+    t = text.strip()
+    if not t or "\n" in t or len(t) > CAPTION_MAX_CHARS or _BLOCK_START_RE.match(t):
+        return None
+    return _escape_outside_inline_code(t)
+
+
+def render_thinking(
+    text: str, opts: RenderOptions, caption: str | None = None
+) -> list[str]:
+    """Thinking as a collapsed block.
+
+    The summary is ``caption`` (inline markdown, see text_caption) when given
+    and the thinking fits one message, else a preview of its first line.
+    """
     body = text.strip()
     if opts.thinking_max_chars and len(body) > opts.thinking_max_chars:
         body = body[: opts.thinking_max_chars].rstrip() + "\n\n_… (truncated)_"
@@ -370,7 +399,9 @@ def render_thinking(text: str, opts: RenderOptions) -> list[str]:
     out = []
     for i, chunk in enumerate(chunks, 1):
         label = escape_inline(preview) or "Thinking"
-        if n > 1:
+        if caption and n == 1:
+            label = caption
+        elif n > 1:
             label = f"{label} ({i}/{n})"
         out.append(details(f"💭 {label}", chunk))
     return out
@@ -383,6 +414,33 @@ def render_user_text(text: str) -> list[str]:
 def render_notice(text: str) -> list[str]:
     """Errors / warnings / info lines (already carry their emoji)."""
     return split_rich(escape_prose(text.strip()))
+
+
+def render_task_notice(notice: TaskNotice) -> list[str]:
+    """A background command / agent / monitor reporting back."""
+    if notice.kind == "other":
+        head = f"{notice.icon} {escape_inline(notice.headline)}"
+    else:
+        head = f"{notice.icon} **{escape_inline(notice.headline)}**"
+    if notice.kind == "command" and not notice.subject:
+        head += f" · {notice.verb}"  # the headline is the Bash description
+    if notice.kind != "command" and notice.subject:
+        head += f" · {escape_inline(notice.subject)}"
+    for extra in (notice.outcome, notice.stats):
+        if extra:
+            head += f" · {escape_inline(extra)}"
+    lines = [head]
+    if notice.kind == "command" and notice.subject:
+        lines.append(command_block(notice.subject, inline=(1, 80)))
+    if notice.worktree:
+        lines.append(f"🌿 {inline_code(notice.worktree)}")
+    body = notice.body.strip()
+    if body and notice.kind == "agent":
+        lines.append(details("Result", escape_prose(body)))
+    elif body:
+        multi = "\n" in body or len(body) > 300
+        lines.append(code_block(body, "text") if multi else escape_prose(body))
+    return split_rich("\n".join(lines))
 
 
 def render_local_command(command: str, output: str) -> list[str]:
@@ -437,6 +495,32 @@ def _todo_list(todos: Any) -> str:
     return "\n".join(lines)
 
 
+# `cd <dir> && ` — Claude's usual prefix, noise in a one-line preview
+_CD_PREFIX_RE = re.compile(r"^cd\s+(?:\"[^\"]*\"|'[^']*'|\S+)\s*&&\s*")
+# Claude Code's per-session temp dir: /tmp/claude-<uid>/<project>/<session>/
+_CC_TMP_RE = re.compile(r"(?:/private)?/tmp/claude-\d+/[^/\s]+/[0-9a-f-]{36}/")
+
+
+def _command_preview(cmd: str) -> str:
+    first = next((ln.strip() for ln in cmd.split("\n") if ln.strip()), "")
+    first = _CC_TMP_RE.sub("…/", _CD_PREFIX_RE.sub("", first) or first)
+    if len(first) > COMMAND_PREVIEW_CHARS:
+        first = first[: COMMAND_PREVIEW_CHARS - 1].rstrip() + "…"
+    return first
+
+
+def command_block(cmd: str, inline: tuple[int, int] = COMMAND_INLINE) -> str:
+    """A shell command in full: shown as is when small, else folded behind
+    a one-line preview (``inline`` = the (lines, chars) shown unfolded)."""
+    n = _lines(cmd)
+    if n <= inline[0] and len(cmd) <= inline[1]:
+        return code_block(cmd, "bash")
+    summary = f"$ {inline_code(_command_preview(cmd))}"
+    if n > 1:
+        summary += f" · {_plural(n, 'line')}"
+    return details(summary, code_block(cmd, "bash"))
+
+
 def tool_header(call: ToolCall) -> str:
     """The tool_use message: what is being run, in full."""
     inp, name = call.input, call.name
@@ -446,15 +530,7 @@ def tool_header(call: ToolCall) -> str:
         title = f"⚙️ **{escape_inline(desc)}**" if desc else "⚙️ **Bash**"
         if inp.get("run_in_background"):
             title += " · background"
-        n = _lines(cmd)
-        if n > COMMAND_INLINE_LINES:
-            first = cmd.split("\n", 1)[0]
-            first = first if len(first) <= 60 else first[:59] + "…"
-            body = details(
-                f"{inline_code(first)} · {_plural(n, 'line')}", code_block(cmd, "bash")
-            )
-        else:
-            body = code_block(cmd, "bash")
+        body = command_block(cmd, COMMAND_INLINE_DESCRIBED if desc else COMMAND_INLINE)
         return f"{title}\n{body}"
     if name == "Read":
         path = _s(inp, "file_path")

@@ -7,6 +7,9 @@ Provides a queue-based message processing system that ensures:
     they always land after the content that preceded them; content that
     still arrives while a UI is open re-posts the UI below it
   - Consecutive content messages can be merged for efficiency
+  - Rich style: a short reply line right after a thinking block becomes that
+    block's title (merged, or edited into the already-sent thinking message)
+  - Task notifications reply to the tool call that started the task
   - Thread-aware sending: each MessageTask carries an optional thread_id
     for Telegram topic support
 
@@ -24,13 +27,14 @@ Key components:
 import asyncio
 import logging
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
 from aiogram import Bot
 from aiogram.enums import ChatAction
 from aiogram.exceptions import TelegramRetryAfter
-from aiogram.types import Message
+from aiogram.types import Message, ReplyParameters
 
 from ..rich_render import RICH_CHAR_BUDGET, RICH_LINE_BUDGET
 from ..session import session_manager
@@ -52,6 +56,7 @@ from .message_sender import (
     send_with_fallback,
 )
 from .notifications_topic import record_sent
+from .response_builder import titled_thinking
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +95,11 @@ class MessageTask:
     # parts are rich_render markdown (sendRichMessage) instead of MarkdownV2
     # source; consecutive rich parts are packed into as few messages as fit
     rich: bool = False
+    # Rich only. ``thinking``: raw body of a one-part thinking task, whose
+    # summary a following reply line may replace. ``caption``: that summary,
+    # offered by a short one-line reply (rich_render.text_caption)
+    thinking: str | None = None
+    caption: str | None = None
 
 
 # Per-user message queues and worker tasks
@@ -112,6 +122,28 @@ UI_SEND_BACKOFF = 10.0
 
 # Flood control: user_id -> monotonic time when ban expires
 _flood_until: dict[int, float] = {}
+
+
+@dataclass
+class _OpenThinking:
+    """A sent message ending in a thinking block that is still the topic's
+    last content: the next short reply line can become its title."""
+
+    message_id: int
+    window_id: str
+    head: str  # the message's markdown before the thinking block
+    thinking: str  # raw thinking body
+    sent_at: float
+
+
+_open_thinking: dict[tuple[int, int], _OpenThinking] = {}
+# Only a reply that follows this soon is folded into the sent thinking
+TITLE_EDIT_WINDOW = 20.0
+
+# (tool_use_id, user_id, thread_id_or_0) -> tool_use message id, kept after
+# the result edit so a task notification can reply to its tool call
+_recent_tool_msgs: OrderedDict[tuple[str, int, int], int] = OrderedDict()
+_RECENT_TOOL_MSGS_MAX = 500
 
 # Max seconds to wait for flood control before dropping tasks
 FLOOD_CONTROL_MAX_WAIT = 10
@@ -166,7 +198,7 @@ def _can_merge_tasks(base: MessageTask, candidate: MessageTask) -> bool:
     return True
 
 
-_UNMERGEABLE = frozenset({"tool_use", "tool_result", "error"})
+_UNMERGEABLE = frozenset({"tool_use", "tool_result", "error", "task_notification"})
 
 
 async def _merge_content_tasks(
@@ -200,6 +232,20 @@ async def _merge_content_tasks(
                 # Can't merge, keep this and all remaining items
                 remaining = items[i:]
                 break
+
+            prev = merged_tasks[-1]
+            titled = (
+                titled_thinking(prev.thinking, task.caption)
+                if first.rich and task.caption and prev.thinking is not None
+                else None
+            )
+            if titled is not None:
+                # The reply line becomes the title of the thinking before it
+                current_length += len(titled) - len(merged_parts[-1])
+                merged_parts[-1] = titled
+                merge_count += 1
+                merged_tasks.append(task)
+                continue
 
             # Check length before merging
             task_length = sum(len(p) for p in task.parts)
@@ -243,6 +289,8 @@ async def _merge_content_tasks(
             entry_ts=merged_tasks[-1].entry_ts,
             thread_id=first.thread_id,
             rich=first.rich,
+            thinking=merged_tasks[-1].thinking,
+            caption=first.caption,
         ),
         merge_count,
     )
@@ -396,6 +444,7 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
     # (still open) UI again and re-posts it exactly once, after the content.
     await _send_content_task(bot, user_id, task)
     if ui_waiting:
+        _open_thinking.pop((user_id, task.thread_id or 0), None)
         await handle_interactive_ui(
             bot, user_id, task.window_id or "", task.thread_id, force_new=True
         )
@@ -464,6 +513,7 @@ def clear_pending_interactive(user_id: int, thread_id: int | None) -> None:
 async def _show_interactive(bot: Bot, user_id: int, task: MessageTask) -> None:
     wid = task.window_id or ""
     key = (user_id, task.thread_id or 0)
+    _open_thinking.pop(key, None)
     waited = 0.0
     while True:
         if await handle_interactive_ui(bot, user_id, wid, task.thread_id):
@@ -506,6 +556,8 @@ async def _send_content_task(bot: Bot, user_id: int, task: MessageTask) -> None:
     wid = task.window_id or ""
     tid = task.thread_id or 0
     chat_id = session_manager.resolve_chat_id(user_id, task.thread_id)
+    # Whatever this task sends, an earlier thinking message stops being last
+    open_thinking = _open_thinking.pop((user_id, tid), None)
 
     # 1. Handle tool_result editing (merged parts are edited together)
     if task.content_type == "tool_result" and task.tool_use_id:
@@ -534,10 +586,42 @@ async def _send_content_task(bot: Bot, user_id: int, task: MessageTask) -> None:
             logger.debug(f"Failed to edit tool msg {edit_msg_id}, sending new")
             # Fall through to send as new message
 
-    # 2. Send content messages, converting status message to first content part
-    first_part = True
     last_msg_id: int | None = None
-    parts = _pack_rich(task.parts) if task.rich else task.parts
+
+    # 2a. A short reply line right after a sent thinking block: edit it in as
+    # that block's title (with whatever else fits) instead of a new message
+    parts: list[str] | None = None  # set when already packed
+    last_markdown = ""
+    if task.rich and task.caption and open_thinking is not None:
+        titled = (
+            titled_thinking(open_thinking.thinking, task.caption)
+            if open_thinking.window_id == wid
+            and time.monotonic() - open_thinking.sent_at < TITLE_EDIT_WINDOW
+            else None
+        )
+        if titled is not None:
+            head = open_thinking.head
+            packed = _pack_rich(
+                [f"{head}\n\n{titled}" if head else titled, *task.parts[1:]]
+            )
+            if await edit_rich(bot, chat_id, open_thinking.message_id, packed[0]):
+                last_msg_id = open_thinking.message_id
+                last_markdown = packed[0]
+                parts = packed[1:]
+
+    # 2b. Send content messages, converting status message to first content part
+    reply_to = (
+        _recent_tool_msgs.get((task.tool_use_id, user_id, tid))
+        if task.content_type == "task_notification" and task.tool_use_id
+        else None
+    )
+    if reply_to is not None:
+        # A reply can't be made by editing: drop the status message instead
+        await _do_clear_status_message(bot, user_id, tid)
+    first_part = reply_to is None
+    if parts is None:
+        parts = _pack_rich(task.parts) if task.rich else task.parts
+    last_ok = True
     for part in parts:
         sent = None
 
@@ -548,17 +632,35 @@ async def _send_content_task(bot: Bot, user_id: int, task: MessageTask) -> None:
                 bot, user_id, tid, wid, part, rich=task.rich
             )
             if converted_msg_id is not None:
-                last_msg_id = converted_msg_id
+                last_msg_id, last_markdown = converted_msg_id, part
                 continue
 
-        sent = await _send_part(bot, chat_id, part, task)
-
+        sent = await _send_part(bot, chat_id, part, task, reply_to=reply_to)
+        reply_to = None
+        last_ok = sent is not None
         if sent:
-            last_msg_id = sent.message_id
+            last_msg_id, last_markdown = sent.message_id, part
 
     # 3. Record tool_use message ID for later editing
     if last_msg_id and task.tool_use_id and task.content_type == "tool_use":
         _tool_msg_ids[(task.tool_use_id, user_id, tid)] = last_msg_id
+        _remember_tool_msg((task.tool_use_id, user_id, tid), last_msg_id)
+    # A message ending in a lone thinking block: the next reply line may
+    # still become its title
+    if (
+        task.rich
+        and task.thinking is not None
+        and last_msg_id
+        and last_ok
+        and last_markdown.endswith(task.parts[-1])
+    ):
+        _open_thinking[(user_id, tid)] = _OpenThinking(
+            message_id=last_msg_id,
+            window_id=wid,
+            head=last_markdown[: -len(task.parts[-1])].rstrip("\n"),
+            thinking=task.thinking,
+            sent_at=time.monotonic(),
+        )
     if last_msg_id:
         await record_sent(
             wid,
@@ -578,12 +680,29 @@ async def _send_content_task(bot: Bot, user_id: int, task: MessageTask) -> None:
 
 
 async def _send_part(
-    bot: Bot, chat_id: int, part: str, task: MessageTask
+    bot: Bot,
+    chat_id: int,
+    part: str,
+    task: MessageTask,
+    *,
+    reply_to: int | None = None,
 ) -> Message | None:
     """Send one part of a content task (rich or MarkdownV2)."""
+    kwargs: dict[str, Any] = dict(_send_kwargs(task.thread_id))
+    if reply_to is not None:
+        kwargs["reply_parameters"] = ReplyParameters(
+            message_id=reply_to, allow_sending_without_reply=True
+        )
     if task.rich:
-        return await send_rich(bot, chat_id, part, **_send_kwargs(task.thread_id))
-    return await send_with_fallback(bot, chat_id, part, **_send_kwargs(task.thread_id))
+        return await send_rich(bot, chat_id, part, **kwargs)
+    return await send_with_fallback(bot, chat_id, part, **kwargs)
+
+
+def _remember_tool_msg(key: tuple[str, int, int], message_id: int) -> None:
+    _recent_tool_msgs[key] = message_id
+    _recent_tool_msgs.move_to_end(key)
+    while len(_recent_tool_msgs) > _RECENT_TOOL_MSGS_MAX:
+        _recent_tool_msgs.popitem(last=False)
 
 
 def _pack_rich(parts: list[str]) -> list[str]:
@@ -786,8 +905,11 @@ async def enqueue_content_message(
     turn_key: str | None = None,
     entry_ts: str | None = None,
     rich: bool = False,
+    thinking: str | None = None,
+    caption: str | None = None,
 ) -> None:
-    """Enqueue a content message task (``rich``: parts are rich markdown)."""
+    """Enqueue a content message task (``rich``: parts are rich markdown;
+    ``thinking`` / ``caption``: see MessageTask)."""
     logger.debug(
         "Enqueue content: user=%d, window_id=%s, content_type=%s",
         user_id,
@@ -809,6 +931,8 @@ async def enqueue_content_message(
         turn_key=turn_key,
         entry_ts=entry_ts,
         rich=rich,
+        thinking=thinking,
+        caption=caption,
     )
     queue.put_nowait(task)
 
@@ -903,6 +1027,9 @@ def clear_tool_msg_ids_for_topic(user_id: int, thread_id: int | None = None) -> 
     ]
     for key in keys_to_remove:
         _tool_msg_ids.pop(key, None)
+    for key in [k for k in _recent_tool_msgs if k[1] == user_id and k[2] == tid]:
+        _recent_tool_msgs.pop(key, None)
+    _open_thinking.pop((user_id, tid), None)
 
 
 async def shutdown_workers() -> None:

@@ -14,6 +14,9 @@ Key functions:
   - build_rich_parts: Rich-message markdown via rich_render (message_format
     "rich"); None for a tool_result that adds nothing to its tool_use message
   - render_options: RenderOptions from the live settings
+  - thinking_body / titled_thinking: re-render a thinking block with the
+    reply line that followed it as its summary (the queue does this when
+    the reply arrives)
 """
 
 from .. import rich_render
@@ -33,6 +36,18 @@ def render_options() -> rich_render.RenderOptions:
         expand_output=bool(config.expand_output),
         thinking_max_chars=int(config.thinking_max_chars),
     )
+
+
+def thinking_body(text: str, raw: str | None) -> str:
+    """The thinking text a rich thinking part was rendered from."""
+    return raw or _strip_sentinels(text)
+
+
+def titled_thinking(body: str, caption: str) -> str | None:
+    """One thinking block summarised by ``caption`` (None if it needs more
+    than one message)."""
+    parts = rich_render.render_thinking(body, render_options(), caption=caption)
+    return parts[0] if len(parts) == 1 else None
 
 
 def _strip_sentinels(text: str) -> str:
@@ -64,10 +79,14 @@ def build_rich_parts(
         except ValueError:
             seconds = 0.0
         return [f"_{text}_"] if seconds >= TURN_FOOTER_MIN_SECONDS else None
+    if content_type == "task_notification":
+        notice = TranscriptParser.parse_task_notification(raw or "")
+        if notice is not None:
+            return rich_render.render_task_notice(notice)
     if role == "user":
         return rich_render.render_user_text(raw or text)
     if content_type == "thinking":
-        return rich_render.render_thinking(raw or _strip_sentinels(text), opts)
+        return rich_render.render_thinking(thinking_body(text, raw), opts)
     if tool is not None and tool.name:
         if content_type == "tool_use":
             return rich_render.render_tool_use(tool)
