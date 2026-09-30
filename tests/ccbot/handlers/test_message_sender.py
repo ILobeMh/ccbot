@@ -146,6 +146,15 @@ class TestEditWithFallback:
         with pytest.raises(TelegramRetryAfter):
             await edit_with_fallback(bot, 1, 10, "text")
 
+    @pytest.mark.asyncio
+    async def test_gateway_5xx_assumed_delivered(self):
+        """A 502/504 may come after Telegram applied the edit: no duplicate."""
+        from aiogram.exceptions import TelegramServerError
+
+        bot = _bot([TelegramServerError(method=_M, message="Bad Gateway")])
+        assert await edit_with_fallback(bot, 1, 10, "text") is True
+        assert bot.edit_message_text.await_count == 1
+
 
 class TestSafeEditTargets:
     @pytest.mark.asyncio

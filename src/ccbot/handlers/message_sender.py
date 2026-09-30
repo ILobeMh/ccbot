@@ -12,6 +12,8 @@ Functions:
   - safe_edit: Edit message with formatting, fallback to plain text
   - safe_send: Send message with formatting, fallback to plain text
   - edit_with_fallback: Edit by (chat_id, message_id), returns success bool
+  - send_rich / edit_rich: Rich messages (Bot API 10.1, rich_render markdown);
+    a rejected rich text is resent / re-edited as plain text
   - run_with_fallback: The shared policy behind all of the above
 
 Fallback policy (see run_with_fallback): only a TelegramBadRequest (i.e.
@@ -34,16 +36,19 @@ from aiogram.exceptions import (
     TelegramBadRequest,
     TelegramNetworkError,
     TelegramRetryAfter,
+    TelegramServerError,
 )
 from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
     InputMediaPhoto,
+    InputRichMessage,
     LinkPreviewOptions,
     Message,
 )
 
 from ..markdown_v2 import convert_markdown
+from ..rich_render import is_rtl
 from ..transcript_parser import TranscriptParser
 
 logger = logging.getLogger(__name__)
@@ -73,6 +78,11 @@ PARSE_MODE = "MarkdownV2"
 NO_LINK_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
 _NOT_MODIFIED = "message is not modified"
+
+# The request may well have reached Telegram: never resend / report failure.
+# 5xx gateway errors (TelegramServerError) count too — PTB mapped them to
+# NetworkError, and treating them as failure made the queue post duplicates.
+_TRANSPORT_ERRORS = (TelegramNetworkError, TelegramServerError)
 
 
 def _is_not_modified(e: TelegramBadRequest) -> bool:
@@ -104,7 +114,7 @@ async def run_with_fallback(
         if _is_not_modified(e):
             return None
         logger.warning("%s: MarkdownV2 rejected, falling back to plain: %s", what, e)
-    except TelegramNetworkError as e:
+    except _TRANSPORT_ERRORS as e:
         logger.warning("%s: transport error, not retrying: %s", what, e)
         if raise_on_failure:
             raise
@@ -269,7 +279,7 @@ async def edit_with_fallback(
         if _is_not_modified(e):
             return True
         logger.warning("%s: MarkdownV2 rejected, falling back to plain: %s", what, e)
-    except TelegramNetworkError as e:
+    except _TRANSPORT_ERRORS as e:
         logger.warning("%s: transport error, not retrying: %s", what, e)
         return True
     except Exception as e:
@@ -292,7 +302,7 @@ async def edit_with_fallback(
             return True
         logger.debug("%s: plain-text fallback rejected: %s", what, e)
         return False
-    except TelegramNetworkError as e:
+    except _TRANSPORT_ERRORS as e:
         logger.warning("%s: transport error on fallback, not retrying: %s", what, e)
         return True
     except Exception as e:
@@ -323,3 +333,115 @@ async def safe_send(
         ),
         f"send_message({chat_id})",
     )
+
+
+def _rich(markdown: str) -> InputRichMessage:
+    return InputRichMessage(
+        markdown=markdown, is_rtl=True if is_rtl(markdown) else None
+    )
+
+
+_EDIT_GONE = ("message to edit not found", "message can't be edited")
+
+
+async def send_rich(
+    bot: Bot,
+    chat_id: int,
+    markdown: str,
+    **kwargs: Any,
+) -> Message | None:
+    """Send a rich message; if Telegram rejects the markdown, send it as plain text.
+
+    Returns the sent Message, or None on failure. Transport errors are not
+    retried (the message may have been delivered). TelegramRetryAfter is
+    re-raised for the queue worker.
+    """
+    try:
+        return await bot.send_rich_message(
+            chat_id=chat_id, rich_message=_rich(markdown), **kwargs
+        )
+    except TelegramRetryAfter:
+        raise
+    except TelegramBadRequest as e:
+        logger.warning("send_rich_message(%s) rejected, sending plain: %s", chat_id, e)
+    except _TRANSPORT_ERRORS as e:
+        logger.warning(
+            "send_rich_message(%s): transport error, not retrying: %s", chat_id, e
+        )
+        return None
+    except Exception as e:
+        logger.error("send_rich_message(%s) failed: %s", chat_id, e)
+        return None
+    kwargs.pop("link_preview_options", None)
+    try:
+        return await bot.send_message(
+            chat_id=chat_id,
+            text=markdown,
+            parse_mode=None,
+            link_preview_options=NO_LINK_PREVIEW,
+            **kwargs,
+        )
+    except TelegramRetryAfter:
+        raise
+    except Exception as e:
+        logger.error("send_message(%s) plain fallback failed: %s", chat_id, e)
+        return None
+
+
+async def edit_rich(
+    bot: Bot,
+    chat_id: int,
+    message_id: int,
+    markdown: str,
+    **kwargs: Any,
+) -> bool:
+    """Edit a message (rich or plain) into a rich one.
+
+    Same contract as edit_with_fallback: True when edited, unchanged, or the
+    outcome is unknown (transport error); False when the message can't be
+    edited any more (caller sends a new one). Markdown Telegram rejects is
+    re-edited as plain text.
+    """
+    what = f"edit_rich({message_id})"
+    try:
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            rich_message=_rich(markdown),
+            **kwargs,
+        )
+        return True
+    except TelegramRetryAfter:
+        raise
+    except TelegramBadRequest as e:
+        if _is_not_modified(e):
+            return True
+        if any(g in str(e).lower() for g in _EDIT_GONE):
+            logger.debug("%s: %s", what, e)
+            return False
+        logger.warning("%s: rich text rejected, editing plain: %s", what, e)
+    except _TRANSPORT_ERRORS as e:
+        logger.warning("%s: transport error, not retrying: %s", what, e)
+        return True
+    except Exception as e:
+        logger.error("%s failed: %s", what, e)
+        return False
+    try:
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=markdown,
+            parse_mode=None,
+            link_preview_options=NO_LINK_PREVIEW,
+            **kwargs,
+        )
+        return True
+    except TelegramRetryAfter:
+        raise
+    except TelegramBadRequest as e:
+        return _is_not_modified(e)
+    except _TRANSPORT_ERRORS:
+        return True
+    except Exception as e:
+        logger.error("%s: plain fallback failed: %s", what, e)
+        return False

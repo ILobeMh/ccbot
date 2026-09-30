@@ -85,16 +85,26 @@ class TelegramRateLimiter(BaseRequestMiddleware):
         overall_per_second: float = 30,
         group_per_minute: float = 20,
         max_retries: int = 5,
+        prefill: bool = True,
     ) -> None:
         self._overall = AsyncLimiter(overall_per_second, 1)
         # Telegram's server-side counter survives our restarts: start with
-        # the bucket full so capacity drains in over ~1 s instead of bursting
-        self._overall._level = self._overall.max_rate
+        # the bucket full so capacity drains in over ~1 s instead of bursting.
+        # Done on first use, inside the running loop (see _prefill).
+        self._prefill_pending = prefill
         self._group_rate = group_per_minute
         self._groups: dict[int | str, AsyncLimiter] = {}
         self._max_retries = max_retries
         self._not_paused = asyncio.Event()
         self._not_paused.set()
+
+    def _prefill(self) -> None:
+        """Fill the global bucket once. aiolimiter drains ``_level`` by the time
+        since ``_last_check`` (initially 0), so both must be set together."""
+        if self._prefill_pending:
+            self._prefill_pending = False
+            self._overall._level = self._overall.max_rate
+            self._overall._last_check = asyncio.get_running_loop().time()
 
     def _group_limiter(self, chat_id: int | str) -> AsyncLimiter:
         limiter = self._groups.get(chat_id)
@@ -111,6 +121,7 @@ class TelegramRateLimiter(BaseRequestMiddleware):
         chat_id = getattr(method, "chat_id", None)
         if chat_id is None:  # getUpdates, getMe, getFile, …: not limited
             return await make_request(bot, method)
+        self._prefill()
         group = (
             self._group_limiter(chat_id)
             if _is_group(chat_id) and method.__api_method__ in MESSAGE_CREATING_METHODS
@@ -167,5 +178,10 @@ def build_bot(token: str, *, request_timeout: float = 30.0) -> Bot:
     return Bot(
         token,
         session=session,
-        default=DefaultBotProperties(link_preview=LinkPreviewOptions(is_disabled=True)),
+        default=DefaultBotProperties(
+            link_preview=LinkPreviewOptions(is_disabled=True),
+            # a reply whose original was deleted meanwhile (text merge / album
+            # flush delay) is sent anyway instead of failing
+            allow_sending_without_reply=True,
+        ),
     )

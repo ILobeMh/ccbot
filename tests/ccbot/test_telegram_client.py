@@ -11,9 +11,8 @@ from ccbot import telegram_client as tc
 
 
 def _limiter(**kw) -> tc.TelegramRateLimiter:
-    lim = tc.TelegramRateLimiter(**kw)
-    lim._overall._level = 0  # tests shouldn't wait for the startup pre-fill
-    return lim
+    kw.setdefault("prefill", False)  # tests shouldn't wait for the pre-fill
+    return tc.TelegramRateLimiter(**kw)
 
 
 @pytest.mark.asyncio
@@ -69,10 +68,27 @@ async def test_group_budget_only_for_message_creating_calls():
 
 @pytest.mark.asyncio
 async def test_calls_without_chat_id_bypass_limits():
-    lim = _limiter()
-    lim._overall._level = lim._overall.max_rate  # bucket empty: would wait
+    lim = tc.TelegramRateLimiter(overall_per_second=1)  # pre-filled: 1 s wait
     ok = AsyncMock(return_value="me")
     assert await asyncio.wait_for(lim(ok, MagicMock(), GetMe()), 0.5) == "me"
+
+
+@pytest.mark.asyncio
+async def test_prefill_really_throttles_the_first_burst():
+    """After a restart the bucket starts full: a burst drains in at the rate."""
+    lim = tc.TelegramRateLimiter(overall_per_second=100)
+    ok = AsyncMock(return_value="ok")
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    for _ in range(20):
+        await lim(ok, MagicMock(), SendMessage(chat_id=5, text="x"))
+    assert loop.time() - start >= 0.15  # ~20 / 100 s, not instant
+
+    cold = tc.TelegramRateLimiter(overall_per_second=100, prefill=False)
+    start = loop.time()
+    for _ in range(20):
+        await cold(ok, MagicMock(), SendMessage(chat_id=5, text="x"))
+    assert loop.time() - start < 0.1
 
 
 @pytest.mark.parametrize(
