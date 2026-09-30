@@ -9,11 +9,11 @@ from ccbot import bot as bot_mod
 from ccbot.config import config
 
 
-def _text_update(text: str, user_id: int = 1) -> MagicMock:
-    update = MagicMock()
-    update.effective_user.id = user_id
-    update.message.text = text
-    return update
+def _text_message(text: str, user_id: int = 1) -> MagicMock:
+    message = MagicMock()
+    message.from_user.id = user_id
+    message.text = text
+    return message
 
 
 @pytest.fixture(autouse=True)
@@ -28,28 +28,33 @@ def _clean():
 class TestTextMerge:
     @pytest.mark.asyncio
     async def test_parts_within_window_are_joined(self):
-        handled: list[str] = []
+        handled: list[tuple] = []
 
-        async def _record(_u, _c, text):
-            handled.append(text)
+        async def _record(message, bot, user_data, text):
+            handled.append((message, bot, user_data, text))
 
+        bot = MagicMock()
+        user_data: dict = {}
+        first = _text_message("part one")
         with (
             patch("ccbot.bot.is_user_allowed", return_value=True),
             patch("ccbot.bot._get_thread_id", return_value=42),
             patch("ccbot.bot._handle_text", side_effect=_record),
             patch.object(config, "text_merge_window", 0.05),
         ):
-            for part in ("part one", "part two", "part three"):
-                await bot_mod.text_handler(_text_update(part), MagicMock())
+            await bot_mod.text_handler(first, bot, user_data)
+            for part in ("part two", "part three"):
+                await bot_mod.text_handler(_text_message(part), bot, user_data)
             assert handled == []
             await asyncio.sleep(0.2)
-        assert handled == ["part one\npart two\npart three"]
+        # Replayed with the first message, the bot and the user's data
+        assert handled == [(first, bot, user_data, "part one\npart two\npart three")]
 
     @pytest.mark.asyncio
     async def test_window_zero_processes_immediately(self):
         handled: list[str] = []
 
-        async def _record(_u, _c, text):
+        async def _record(_message, _bot, _user_data, text):
             handled.append(text)
 
         with (
@@ -57,8 +62,8 @@ class TestTextMerge:
             patch("ccbot.bot._handle_text", side_effect=_record),
             patch.object(config, "text_merge_window", 0.0),
         ):
-            await bot_mod.text_handler(_text_update("a"), MagicMock())
-            await bot_mod.text_handler(_text_update("b"), MagicMock())
+            await bot_mod.text_handler(_text_message("a"), MagicMock(), {})
+            await bot_mod.text_handler(_text_message("b"), MagicMock(), {})
         assert handled == ["a", "b"]
 
 
@@ -66,15 +71,13 @@ class TestConfirmText:
     @pytest.mark.asyncio
     async def test_stage_and_append(self):
         msg = MagicMock()
-        msg.reply_text = AsyncMock(
-            return_value=MagicMock(edit_reply_markup=AsyncMock())
-        )
+        msg.reply = AsyncMock(return_value=MagicMock(edit_reply_markup=AsyncMock()))
         await bot_mod._stage_text(msg, 1, 42, "@1", "hello")
         await bot_mod._stage_text(msg, 1, 42, "@1", "more")
         pending = bot_mod._pending_texts[(1, 42)]
         assert pending["text"] == "hello\n\nmore"
-        assert msg.reply_text.await_count == 2
-        first_prompt = msg.reply_text.return_value
+        assert msg.reply.await_count == 2
+        first_prompt = msg.reply.return_value
         first_prompt.edit_reply_markup.assert_awaited()
 
     def test_prompt_preview_is_truncated(self):

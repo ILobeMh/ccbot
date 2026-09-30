@@ -9,7 +9,7 @@ Functions:
 
 from typing import Any
 
-from telegram import Bot
+from aiogram import Bot
 
 from .interactive_ui import clear_interactive_msg
 from .message_queue import (

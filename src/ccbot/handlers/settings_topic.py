@@ -15,10 +15,16 @@ Key components:
 from __future__ import annotations
 
 import logging
+from typing import Any
 
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import TelegramError
-from telegram.ext import ContextTypes
+from aiogram import Bot
+from aiogram.exceptions import TelegramAPIError, TelegramNetworkError
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 
 from .. import settings
 from ..config import config
@@ -47,13 +53,14 @@ def render_settings() -> tuple[str, InlineKeyboardMarkup]:
         rows.append(
             [
                 InlineKeyboardButton(
-                    f"{s.label}: {value}{arrow}", callback_data=f"{CB_SETTING}{s.key}"
+                    text=f"{s.label}: {value}{arrow}",
+                    callback_data=f"{CB_SETTING}{s.key}",
                 )
             ]
         )
     lines.append("")
     lines.append(f"_file: `{settings.settings_file()}`_")
-    return "\n".join(lines), InlineKeyboardMarkup(rows)
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 class SettingsTopic:
@@ -75,23 +82,18 @@ class SettingsTopic:
             await bot.pin_chat_message(
                 chat_id=chat_id, message_id=msg.message_id, disable_notification=True
             )
-        except TelegramError as e:
+        except (TelegramAPIError, TelegramNetworkError) as e:
             logger.warning("settings dashboard: %s", e)
 
     async def handle_text(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str
+        self, message: Message, bot: Bot, user_data: dict[str, Any], text: str
     ) -> None:
-        if update.message is None:
-            return
         body, kb = render_settings()
-        await safe_reply(update.message, body, reply_markup=kb)
+        await safe_reply(message, body, reply_markup=kb)
 
     async def handle_callback(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, data: str
+        self, query: CallbackQuery, bot: Bot, user_data: dict[str, Any], data: str
     ) -> None:
-        query = update.callback_query
-        if query is None:
-            return
         key = data[len(CB_SETTING) :]
         try:
             value = settings.cycle(key)
@@ -105,13 +107,13 @@ class SettingsTopic:
         await safe_edit(query, body, reply_markup=kb)
 
 
-async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def settings_command(message: Message) -> None:
     """Show the settings dashboard in the current topic."""
-    user = update.effective_user
-    if not user or not config.is_user_allowed(user.id) or not update.message:
+    user = message.from_user
+    if not user or not config.is_user_allowed(user.id):
         return
     body, kb = render_settings()
-    await safe_reply(update.message, body, reply_markup=kb)
+    await safe_reply(message, body, reply_markup=kb)
 
 
 settings_topic = SettingsTopic()

@@ -7,22 +7,29 @@ instead of the normal topic→window→session routing.
 Key components:
   - SpecialTopic: interface (name, handle_text, handle_command, callbacks)
   - register(): add an implementation to the registry (done at import time
-    by the feature modules; see bot.create_bot)
+    by the feature modules; see bot.build_dispatcher)
   - ensure_special_topics(bot): create missing topics in the forum group and
     persist their thread ids in state.json (special_topics)
-  - special_message_router / special_callback_router: PTB handlers placed in
-    a negative group; they raise ApplicationHandlerStop for special topics so
-    the regular handlers never see those updates
+  - special_message_router / special_callback_router: handlers on the
+    router that bot.build_dispatcher checks before the main one; they
+    consume updates for special topics (so the regular handlers never see
+    them) and raise SkipHandler for everything else
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Protocol
+from typing import Any, Protocol
 
-from telegram import Bot, Update
-from telegram.error import BadRequest, TelegramError
-from telegram.ext import ApplicationHandlerStop, ContextTypes
+from aiogram import Bot
+from aiogram.dispatcher.event.bases import SkipHandler
+from aiogram.enums import ChatType
+from aiogram.exceptions import (
+    TelegramAPIError,
+    TelegramBadRequest,
+    TelegramNetworkError,
+)
+from aiogram.types import CallbackQuery, Message
 
 from ..config import config
 from ..session import session_manager
@@ -38,11 +45,11 @@ class SpecialTopic(Protocol):
     callback_prefixes: tuple[str, ...]
 
     async def handle_text(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str
+        self, message: Message, bot: Bot, user_data: dict[str, Any], text: str
     ) -> None: ...
 
     async def handle_callback(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, data: str
+        self, query: CallbackQuery, bot: Bot, user_data: dict[str, Any], data: str
     ) -> None: ...
 
     async def on_ready(self, bot: Bot, chat_id: int, thread_id: int) -> None:
@@ -96,12 +103,14 @@ async def _topic_exists(bot: Bot, chat_id: int, thread_id: int) -> bool:
             chat_id=chat_id, message_thread_id=thread_id
         )
         return True
-    except BadRequest as e:
-        if "Topic_id_invalid" in str(e) or "thread not found" in str(e).lower():
+    except TelegramBadRequest as e:
+        # aiogram keeps Telegram's raw text ("Bad Request: TOPIC_ID_INVALID")
+        text = str(e).lower()
+        if "topic_id_invalid" in text or "thread not found" in text:
             return False
         logger.debug("Topic probe for %s: %s", thread_id, e)
         return True
-    except TelegramError as e:
+    except (TelegramAPIError, TelegramNetworkError) as e:
         logger.debug("Topic probe for %s: %s", thread_id, e)
         return True
 
@@ -127,7 +136,7 @@ async def ensure_special_topics(bot: Bot) -> None:
         if thread_id is None:
             try:
                 created = await bot.create_forum_topic(chat_id=chat_id, name=name)
-            except TelegramError as e:
+            except (TelegramAPIError, TelegramNetworkError) as e:
                 logger.error(
                     "Cannot create special topic %r (needs 'Manage Topics' admin "
                     "right in the group): %s",
@@ -145,55 +154,57 @@ async def ensure_special_topics(bot: Bot) -> None:
 
 
 async def special_message_router(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
+    message: Message, bot: Bot, user_data: dict[str, Any]
 ) -> None:
-    """Group -1 handler: dispatch messages in special topics and stop."""
-    user = update.effective_user
-    msg = update.message
-    if not user or not msg or not msg.text:
-        return
-    chat = update.effective_chat
-    thread_id = getattr(msg, "message_thread_id", None)
+    """First-checked handler: dispatch messages in special topics and stop.
+
+    Anything outside a special topic raises SkipHandler so the main router
+    still gets it.
+    """
+    user = message.from_user
+    if not user or not message.text:
+        raise SkipHandler()
+    chat = message.chat
+    thread_id = message.message_thread_id
     if thread_id == 1:
         thread_id = None
-    if chat and chat.type in ("group", "supergroup"):
+    if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
         session_manager.set_group_chat_id(user.id, thread_id, chat.id)
         # Topics could not be created at startup without a known chat id
         if _REGISTRY and not all(
             n in session_manager.special_topics for n in _REGISTRY
         ):
-            await ensure_special_topics(context.bot)
+            await ensure_special_topics(bot)
 
     topic = topic_for_thread(thread_id)
     if topic is None:
-        return
+        raise SkipHandler()
     if not config.is_user_allowed(user.id):
-        await safe_reply(msg, "You are not authorized to use this bot.")
-        raise ApplicationHandlerStop
+        await safe_reply(message, "You are not authorized to use this bot.")
+        return
     try:
-        await topic.handle_text(update, context, msg.text)
+        await topic.handle_text(message, bot, user_data, message.text)
     except Exception as e:
         logger.exception("Special topic %r failed", topic.name)
-        await safe_reply(msg, f"❌ {topic.name}: {e}")
-    raise ApplicationHandlerStop
+        await safe_reply(message, f"❌ {topic.name}: {e}")
 
 
 async def special_callback_router(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
+    query: CallbackQuery, bot: Bot, user_data: dict[str, Any]
 ) -> None:
-    """Group -1 handler: dispatch callback queries owned by special topics."""
-    query = update.callback_query
-    if not query or not query.data:
-        return
+    """First-checked handler: dispatch callback queries owned by special topics."""
+    if not query.data:
+        raise SkipHandler()
     for topic in _REGISTRY.values():
         if topic.callback_prefixes and query.data.startswith(topic.callback_prefixes):
-            user = update.effective_user
-            if not user or not config.is_user_allowed(user.id):
+            user = query.from_user
+            if not config.is_user_allowed(user.id):
                 await query.answer("Not authorized")
-                raise ApplicationHandlerStop
+                return
             try:
-                await topic.handle_callback(update, context, query.data)
+                await topic.handle_callback(query, bot, user_data, query.data)
             except Exception as e:
                 logger.exception("Special topic %r callback failed", topic.name)
                 await query.answer(f"Error: {e}"[:200], show_alert=True)
-            raise ApplicationHandlerStop
+            return
+    raise SkipHandler()

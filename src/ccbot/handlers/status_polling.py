@@ -25,8 +25,9 @@ import logging
 import time
 from collections.abc import Awaitable, Callable
 
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.error import BadRequest
+from aiogram import Bot
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from ..config import config
 from ..session import session_manager
@@ -106,14 +107,16 @@ def mark_launching(window_id: str, launching: bool) -> None:
 def _health_keyboard(window_id: str, with_kill: bool) -> InlineKeyboardMarkup:
     row = [
         InlineKeyboardButton(
-            "🔄 Restart", callback_data=f"{CB_RESTART}{window_id}"[:64]
+            text="🔄 Restart", callback_data=f"{CB_RESTART}{window_id}"[:64]
         )
     ]
     if with_kill:
         row.append(
-            InlineKeyboardButton("🗑 Kill", callback_data=f"{CB_KILL}{window_id}"[:64])
+            InlineKeyboardButton(
+                text="🗑 Kill", callback_data=f"{CB_KILL}{window_id}"[:64]
+            )
         )
-    return InlineKeyboardMarkup([row])
+    return InlineKeyboardMarkup(inline_keyboard=[row])
 
 
 async def _check_window_health(
@@ -364,8 +367,8 @@ async def status_poll_loop(bot: Bot) -> None:
                             chat_id=session_manager.resolve_chat_id(user_id, thread_id),
                             message_thread_id=thread_id,
                         )
-                    except BadRequest as e:
-                        if "Topic_id_invalid" in str(e):
+                    except TelegramBadRequest as e:
+                        if "topic_id_invalid" in str(e).lower():
                             # Topic deleted — kill window, unbind, and clean up state
                             w = await tmux_manager.find_window_by_id(wid)
                             if w:

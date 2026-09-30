@@ -227,7 +227,8 @@ async def test_flood_control_waits_for_interactive_instead_of_dropping(
 @pytest.mark.asyncio
 async def test_retry_after_reposts_ui_once_after_content(env, events, monkeypatch):
     """A 429 on the content send: retry sends content, then re-posts UI once."""
-    from telegram.error import RetryAfter
+    from aiogram.exceptions import TelegramRetryAfter
+    from aiogram.methods import SendMessage
 
     bot = AsyncMock()
     interactive_ui._interactive_msgs[(1, 42)] = 55
@@ -238,7 +239,9 @@ async def test_retry_after_reposts_ui_once_after_content(env, events, monkeypatc
     async def flaky_send(*args, **kwargs):
         calls["n"] += 1
         if calls["n"] == 1:
-            raise RetryAfter(1)
+            raise TelegramRetryAfter(
+                method=SendMessage(chat_id=1, text="x"), message="flood", retry_after=1
+            )
         return await real_send(*args, **kwargs)
 
     monkeypatch.setattr(message_queue, "send_with_fallback", flaky_send)

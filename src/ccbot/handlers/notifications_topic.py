@@ -26,9 +26,15 @@ import asyncio
 import logging
 import time
 from datetime import datetime, timezone
+from typing import Any
 
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import ContextTypes
+from aiogram import Bot
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 
 from ..config import config
 from ..session import session_manager
@@ -142,7 +148,7 @@ async def notify(
         where = f"**{display}** · "
         link = _topic_link(_s.chat_id, _thread_for_window(window_id), message_id)
         if link:
-            rows.append([InlineKeyboardButton(f"↗ {display}", url=link)])
+            rows.append([InlineKeyboardButton(text=f"↗ {display}", url=link)])
     if buttons:
         rows.append(buttons)
     await safe_send(
@@ -150,7 +156,7 @@ async def notify(
         _s.chat_id,
         f"{icon} {where}{text}",
         message_thread_id=_s.thread_id,
-        reply_markup=InlineKeyboardMarkup(rows) if rows else None,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows) if rows else None,
     )
     return True
 
@@ -305,17 +311,15 @@ class NotificationsTopic:
         )
 
     async def handle_text(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str
+        self, message: Message, bot: Bot, user_data: dict[str, Any], text: str
     ) -> None:
-        if update.message is None:
-            return
         from .settings_topic import render_settings
 
         body, kb = render_settings()
-        await safe_reply(update.message, body, reply_markup=kb)
+        await safe_reply(message, body, reply_markup=kb)
 
     async def handle_callback(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, data: str
+        self, query: CallbackQuery, bot: Bot, user_data: dict[str, Any], data: str
     ) -> None:
         return
 

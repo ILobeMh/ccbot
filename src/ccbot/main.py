@@ -3,9 +3,10 @@
 Handles two execution modes:
   1. `ccbot hook` — delegates to hook.hook_main() for Claude Code hook processing.
   2. Default — configures logging, initializes tmux session, and starts the
-     Telegram bot polling loop via bot.create_bot().
+     Telegram bot polling loop via bot.run() (aiogram Dispatcher).
 """
 
+import asyncio
 import logging
 import sys
 
@@ -51,8 +52,12 @@ def main() -> None:
         sys.exit(1)
 
     logging.getLogger("ccbot").setLevel(logging.DEBUG)
-    # AIORateLimiter (max_retries=5) handles retries itself; keep INFO for visibility
-    logging.getLogger("telegram.ext.AIORateLimiter").setLevel(logging.INFO)
+    # TelegramRateLimiter (max_retries=5) handles retries itself; keep INFO
+    # for visibility of rate-limit hits
+    logging.getLogger("ccbot.telegram_client").setLevel(logging.INFO)
+    # aiogram logs every handled update at INFO in aiogram.event: too noisy
+    logging.getLogger("aiogram.event").setLevel(logging.WARNING)
+    logging.getLogger("aiogram.dispatcher").setLevel(logging.INFO)
     logger = logging.getLogger(__name__)
 
     from .tmux_manager import tmux_manager
@@ -65,10 +70,9 @@ def main() -> None:
     logger.info("Tmux session '%s' ready", session.session_name)
 
     logger.info("Starting Telegram bot...")
-    from .bot import create_bot
+    from .bot import run
 
-    application = create_bot()
-    application.run_polling(allowed_updates=["message", "callback_query"])
+    asyncio.run(run())
 
 
 if __name__ == "__main__":

@@ -10,7 +10,8 @@ Supports both full history and unread message range views.
 import logging
 from typing import Any
 
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram import Bot
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from ..config import config
 from ..session import session_manager
@@ -44,13 +45,15 @@ def _build_history_keyboard(
         )
         buttons.append(
             InlineKeyboardButton(
-                "◀ Older",
+                text="◀ Older",
                 callback_data=cb_data[:64],
             )
         )
 
     buttons.append(
-        InlineKeyboardButton(f"{page_index + 1}/{total_pages}", callback_data="noop")
+        InlineKeyboardButton(
+            text=f"{page_index + 1}/{total_pages}", callback_data="noop"
+        )
     )
 
     if page_index < total_pages - 1:
@@ -59,12 +62,12 @@ def _build_history_keyboard(
         )
         buttons.append(
             InlineKeyboardButton(
-                "Newer ▶",
+                text="Newer ▶",
                 callback_data=cb_data[:64],
             )
         )
 
-    return InlineKeyboardMarkup([buttons])
+    return InlineKeyboardMarkup(inline_keyboard=[buttons])
 
 
 async def send_history(

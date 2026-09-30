@@ -21,7 +21,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from ..config import config
 from ..session import ClaudeSession
@@ -119,14 +119,16 @@ def build_mode_picker(
         label = LAUNCH_MODE_LABELS[mode]
         if mode == last_mode:
             label = f"• {label}"
-        row.append(InlineKeyboardButton(label, callback_data=f"{CB_MODE_SELECT}{mode}"))
+        row.append(
+            InlineKeyboardButton(text=label, callback_data=f"{CB_MODE_SELECT}{mode}")
+        )
         if len(row) == 2:
             buttons.append(row)
             row = []
     if row:
         buttons.append(row)
-    buttons.append([InlineKeyboardButton("Cancel", callback_data=CB_MODE_CANCEL)])
-    return "\n".join(lines), InlineKeyboardMarkup(buttons)
+    buttons.append([InlineKeyboardButton(text="Cancel", callback_data=CB_MODE_CANCEL)])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 def _escape_md(text: str) -> str:
@@ -163,20 +165,20 @@ def build_window_picker(
             display = name[:12] + "…" if len(name) > 13 else name
             row.append(
                 InlineKeyboardButton(
-                    f"🖥 {display}", callback_data=f"{CB_WIN_BIND}{i + j}"
+                    text=f"🖥 {display}", callback_data=f"{CB_WIN_BIND}{i + j}"
                 )
             )
         buttons.append(row)
 
     buttons.append(
         [
-            InlineKeyboardButton("➕ New Session", callback_data=CB_WIN_NEW),
-            InlineKeyboardButton("Cancel", callback_data=CB_WIN_CANCEL),
+            InlineKeyboardButton(text="➕ New Session", callback_data=CB_WIN_NEW),
+            InlineKeyboardButton(text="Cancel", callback_data=CB_WIN_CANCEL),
         ]
     )
 
     text = "\n".join(lines)
-    return text, InlineKeyboardMarkup(buttons), window_ids
+    return text, InlineKeyboardMarkup(inline_keyboard=buttons), window_ids
 
 
 def build_directory_browser(
@@ -216,7 +218,7 @@ def build_directory_browser(
             idx = start + i + j
             row.append(
                 InlineKeyboardButton(
-                    f"📁 {display}", callback_data=f"{CB_DIR_SELECT}{idx}"
+                    text=f"📁 {display}", callback_data=f"{CB_DIR_SELECT}{idx}"
                 )
             )
         buttons.append(row)
@@ -225,23 +227,23 @@ def build_directory_browser(
         nav: list[InlineKeyboardButton] = []
         if page > 0:
             nav.append(
-                InlineKeyboardButton("◀", callback_data=f"{CB_DIR_PAGE}{page - 1}")
+                InlineKeyboardButton(text="◀", callback_data=f"{CB_DIR_PAGE}{page - 1}")
             )
         nav.append(
-            InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="noop")
+            InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop")
         )
         if page < total_pages - 1:
             nav.append(
-                InlineKeyboardButton("▶", callback_data=f"{CB_DIR_PAGE}{page + 1}")
+                InlineKeyboardButton(text="▶", callback_data=f"{CB_DIR_PAGE}{page + 1}")
             )
         buttons.append(nav)
 
     action_row: list[InlineKeyboardButton] = []
     # Allow going up unless at filesystem root
     if path != path.parent:
-        action_row.append(InlineKeyboardButton("..", callback_data=CB_DIR_UP))
-    action_row.append(InlineKeyboardButton("Select", callback_data=CB_DIR_CONFIRM))
-    action_row.append(InlineKeyboardButton("Cancel", callback_data=CB_DIR_CANCEL))
+        action_row.append(InlineKeyboardButton(text="..", callback_data=CB_DIR_UP))
+    action_row.append(InlineKeyboardButton(text="Select", callback_data=CB_DIR_CONFIRM))
+    action_row.append(InlineKeyboardButton(text="Cancel", callback_data=CB_DIR_CANCEL))
     buttons.append(action_row)
 
     display_path = str(path).replace(str(Path.home()), "~")
@@ -251,7 +253,7 @@ def build_directory_browser(
     else:
         text = f"*Select Working Directory*\n\nCurrent: `{display_path}`\n\n{hint}"
 
-    return text, InlineKeyboardMarkup(buttons), subdirs
+    return text, InlineKeyboardMarkup(inline_keyboard=buttons), subdirs
 
 
 def as_directory(text: str) -> str | None:
@@ -402,17 +404,17 @@ def build_session_picker(
             label = s.summary[:14] + "…" if len(s.summary) > 14 else s.summary
             row.append(
                 InlineKeyboardButton(
-                    f"▶ {label}", callback_data=f"{CB_SESSION_SELECT}{i + j}"
+                    text=f"▶ {label}", callback_data=f"{CB_SESSION_SELECT}{i + j}"
                 )
             )
         buttons.append(row)
 
     buttons.append(
         [
-            InlineKeyboardButton("➕ New Session", callback_data=CB_SESSION_NEW),
-            InlineKeyboardButton("Cancel", callback_data=CB_SESSION_CANCEL),
+            InlineKeyboardButton(text="➕ New Session", callback_data=CB_SESSION_NEW),
+            InlineKeyboardButton(text="Cancel", callback_data=CB_SESSION_CANCEL),
         ]
     )
 
     text = "\n".join(lines)
-    return text, InlineKeyboardMarkup(buttons)
+    return text, InlineKeyboardMarkup(inline_keyboard=buttons)
