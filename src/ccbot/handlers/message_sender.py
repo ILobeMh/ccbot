@@ -14,23 +14,34 @@ Functions:
   - edit_with_fallback: Edit by (chat_id, message_id), returns success bool
   - run_with_fallback: The shared policy behind all of the above
 
-Fallback policy (see run_with_fallback): only a BadRequest (i.e. the
-MarkdownV2 parser rejected the text) triggers the plain-text retry.
-TimedOut / NetworkError usually mean the request *was* delivered and the
-response got lost, so retrying would duplicate the message — those are
-logged and treated as failure without a resend.
+Fallback policy (see run_with_fallback): only a TelegramBadRequest (i.e.
+the MarkdownV2 parser rejected the text) triggers the plain-text retry.
+TelegramNetworkError (timeouts included) usually means the request *was*
+delivered and the response got lost, so retrying would duplicate the
+message — those are logged and treated as failure without a resend.
 
-Rate limiting is handled globally by AIORateLimiter on the Application.
-RetryAfter exceptions are re-raised so callers (queue worker) can handle them.
+Rate limiting is handled by telegram_client.TelegramRateLimiter on the bot
+session. TelegramRetryAfter that survives its retries is re-raised so
+callers (queue worker) can handle it.
 """
 
-import io
 import logging
 from collections.abc import Awaitable, Callable
 from typing import Any, TypeVar
 
-from telegram import Bot, InputMediaPhoto, LinkPreviewOptions, Message
-from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
+from aiogram import Bot
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramNetworkError,
+    TelegramRetryAfter,
+)
+from aiogram.types import (
+    BufferedInputFile,
+    CallbackQuery,
+    InputMediaPhoto,
+    LinkPreviewOptions,
+    Message,
+)
 
 from ..markdown_v2 import convert_markdown
 from ..transcript_parser import TranscriptParser
@@ -64,7 +75,7 @@ NO_LINK_PREVIEW = LinkPreviewOptions(is_disabled=True)
 _NOT_MODIFIED = "message is not modified"
 
 
-def _is_not_modified(e: BadRequest) -> bool:
+def _is_not_modified(e: TelegramBadRequest) -> bool:
     return _NOT_MODIFIED in str(e).lower()
 
 
@@ -75,24 +86,25 @@ async def run_with_fallback(
     *,
     raise_on_failure: bool = False,
 ) -> T | None:
-    """Run ``primary``; on a BadRequest run ``fallback`` (plain text).
+    """Run ``primary``; on a TelegramBadRequest run ``fallback`` (plain text).
 
-    - BadRequest → the formatted text was rejected → try ``fallback``.
+    - TelegramBadRequest → the formatted text was rejected → try ``fallback``.
     - "Message is not modified" (edits) → treated as success, returns None.
-    - TimedOut / NetworkError → logged, returns None. Not retried: the
-      request has usually reached Telegram already and a resend duplicates.
-    - RetryAfter → re-raised for the queue worker.
+    - TelegramNetworkError (incl. timeouts) → logged, returns None. Not
+      retried: the request has usually reached Telegram already and a resend
+      duplicates.
+    - TelegramRetryAfter → re-raised for the queue worker.
     - Anything else → logged (re-raised when ``raise_on_failure``).
     """
     try:
         return await primary()
-    except RetryAfter:
+    except TelegramRetryAfter:
         raise
-    except BadRequest as e:
+    except TelegramBadRequest as e:
         if _is_not_modified(e):
             return None
         logger.warning("%s: MarkdownV2 rejected, falling back to plain: %s", what, e)
-    except (TimedOut, NetworkError) as e:
+    except TelegramNetworkError as e:
         logger.warning("%s: transport error, not retrying: %s", what, e)
         if raise_on_failure:
             raise
@@ -105,9 +117,9 @@ async def run_with_fallback(
 
     try:
         return await fallback()
-    except RetryAfter:
+    except TelegramRetryAfter:
         raise
-    except BadRequest as e:
+    except TelegramBadRequest as e:
         if _is_not_modified(e):
             return None
         logger.error("%s: plain-text fallback rejected too: %s", what, e)
@@ -130,7 +142,7 @@ async def send_with_fallback(
     """Send message with MarkdownV2, falling back to plain text on failure.
 
     Returns the sent Message on success, None on failure.
-    RetryAfter is re-raised for caller handling.
+    TelegramRetryAfter is re-raised for caller handling.
     """
     kwargs.setdefault("link_preview_options", NO_LINK_PREVIEW)
     return await run_with_fallback(
@@ -140,7 +152,9 @@ async def send_with_fallback(
             parse_mode=PARSE_MODE,
             **kwargs,
         ),
-        lambda: bot.send_message(chat_id=chat_id, text=strip_sentinels(text), **kwargs),
+        lambda: bot.send_message(
+            chat_id=chat_id, text=strip_sentinels(text), parse_mode=None, **kwargs
+        ),
         f"send_message({chat_id})",
     )
 
@@ -153,7 +167,7 @@ async def send_photo(
 ) -> None:
     """Send photo(s) to chat. Sends as media group if multiple images.
 
-    Rate limiting is handled globally by AIORateLimiter on the Application.
+    Rate limiting is handled by the bot session's TelegramRateLimiter.
 
     Args:
         bot: Telegram Bot instance
@@ -163,40 +177,38 @@ async def send_photo(
     """
     if not image_data:
         return
+    files = [
+        BufferedInputFile(raw_bytes, filename=f"image{i}.{_extension(media_type)}")
+        for i, (media_type, raw_bytes) in enumerate(image_data, 1)
+    ]
     try:
-        if len(image_data) == 1:
-            _media_type, raw_bytes = image_data[0]
-            await bot.send_photo(
-                chat_id=chat_id,
-                photo=io.BytesIO(raw_bytes),
-                **kwargs,
-            )
+        if len(files) == 1:
+            await bot.send_photo(chat_id=chat_id, photo=files[0], **kwargs)
         else:
-            media = [
-                InputMediaPhoto(media=io.BytesIO(raw_bytes))
-                for _media_type, raw_bytes in image_data
-            ]
-            await bot.send_media_group(
-                chat_id=chat_id,
-                media=media,
-                **kwargs,
-            )
-    except RetryAfter:
+            media: list[Any] = [InputMediaPhoto(media=f) for f in files]
+            await bot.send_media_group(chat_id=chat_id, media=media, **kwargs)
+    except TelegramRetryAfter:
         raise
     except Exception as e:
         logger.error("Failed to send photo to %d: %s", chat_id, e)
 
 
+def _extension(media_type: str) -> str:
+    """ "image/png" → "png" (Telegram sniffs the content; this is cosmetic)."""
+    sub = media_type.partition("/")[2].split(";")[0].strip()
+    return {"jpeg": "jpg", "svg+xml": "svg"}.get(sub, sub or "png")
+
+
 async def safe_reply(message: Message, text: str, **kwargs: Any) -> Message:
-    """Reply with formatting, falling back to plain text on failure."""
+    """Reply (quoting ``message``, in its topic) with formatting → plain fallback."""
     kwargs.setdefault("link_preview_options", NO_LINK_PREVIEW)
     sent = await run_with_fallback(
-        lambda: message.reply_text(
+        lambda: message.reply(
             _ensure_formatted(text),
             parse_mode=PARSE_MODE,
             **kwargs,
         ),
-        lambda: message.reply_text(strip_sentinels(text), **kwargs),
+        lambda: message.reply(strip_sentinels(text), parse_mode=None, **kwargs),
         "reply_text",
         raise_on_failure=True,
     )
@@ -205,17 +217,22 @@ async def safe_reply(message: Message, text: str, **kwargs: Any) -> Message:
     return sent
 
 
-async def safe_edit(target: Any, text: str, **kwargs: Any) -> None:
+async def safe_edit(target: CallbackQuery | Message, text: str, **kwargs: Any) -> None:
     """Edit message with formatting, falling back to plain text on failure.
 
-    ``target`` is a CallbackQuery (``edit_message_text``) or a Message
-    (``edit_text``) — e.g. a progress message returned by safe_reply.
+    ``target`` is a CallbackQuery (its message is edited) or a Message —
+    e.g. a progress message returned by safe_reply.
     """
     kwargs.setdefault("link_preview_options", NO_LINK_PREVIEW)
-    edit = getattr(target, "edit_message_text", None) or target.edit_text
+    message = target.message if isinstance(target, CallbackQuery) else target
+    if not isinstance(message, Message):
+        logger.debug("edit_message_text: message is inaccessible (too old)")
+        return
     await run_with_fallback(
-        lambda: edit(_ensure_formatted(text), parse_mode=PARSE_MODE, **kwargs),
-        lambda: edit(strip_sentinels(text), **kwargs),
+        lambda: message.edit_text(
+            _ensure_formatted(text), parse_mode=PARSE_MODE, **kwargs
+        ),
+        lambda: message.edit_text(strip_sentinels(text), parse_mode=None, **kwargs),
         "edit_message_text",
     )
 
@@ -246,13 +263,13 @@ async def edit_with_fallback(
             **kwargs,
         )
         return True
-    except RetryAfter:
+    except TelegramRetryAfter:
         raise
-    except BadRequest as e:
+    except TelegramBadRequest as e:
         if _is_not_modified(e):
             return True
         logger.warning("%s: MarkdownV2 rejected, falling back to plain: %s", what, e)
-    except (TimedOut, NetworkError) as e:
+    except TelegramNetworkError as e:
         logger.warning("%s: transport error, not retrying: %s", what, e)
         return True
     except Exception as e:
@@ -264,17 +281,18 @@ async def edit_with_fallback(
             chat_id=chat_id,
             message_id=message_id,
             text=strip_sentinels(text),
+            parse_mode=None,
             **kwargs,
         )
         return True
-    except RetryAfter:
+    except TelegramRetryAfter:
         raise
-    except BadRequest as e:
+    except TelegramBadRequest as e:
         if _is_not_modified(e):
             return True
         logger.debug("%s: plain-text fallback rejected: %s", what, e)
         return False
-    except (TimedOut, NetworkError) as e:
+    except TelegramNetworkError as e:
         logger.warning("%s: transport error on fallback, not retrying: %s", what, e)
         return True
     except Exception as e:
@@ -300,6 +318,8 @@ async def safe_send(
             parse_mode=PARSE_MODE,
             **kwargs,
         ),
-        lambda: bot.send_message(chat_id=chat_id, text=strip_sentinels(text), **kwargs),
+        lambda: bot.send_message(
+            chat_id=chat_id, text=strip_sentinels(text), parse_mode=None, **kwargs
+        ),
         f"send_message({chat_id})",
     )
