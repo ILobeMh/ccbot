@@ -45,7 +45,7 @@ def _secs(v: Any) -> str:
 
 
 def _thinking(v: Any) -> str:
-    return {0: "full (split in parts)", 500: "short (500)"}.get(int(v), f"{v} chars")
+    return {0: "full", 500: "short (500)"}.get(int(v), f"{v} chars")
 
 
 def _quiet(v: Any) -> str:
@@ -70,6 +70,44 @@ def _forget_last_modes(_: Any) -> None:
 
 
 SETTINGS: list[Setting] = [
+    Setting(
+        "message_format",
+        "Message style",
+        "Output",
+        "choice",
+        choices=["rich", "classic"],
+        fmt=lambda v: {"rich": "✨ rich", "classic": "classic"}.get(str(v), str(v)),
+        help="Rich: real tables, code blocks, collapsible output, 32k per message",
+    ),
+    Setting(
+        "tool_output",
+        "Tool output",
+        "Output",
+        "choice",
+        choices=["full", "preview", "summary"],
+        fmt=lambda v: {
+            "full": "full (collapsed)",
+            "preview": "first lines",
+            "summary": "status only",
+        }.get(str(v), str(v)),
+        help="Bash output, diffs, file contents (rich style)",
+    ),
+    Setting(
+        "tool_output_lines",
+        "… first lines",
+        "Output",
+        "choice",
+        choices=[5, 10, 15, 30, 50],
+        fmt=lambda v: f"{v} lines",
+        help="How many lines 'first lines' shows",
+    ),
+    Setting(
+        "expand_output",
+        "Expand output blocks",
+        "Output",
+        "bool",
+        help="Open tool output / diffs instead of collapsed",
+    ),
     Setting(
         "show_thinking",
         "Thinking",

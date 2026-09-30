@@ -30,7 +30,9 @@ from typing import Literal
 from aiogram import Bot
 from aiogram.enums import ChatAction
 from aiogram.exceptions import TelegramRetryAfter
+from aiogram.types import Message
 
+from ..rich_render import RICH_CHAR_BUDGET, RICH_LINE_BUDGET
 from ..session import session_manager
 from ..terminal_parser import is_interactive_ui, parse_status_line
 from ..tmux_manager import tmux_manager
@@ -43,8 +45,10 @@ from .interactive_ui import (
     set_interactive_mode,
 )
 from .message_sender import (
+    edit_rich,
     edit_with_fallback,
     send_photo,
+    send_rich,
     send_with_fallback,
 )
 from .notifications_topic import record_sent
@@ -83,6 +87,9 @@ class MessageTask:
     ends_turn: bool = False  # last message of a Claude turn (stop_reason end_turn)
     turn_key: str | None = None  # API message id, for turn-done dedupe
     entry_ts: str | None = None  # JSONL timestamp
+    # parts are rich_render markdown (sendRichMessage) instead of MarkdownV2
+    # source; consecutive rich parts are packed into as few messages as fit
+    rich: bool = False
 
 
 # Per-user message queues and worker tasks
@@ -146,6 +153,8 @@ def _can_merge_tasks(base: MessageTask, candidate: MessageTask) -> bool:
     """Check if two content tasks can be merged."""
     if base.window_id != candidate.window_id:
         return False
+    if base.rich != candidate.rich:
+        return False
     if candidate.task_type != "content":
         return False
     # tool_use/tool_result break merge chain
@@ -178,6 +187,7 @@ async def _merge_content_tasks(
     """
     merged_parts = list(first.parts)
     current_length = sum(len(p) for p in merged_parts)
+    max_length = RICH_CHAR_BUDGET if first.rich else MERGE_MAX_LENGTH
     merge_count = 0
     merged_tasks: list[MessageTask] = [first]
 
@@ -193,7 +203,7 @@ async def _merge_content_tasks(
 
             # Check length before merging
             task_length = sum(len(p) for p in task.parts)
-            if current_length + task_length > MERGE_MAX_LENGTH:
+            if current_length + task_length > max_length:
                 # Too long, stop merging
                 remaining = items[i:]
                 break
@@ -227,6 +237,7 @@ async def _merge_content_tasks(
             ),
             entry_ts=merged_tasks[-1].entry_ts,
             thread_id=first.thread_id,
+            rich=first.rich,
         ),
         merge_count,
     )
@@ -480,6 +491,7 @@ async def _show_interactive(bot: Bot, user_id: int, task: MessageTask) -> None:
                 content_type="tool_use",
                 thread_id=task.thread_id,
                 entry_ts=task.entry_ts,
+                rich=task.rich,
             ),
         )
 
@@ -497,41 +509,44 @@ async def _send_content_task(bot: Bot, user_id: int, task: MessageTask) -> None:
         if edit_msg_id is not None:
             # Clear status message first
             await _do_clear_status_message(bot, user_id, tid)
-            # Join all parts for editing (merged content goes together)
-            full_text = "\n\n".join(task.parts)
-            if await edit_with_fallback(bot, chat_id, edit_msg_id, full_text):
-                await _send_task_images(bot, chat_id, task)
-                await _check_and_send_status(bot, user_id, wid, task.thread_id)
-                return
+            if task.rich:
+                # The first part replaces the tool_use message; any further
+                # parts (output past the size budget) continue below it
+                first, rest = task.parts[0], task.parts[1:]
+                if await edit_rich(bot, chat_id, edit_msg_id, first):
+                    for part in _pack_rich(rest):
+                        await _send_part(bot, chat_id, part, task)
+                    await _send_task_images(bot, chat_id, task)
+                    await _check_and_send_status(bot, user_id, wid, task.thread_id)
+                    return
+            else:
+                # Join all parts for editing (merged content goes together)
+                full_text = "\n\n".join(task.parts)
+                if await edit_with_fallback(bot, chat_id, edit_msg_id, full_text):
+                    await _send_task_images(bot, chat_id, task)
+                    await _check_and_send_status(bot, user_id, wid, task.thread_id)
+                    return
             logger.debug(f"Failed to edit tool msg {edit_msg_id}, sending new")
             # Fall through to send as new message
 
     # 2. Send content messages, converting status message to first content part
     first_part = True
     last_msg_id: int | None = None
-    for part in task.parts:
+    parts = _pack_rich(task.parts) if task.rich else task.parts
+    for part in parts:
         sent = None
 
         # For first part, try to convert status message to content (edit instead of delete)
         if first_part:
             first_part = False
             converted_msg_id = await _convert_status_to_content(
-                bot,
-                user_id,
-                tid,
-                wid,
-                part,
+                bot, user_id, tid, wid, part, rich=task.rich
             )
             if converted_msg_id is not None:
                 last_msg_id = converted_msg_id
                 continue
 
-        sent = await send_with_fallback(
-            bot,
-            chat_id,
-            part,
-            **_send_kwargs(task.thread_id),  # type: ignore[arg-type]
-        )
+        sent = await _send_part(bot, chat_id, part, task)
 
         if sent:
             last_msg_id = sent.message_id
@@ -557,12 +572,43 @@ async def _send_content_task(bot: Bot, user_id: int, task: MessageTask) -> None:
     await _check_and_send_status(bot, user_id, wid, task.thread_id)
 
 
+async def _send_part(
+    bot: Bot, chat_id: int, part: str, task: MessageTask
+) -> Message | None:
+    """Send one part of a content task (rich or MarkdownV2)."""
+    if task.rich:
+        return await send_rich(bot, chat_id, part, **_send_kwargs(task.thread_id))
+    return await send_with_fallback(bot, chat_id, part, **_send_kwargs(task.thread_id))
+
+
+def _pack_rich(parts: list[str]) -> list[str]:
+    """Join consecutive rich parts into as few messages as the budget allows.
+
+    Every part is a self-contained block structure, so concatenating them
+    (blank line between) is safe; fewer messages also spare the per-group
+    send budget.
+    """
+    packed: list[str] = []
+    for part in parts:
+        if (
+            packed
+            and len(packed[-1]) + len(part) + 2 <= RICH_CHAR_BUDGET
+            and (packed[-1].count("\n") + part.count("\n") < RICH_LINE_BUDGET)
+        ):
+            packed[-1] = f"{packed[-1]}\n\n{part}"
+        else:
+            packed.append(part)
+    return packed
+
+
 async def _convert_status_to_content(
     bot: Bot,
     user_id: int,
     thread_id_or_0: int,
     window_id: str,
     content_text: str,
+    *,
+    rich: bool = False,
 ) -> int | None:
     """Convert status message to content message by editing it.
 
@@ -583,8 +629,9 @@ async def _convert_status_to_content(
             pass
         return None
 
-    # Edit status message to show content
-    if await edit_with_fallback(bot, chat_id, msg_id, content_text):
+    # Edit status message to show content (a plain message can become rich)
+    edit = edit_rich if rich else edit_with_fallback
+    if await edit(bot, chat_id, msg_id, content_text):
         return msg_id
     # Message might be deleted or too old, caller will send new message
     logger.debug("Failed to convert status msg %s to content", msg_id)
@@ -733,8 +780,9 @@ async def enqueue_content_message(
     ends_turn: bool = False,
     turn_key: str | None = None,
     entry_ts: str | None = None,
+    rich: bool = False,
 ) -> None:
-    """Enqueue a content message task."""
+    """Enqueue a content message task (``rich``: parts are rich markdown)."""
     logger.debug(
         "Enqueue content: user=%d, window_id=%s, content_type=%s",
         user_id,
@@ -755,6 +803,7 @@ async def enqueue_content_message(
         ends_turn=ends_turn,
         turn_key=turn_key,
         entry_ts=entry_ts,
+        rich=rich,
     )
     queue.put_nowait(task)
 
@@ -769,6 +818,7 @@ async def enqueue_interactive(
     tool_use_id: str | None = None,
     text: str | None = None,
     entry_ts: str | None = None,
+    rich: bool = False,
 ) -> None:
     """Queue showing ``window_id``'s interactive UI after pending content.
 
@@ -788,6 +838,7 @@ async def enqueue_interactive(
             parts=list(fallback_parts or []),
             tool_use_id=tool_use_id,
             entry_ts=entry_ts,
+            rich=rich,
         )
     )
 

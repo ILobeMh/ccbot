@@ -161,7 +161,7 @@ from .handlers.notifications_topic import (
     record_assistant_text,
     record_turn_start,
 )
-from .handlers.response_builder import build_response_parts
+from .handlers.response_builder import build_response_parts, build_rich_parts
 from .handlers.resume_offer import offer_lost_bindings, offer_resume
 from .handlers.settings_topic import settings_command
 from .handlers.special_topics import (
@@ -2992,20 +2992,20 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
         # the terminal never draws the UI. (An open UI message is deleted or
         # re-posted by the worker when later content arrives — never here,
         # out of order.)
+        rich = config.message_format == "rich"
         if msg.tool_name in INTERACTIVE_TOOL_NAMES and msg.content_type == "tool_use":
             await enqueue_interactive(
                 bot,
                 user_id,
                 wid,
                 thread_id,
-                fallback_parts=build_response_parts(
-                    msg.text, msg.is_complete, msg.content_type, msg.role
-                )
+                fallback_parts=_message_parts(msg, rich)
                 if config.show_tool_calls
                 else None,
                 tool_use_id=msg.tool_use_id,
                 text=msg.text,
                 entry_ts=msg.timestamp,
+                rich=rich,
             )
             _mark_read(user_id, wid)
             continue
@@ -3028,12 +3028,10 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
         elif msg.content_type == "text" and msg.role == "assistant":
             record_assistant_text(wid, msg.text)
 
-        parts = build_response_parts(
-            msg.text,
-            msg.is_complete,
-            msg.content_type,
-            msg.role,
-        )
+        parts = _message_parts(msg, rich)
+        if parts is None:  # a tool result that adds nothing (e.g. TodoWrite)
+            _mark_read(user_id, wid)
+            continue
 
         if msg.is_complete:
             # Enqueue content message task
@@ -3052,9 +3050,19 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
                 ends_turn=msg.stop_reason == "end_turn",
                 turn_key=msg.api_message_id,
                 entry_ts=msg.timestamp,
+                rich=rich,
             )
 
             _mark_read(user_id, wid)
+
+
+def _message_parts(msg: NewMessage, rich: bool) -> list[str] | None:
+    """Rendered messages for ``msg``: rich markdown or classic MarkdownV2 source."""
+    if rich:
+        return build_rich_parts(
+            msg.text, msg.content_type, msg.role, raw=msg.raw, tool=msg.tool
+        )
+    return build_response_parts(msg.text, msg.is_complete, msg.content_type, msg.role)
 
 
 def _mark_read(user_id: int, wid: str) -> None:

@@ -135,7 +135,20 @@ class Config:
         # Show Claude's thinking blocks (as collapsed expandable quotes)
         self.show_thinking = os.getenv("CCBOT_SHOW_THINKING", "true").lower() != "false"
         # Max thinking chars per turn; 0 = send everything, split into parts
-        self.thinking_max_chars = int(os.getenv("CCBOT_MAX_THINKING_CHARS", "500"))
+        self.thinking_max_chars = int(os.getenv("CCBOT_MAX_THINKING_CHARS", "0"))
+
+        # "rich": Telegram rich messages (Bot API 10.1: tables, code blocks,
+        # collapsible output; needs a current Telegram app); "classic":
+        # MarkdownV2 messages as before
+        fmt = os.getenv("CCBOT_MESSAGE_FORMAT", "rich").strip().lower()
+        self.message_format = fmt if fmt in ("rich", "classic") else "rich"
+        # Tool output in rich mode: "full" (all of it, in a collapsed block),
+        # "preview" (first tool_output_lines lines) or "summary" (status only)
+        out = os.getenv("CCBOT_TOOL_OUTPUT", "full").strip().lower()
+        self.tool_output = out if out in ("full", "preview", "summary") else "full"
+        self.tool_output_lines = int(os.getenv("CCBOT_TOOL_OUTPUT_LINES", "15"))
+        # Show output / diff blocks opened instead of collapsed
+        self.expand_output = os.getenv("CCBOT_EXPAND_OUTPUT", "false").lower() == "true"
 
         # Ask ✅ Send / ❌ Cancel before forwarding a text message to Claude
         self.confirm_text = os.getenv("CCBOT_CONFIRM_TEXT", "false").lower() == "true"

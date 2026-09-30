@@ -9,14 +9,65 @@ Markdown conversion is NOT done here — the send layer (message_sender,
 message_queue) handles convert_markdown() so each message is converted
 exactly once.
 
-Key function:
-  - build_response_parts: Build paginated response messages
+Key functions:
+  - build_response_parts: Build paginated MarkdownV2 (classic) messages
+  - build_rich_parts: Rich-message markdown via rich_render (message_format
+    "rich"); None for a tool_result that adds nothing to its tool_use message
+  - render_options: RenderOptions from the live settings
 """
 
+from .. import rich_render
 from ..config import config
 from ..markdown_v2 import convert_markdown_tables
 from ..telegram_sender import split_message
-from ..transcript_parser import TranscriptParser
+from ..transcript_parser import ToolCall, TranscriptParser
+
+
+def render_options() -> rich_render.RenderOptions:
+    return rich_render.RenderOptions(
+        tool_output=config.tool_output,
+        preview_lines=int(config.tool_output_lines),
+        expand_output=bool(config.expand_output),
+        thinking_max_chars=int(config.thinking_max_chars),
+    )
+
+
+def _strip_sentinels(text: str) -> str:
+    for tag in (
+        TranscriptParser.EXPANDABLE_QUOTE_START,
+        TranscriptParser.EXPANDABLE_QUOTE_END,
+    ):
+        text = text.replace(tag, "")
+    return text
+
+
+def build_rich_parts(
+    text: str,
+    content_type: str,
+    role: str,
+    raw: str | None = None,
+    tool: ToolCall | None = None,
+) -> list[str] | None:
+    """Rich markdown messages for one transcript entry.
+
+    Returns None when a tool_result adds nothing to its tool_use message
+    (e.g. TodoWrite), so the caller sends nothing.
+    """
+    opts = render_options()
+    if role == "user":
+        return rich_render.render_user_text(raw or text)
+    if content_type == "thinking":
+        return rich_render.render_thinking(raw or _strip_sentinels(text), opts)
+    if tool is not None and tool.name:
+        if content_type == "tool_use":
+            return rich_render.render_tool_use(tool)
+        if content_type == "tool_result":
+            return rich_render.render_tool_result(tool, opts) or None
+    if content_type in ("error", "warning", "info"):
+        return rich_render.render_notice(text)
+    # text, local_command (already markdown), results of unknown tools
+    return rich_render.render_text(raw or _strip_sentinels(text))
+
 
 # Raw chars per thinking part; escaping inflates this before the 3800-char
 # render budget in markdown_v2._render_expandable_quote
