@@ -98,6 +98,12 @@
       "name": "nimbus_quill",
       "usedPercent": 0,
       "remainingPercent": 100
+     },
+     {
+      "name": "iguana_necktie",
+      "durationSeconds": 604800,
+      "usedPercent": 1.418638,
+      "remainingPercent": 98.581362
      }
     ],
     "extraUsage": {
@@ -348,7 +354,7 @@
     "name": "g***@i***.com",
     "email": "g***@i***.com",
     "identity": "",
-    "status": "ready",
+    "status": "reauth_required",
     "createdAt": "2026-08-15T07:24:17.394924044Z",
     "updatedAt": "2026-09-06T09:44:18.61460276Z",
     "credentialUpdatedAt": "2026-09-06T09:44:16.014408011Z"
@@ -639,6 +645,229 @@
      ]
     },
     "fetchedAt": "2026-09-15T22:17:46.965190176Z"
+   },
+   "stale": false
+  },
+  {
+   "account": {
+    "id": "00000000-0000-0000-0000-00000000000d",
+    "provider": "grok",
+    "name": "g***@x***.com",
+    "email": "g***@x***.com",
+    "identity": "",
+    "status": "ready",
+    "createdAt": "2026-08-20T10:00:00.000000000Z",
+    "updatedAt": "2026-09-15T16:00:43.860363079Z",
+    "credentialUpdatedAt": "2026-09-09T17:50:44.317269492Z"
+   },
+   "current": true,
+   "quota": {
+    "schemaVersion": 1,
+    "provider": "grok",
+    "accountId": "00000000-0000-0000-0000-00000000000d",
+    "plan": "SuperGrok",
+    "windows": [
+     {
+      "name": "seven_day",
+      "durationSeconds": 604800,
+      "usedPercent": 0,
+      "remainingPercent": 100
+     }
+    ],
+    "creditsRemaining": 0,
+    "fetchedAt": "2026-09-16T02:46:33.116319637Z"
+   },
+   "stale": false
+  },
+  {
+   "account": {
+    "id": "00000000-0000-0000-0000-00000000000e",
+    "provider": "grok",
+    "name": "h***@x***.com",
+    "email": "h***@x***.com",
+    "identity": "",
+    "status": "ready",
+    "createdAt": "2026-08-20T10:00:00.000000000Z",
+    "updatedAt": "2026-09-15T16:00:43.860363079Z",
+    "credentialUpdatedAt": "2026-09-09T17:50:44.317269492Z"
+   },
+   "current": false,
+   "quota": {
+    "schemaVersion": 1,
+    "provider": "grok",
+    "accountId": "00000000-0000-0000-0000-00000000000e",
+    "plan": "SuperGrok",
+    "windows": [
+     {
+      "name": "seven_day",
+      "durationSeconds": 604800,
+      "usedPercent": 0,
+      "remainingPercent": 100,
+      "resetsAt": "2026-09-22T02:00:00Z"
+     }
+    ],
+    "creditsRemaining": 0,
+    "fetchedAt": "2026-09-16T02:46:33.116319637Z"
+   },
+   "stale": false
+  },
+  {
+   "account": {
+    "id": "00000000-0000-0000-0000-00000000000f",
+    "provider": "grok",
+    "name": "k***@y***.io",
+    "email": "k***@y***.io",
+    "identity": "",
+    "status": "ready",
+    "createdAt": "2026-08-20T10:00:00.000000000Z",
+    "updatedAt": "2026-09-15T16:00:43.860363079Z",
+    "credentialUpdatedAt": "2026-09-09T17:50:44.317269492Z"
+   },
+   "current": false,
+   "quota": {
+    "schemaVersion": 1,
+    "provider": "grok",
+    "accountId": "00000000-0000-0000-0000-00000000000f",
+    "plan": "SuperGrok",
+    "windows": [
+     {
+      "name": "seven_day",
+      "durationSeconds": 604800,
+      "usedPercent": 100,
+      "remainingPercent": 0,
+      "resetsAt": "2099-01-01T09:30:00Z"
+     }
+    ],
+    "creditsRemaining": 0,
+    "fetchedAt": "2026-09-16T02:46:33.116319637Z"
+   },
+   "stale": false
+  },
+  {
+   "account": {
+    "id": "00000000-0000-0000-0000-000000000010",
+    "provider": "grok",
+    "name": "l***@y***.io",
+    "email": "l***@y***.io",
+    "identity": "",
+    "status": "ready",
+    "createdAt": "2026-08-20T10:00:00.000000000Z",
+    "updatedAt": "2026-09-15T16:00:43.860363079Z",
+    "credentialUpdatedAt": "2026-09-09T17:50:44.317269492Z"
+   },
+   "current": false,
+   "quota": {
+    "schemaVersion": 1,
+    "provider": "grok",
+    "accountId": "00000000-0000-0000-0000-000000000010",
+    "plan": "SuperGrok",
+    "windows": [
+     {
+      "name": "seven_day",
+      "durationSeconds": 604800,
+      "usedPercent": 36,
+      "remainingPercent": 64,
+      "resetsAt": "2026-09-22T02:00:00Z"
+     }
+    ],
+    "creditsRemaining": 0,
+    "fetchedAt": "2026-09-16T02:46:33.116319637Z"
+   },
+   "stale": false
+  },
+  {
+   "account": {
+    "id": "00000000-0000-0000-0000-000000000011",
+    "provider": "grok",
+    "name": "n***@z***.net",
+    "email": "n***@z***.net",
+    "identity": "",
+    "status": "ready",
+    "createdAt": "2026-08-20T10:00:00.000000000Z",
+    "updatedAt": "2026-09-15T16:00:43.860363079Z",
+    "credentialUpdatedAt": "2026-09-09T17:50:44.317269492Z"
+   },
+   "current": false,
+   "quota": {
+    "schemaVersion": 1,
+    "provider": "grok",
+    "accountId": "00000000-0000-0000-0000-000000000011",
+    "plan": "SuperGrok",
+    "windows": [
+     {
+      "name": "seven_day",
+      "durationSeconds": 604800,
+      "usedPercent": 1.418638,
+      "remainingPercent": 98.581362,
+      "resetsAt": "2026-09-22T02:00:00Z"
+     }
+    ],
+    "creditsRemaining": 0,
+    "fetchedAt": "2026-09-16T02:46:33.116319637Z"
+   },
+   "stale": false
+  },
+  {
+   "account": {
+    "id": "00000000-0000-0000-0000-000000000012",
+    "provider": "grok",
+    "name": "o***@z***.net",
+    "email": "o***@z***.net",
+    "identity": "",
+    "status": "ready",
+    "createdAt": "2026-08-20T10:00:00.000000000Z",
+    "updatedAt": "2026-09-15T16:00:43.860363079Z",
+    "credentialUpdatedAt": "2026-09-09T17:50:44.317269492Z"
+   },
+   "current": false,
+   "quota": {
+    "schemaVersion": 1,
+    "provider": "grok",
+    "accountId": "00000000-0000-0000-0000-000000000012",
+    "plan": "SuperGrok",
+    "windows": [
+     {
+      "name": "seven_day",
+      "durationSeconds": 604800,
+      "usedPercent": 58,
+      "remainingPercent": 42,
+      "resetsAt": "2026-09-22T02:00:00Z"
+     }
+    ],
+    "creditsRemaining": 0,
+    "fetchedAt": "2026-09-16T02:46:33.116319637Z"
+   },
+   "stale": true
+  },
+  {
+   "account": {
+    "id": "00000000-0000-0000-0000-000000000013",
+    "provider": "grok",
+    "name": "q***@x***.org",
+    "email": "q***@x***.org",
+    "identity": "",
+    "status": "reauth_required",
+    "createdAt": "2026-08-20T10:00:00.000000000Z",
+    "updatedAt": "2026-09-15T16:00:43.860363079Z",
+    "credentialUpdatedAt": "2026-09-09T17:50:44.317269492Z"
+   },
+   "current": false,
+   "quota": {
+    "schemaVersion": 1,
+    "provider": "grok",
+    "accountId": "00000000-0000-0000-0000-000000000013",
+    "plan": "SuperGrok",
+    "windows": [
+     {
+      "name": "seven_day",
+      "durationSeconds": 604800,
+      "usedPercent": 23,
+      "remainingPercent": 77,
+      "resetsAt": "2026-09-22T02:00:00Z"
+     }
+    ],
+    "creditsRemaining": 0,
+    "fetchedAt": "2026-09-16T02:46:33.116319637Z"
    },
    "stale": false
   }
