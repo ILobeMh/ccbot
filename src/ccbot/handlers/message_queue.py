@@ -3,6 +3,9 @@
 Provides a queue-based message processing system that ensures:
   - Messages are sent in receive order (FIFO)
   - Status messages always follow content messages
+  - Interactive UIs (questions, permission prompts) are queue tasks too, so
+    they always land after the content that preceded them; content that
+    still arrives while a UI is open re-posts the UI below it
   - Consecutive content messages can be merged for efficiency
   - Thread-aware sending: each MessageTask carries an optional thread_id
     for Telegram topic support
@@ -28,8 +31,16 @@ from telegram.constants import ChatAction
 from telegram.error import RetryAfter
 
 from ..session import session_manager
-from ..terminal_parser import parse_status_line
+from ..terminal_parser import is_interactive_ui, parse_status_line
 from ..tmux_manager import tmux_manager
+from .interactive_ui import (
+    clear_interactive_mode,
+    clear_interactive_msg,
+    get_interactive_msg_id,
+    get_interactive_window,
+    handle_interactive_ui,
+    set_interactive_mode,
+)
 from .message_sender import (
     edit_with_fallback,
     send_photo,
@@ -59,7 +70,7 @@ MERGE_MAX_LENGTH = 3800  # Leave room for markdown conversion overhead
 class MessageTask:
     """Message task for queue processing."""
 
-    task_type: Literal["content", "status_update", "status_clear"]
+    task_type: Literal["content", "status_update", "status_clear", "interactive"]
     text: str | None = None
     window_id: str | None = None
     # content type fields
@@ -84,6 +95,9 @@ _tool_msg_ids: dict[tuple[str, int, int], int] = {}
 
 # Status message tracking: (user_id, thread_id_or_0) -> (message_id, window_id, last_text)
 _status_msg_info: dict[tuple[int, int], tuple[int, str, str]] = {}
+
+# Interactive tasks queued but not yet processed: (user_id, thread_id_or_0)
+_pending_interactive: dict[tuple[int, int], int] = {}
 
 # Flood control: user_id -> monotonic time when ban expires
 _flood_until: dict[int, float] = {}
@@ -133,11 +147,13 @@ def _can_merge_tasks(base: MessageTask, candidate: MessageTask) -> bool:
     # tool_use/tool_result break merge chain
     # - tool_use: will be edited later by tool_result
     # - tool_result: edits previous message, merging would cause order issues
-    if base.content_type in ("tool_use", "tool_result"):
-        return False
-    if candidate.content_type in ("tool_use", "tool_result"):
+    # - error: triggers an errors notification carrying its own text/link
+    if base.content_type in _UNMERGEABLE or candidate.content_type in _UNMERGEABLE:
         return False
     return True
+
+
+_UNMERGEABLE = frozenset({"tool_use", "tool_result", "error"})
 
 
 async def _merge_content_tasks(
@@ -196,6 +212,7 @@ async def _merge_content_tasks(
     return (
         MessageTask(
             task_type="content",
+            text="\n\n".join(t.text for t in merged_tasks if t.text) or None,
             window_id=first.window_id,
             parts=merged_parts,
             tool_use_id=first.tool_use_id,
@@ -297,6 +314,8 @@ async def _message_queue_worker(bot: Bot, user_id: int) -> None:
                     await _process_status_update_task(bot, user_id, task)
                 elif task.task_type == "status_clear":
                     await _do_clear_status_message(bot, user_id, task.thread_id or 0)
+                elif task.task_type == "interactive":
+                    await _process_interactive_task(bot, user_id, task)
             except RetryAfter as e:
                 retry_secs = (
                     e.retry_after
@@ -354,7 +373,99 @@ async def _send_task_images(bot: Bot, chat_id: int, task: MessageTask) -> None:
 
 
 async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> None:
-    """Process a content message task."""
+    """Process a content message task.
+
+    If an interactive UI message is open for this topic, it is deleted when
+    the UI is gone from the terminal (it was answered), or re-posted below
+    this content when the UI is still waiting — the question stays last.
+    """
+    ui_waiting = await _settle_open_ui(bot, user_id, task)
+    try:
+        await _send_content_task(bot, user_id, task)
+    finally:
+        if ui_waiting:
+            await handle_interactive_ui(
+                bot, user_id, task.window_id or "", task.thread_id, force_new=True
+            )
+
+
+async def _settle_open_ui(bot: Bot, user_id: int, task: MessageTask) -> bool:
+    """Resolve an open interactive UI message before content is sent.
+
+    Returns True when the UI is still on screen (caller re-posts it after the
+    content); deletes the stale UI message and returns False otherwise.
+    """
+    if get_interactive_msg_id(user_id, task.thread_id) is None:
+        return False
+    if get_interactive_window(user_id, task.thread_id) != task.window_id:
+        return False
+    pane = await tmux_manager.capture_pane(task.window_id or "")
+    if pane and is_interactive_ui(pane):
+        return True
+    await clear_interactive_msg(user_id, bot, task.thread_id)
+    return False
+
+
+# How long an interactive task waits for Claude Code to draw the UI after the
+# transcript announced it (the tool_use line is written slightly earlier).
+INTERACTIVE_RENDER_WAIT = 2.0
+_INTERACTIVE_RENDER_STEP = 0.25
+
+
+async def _process_interactive_task(bot: Bot, user_id: int, task: MessageTask) -> None:
+    """Show the interactive UI of ``task.window_id``, in queue order.
+
+    Waits briefly for the terminal to render it. When nothing renders
+    (already answered, or auto-approved), the task's fallback ``parts`` —
+    the tool_use summary from the transcript — are sent as normal content.
+    """
+    key = (user_id, task.thread_id or 0)
+    try:
+        await _show_interactive(bot, user_id, task)
+    finally:
+        left = _pending_interactive.get(key, 1) - 1
+        if left > 0:
+            _pending_interactive[key] = left
+        else:
+            _pending_interactive.pop(key, None)
+
+
+def has_pending_interactive(user_id: int, thread_id: int | None) -> bool:
+    """True while an interactive task for this topic waits in the queue."""
+    return (user_id, thread_id or 0) in _pending_interactive
+
+
+async def _show_interactive(bot: Bot, user_id: int, task: MessageTask) -> None:
+    wid = task.window_id or ""
+    waited = 0.0
+    while True:
+        if await handle_interactive_ui(bot, user_id, wid, task.thread_id):
+            return
+        if waited >= INTERACTIVE_RENDER_WAIT:
+            break
+        await asyncio.sleep(_INTERACTIVE_RENDER_STEP)
+        waited += _INTERACTIVE_RENDER_STEP
+    if get_interactive_msg_id(user_id, task.thread_id) is None:
+        clear_interactive_mode(user_id, task.thread_id)
+    if task.parts:
+        await _send_content_task(
+            bot,
+            user_id,
+            MessageTask(
+                task_type="content",
+                text=task.text,
+                window_id=wid,
+                parts=task.parts,
+                tool_use_id=task.tool_use_id,
+                content_type="tool_use",
+                thread_id=task.thread_id,
+                entry_ts=task.entry_ts,
+            ),
+        )
+
+
+async def _send_content_task(bot: Bot, user_id: int, task: MessageTask) -> None:
+    """Send (or edit in) one content task."""
     wid = task.window_id or ""
     tid = task.thread_id or 0
     chat_id = session_manager.resolve_chat_id(user_id, task.thread_id)
@@ -626,6 +737,39 @@ async def enqueue_content_message(
         entry_ts=entry_ts,
     )
     queue.put_nowait(task)
+
+
+async def enqueue_interactive(
+    bot: Bot,
+    user_id: int,
+    window_id: str,
+    thread_id: int | None = None,
+    *,
+    fallback_parts: list[str] | None = None,
+    tool_use_id: str | None = None,
+    text: str | None = None,
+    entry_ts: str | None = None,
+) -> None:
+    """Queue showing ``window_id``'s interactive UI after pending content.
+
+    Interactive mode is set right away so the status poller doesn't detect
+    and queue the same UI again while this task waits its turn.
+    ``fallback_parts`` are sent instead when the UI never renders.
+    """
+    set_interactive_mode(user_id, window_id, thread_id)
+    key = (user_id, thread_id or 0)
+    _pending_interactive[key] = _pending_interactive.get(key, 0) + 1
+    get_or_create_queue(bot, user_id).put_nowait(
+        MessageTask(
+            task_type="interactive",
+            text=text,
+            window_id=window_id,
+            thread_id=thread_id,
+            parts=list(fallback_parts or []),
+            tool_use_id=tool_use_id,
+            entry_ts=entry_ts,
+        )
+    )
 
 
 async def enqueue_status_update(

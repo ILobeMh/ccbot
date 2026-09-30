@@ -147,12 +147,16 @@ async def handle_interactive_ui(
     user_id: int,
     window_id: str,
     thread_id: int | None = None,
+    *,
+    force_new: bool = False,
 ) -> bool:
     """Capture terminal and send interactive UI content to user.
 
     Handles AskUserQuestion, ExitPlanMode, Permission Prompt, and
     RestoreCheckpoint UIs. Returns True if UI was detected and sent,
-    False otherwise.
+    False otherwise. An existing UI message is edited in place, unless
+    ``force_new`` asks to re-post it as the newest message in the topic
+    (the old one is deleted once the new one is sent).
     """
     ikey = (user_id, thread_id or 0)
     chat_id = session_manager.resolve_chat_id(user_id, thread_id)
@@ -193,7 +197,7 @@ async def handle_interactive_ui(
 
     # Check if we have an existing interactive message to edit
     existing_msg_id = _interactive_msgs.get(ikey)
-    if existing_msg_id:
+    if existing_msg_id and not force_new:
         try:
             await bot.edit_message_text(
                 chat_id=chat_id,

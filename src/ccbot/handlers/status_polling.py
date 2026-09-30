@@ -23,6 +23,7 @@ Key components:
 import asyncio
 import logging
 import time
+from collections.abc import Awaitable, Callable
 
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest
@@ -43,9 +44,13 @@ from .cleanup import clear_topic_state
 from .interactive_ui import (
     clear_interactive_msg,
     get_interactive_window,
-    handle_interactive_ui,
 )
-from .message_queue import enqueue_status_update, get_message_queue
+from .message_queue import (
+    enqueue_interactive,
+    enqueue_status_update,
+    get_message_queue,
+    has_pending_interactive,
+)
 from .message_sender import safe_send
 from .notifications_topic import mark_ui, notify
 from .resume_offer import offer_resume
@@ -57,6 +62,17 @@ STATUS_POLL_INTERVAL = 1.0  # seconds - faster response (rate limiting at send l
 
 # Topic existence probe interval
 TOPIC_CHECK_INTERVAL = 60.0  # seconds
+
+
+# Runs one transcript-monitor cycle on demand (SessionMonitor.poll_now),
+# registered by the bot at startup.
+_transcript_poller: Callable[[], Awaitable[None]] | None = None
+
+
+def set_transcript_poller(fn: Callable[[], Awaitable[None]] | None) -> None:
+    """Register the monitor's on-demand poll (see update_status_message)."""
+    global _transcript_poller
+    _transcript_poller = fn
 
 
 # Windows the bot is currently (re)starting Claude in — health checks are
@@ -196,6 +212,9 @@ async def update_status_message(
         if is_interactive_ui(pane_text):
             # Interactive UI still showing — skip status update (user is interacting)
             return
+        if has_pending_interactive(user_id, thread_id):
+            # Queued from the transcript; the worker waits for it to render
+            return
         # Interactive UI gone — clear interactive mode, fall through to status check.
         # Don't re-check for new UI this cycle (the old one just disappeared).
         await clear_interactive_msg(user_id, bot, thread_id)
@@ -222,7 +241,13 @@ async def update_status_message(
             window_id,
             thread_id,
         )
-        await handle_interactive_ui(bot, user_id, window_id, thread_id)
+        # The terminal often shows the UI before the transcript lines that
+        # led to it (thinking, text) were read: read them now so they are
+        # queued first, then queue the UI behind them.
+        if _transcript_poller is not None:
+            await _transcript_poller()
+        if get_interactive_window(user_id, thread_id) != window_id:
+            await enqueue_interactive(bot, user_id, window_id, thread_id)
         return
 
     # Normal status line check — skip if queue is non-empty
@@ -274,6 +299,32 @@ async def _handle_vanished_window(
         )
 
 
+async def _poll_binding(bot: Bot, user_id: int, thread_id: int, wid: str) -> None:
+    """One status-poll tick for one topic (never raises)."""
+    try:
+        # Clean up stale bindings (window no longer exists)
+        w = await tmux_manager.find_window_by_id(wid)
+        if not w:
+            await _handle_vanished_window(bot, user_id, thread_id, wid)
+            return
+
+        # UI detection happens unconditionally in update_status_message.
+        # Status enqueue is skipped inside update_status_message when
+        # interactive UI is detected (returns early) or when queue is non-empty.
+        queue = get_message_queue(user_id)
+        skip_status = queue is not None and not queue.empty()
+
+        await update_status_message(
+            bot,
+            user_id,
+            wid,
+            thread_id=thread_id,
+            skip_status=skip_status,
+        )
+    except Exception as e:
+        logger.debug(f"Status update error for user {user_id} thread {thread_id}: {e}")
+
+
 async def status_poll_loop(bot: Bot) -> None:
     """Background task to poll terminal status for all thread-bound windows."""
     logger.info("Status polling started (interval: %ss)", STATUS_POLL_INTERVAL)
@@ -320,32 +371,16 @@ async def status_poll_loop(bot: Bot) -> None:
                             e,
                         )
 
-            for user_id, thread_id, wid in list(session_manager.iter_thread_bindings()):
-                try:
-                    # Clean up stale bindings (window no longer exists)
-                    w = await tmux_manager.find_window_by_id(wid)
-                    if not w:
-                        await _handle_vanished_window(bot, user_id, thread_id, wid)
-                        continue
-
-                    # UI detection happens unconditionally in update_status_message.
-                    # Status enqueue is skipped inside update_status_message when
-                    # interactive UI is detected (returns early) or when queue is non-empty.
-                    queue = get_message_queue(user_id)
-                    skip_status = queue is not None and not queue.empty()
-
-                    await update_status_message(
-                        bot,
-                        user_id,
-                        wid,
-                        thread_id=thread_id,
-                        skip_status=skip_status,
+            # Topics are independent (one window each): poll them together so
+            # one slow capture doesn't delay every other topic.
+            await asyncio.gather(
+                *(
+                    _poll_binding(bot, user_id, thread_id, wid)
+                    for user_id, thread_id, wid in list(
+                        session_manager.iter_thread_bindings()
                     )
-                except Exception as e:
-                    logger.debug(
-                        f"Status update error for user {user_id} "
-                        f"thread {thread_id}: {e}"
-                    )
+                )
+            )
         except Exception as e:
             logger.error(f"Status poll loop error: {e}")
 

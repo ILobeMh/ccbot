@@ -42,34 +42,46 @@ class TestStatusPollerSettingsDetection:
     """
 
     @pytest.mark.asyncio
-    async def test_settings_ui_detected_and_keyboard_sent(
+    async def test_settings_ui_detected_reads_transcript_then_queues_ui(
         self, mock_bot: AsyncMock, sample_pane_settings: str
     ):
-        """Poller captures Settings pane → handle_interactive_ui sends keyboard."""
+        """Poller sees a UI → reads the transcript first, then queues the UI."""
+        from ccbot.handlers import status_polling
+
         window_id = "@5"
         mock_window = MagicMock()
         mock_window.window_id = window_id
+        calls: list[str] = []
 
-        with (
-            patch("ccbot.handlers.status_polling.tmux_manager") as mock_tmux,
-            patch(
-                "ccbot.handlers.status_polling.handle_interactive_ui",
-                new_callable=AsyncMock,
-            ) as mock_handle_ui,
-        ):
-            mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
-            mock_tmux.capture_pane = AsyncMock(return_value=sample_pane_settings)
-            mock_handle_ui.return_value = True
+        async def fake_poll() -> None:
+            calls.append("poll")
 
-            await update_status_message(
-                mock_bot, user_id=1, window_id=window_id, thread_id=42
-            )
+        async def fake_enqueue(bot, user_id, wid, thread_id):
+            calls.append(f"enqueue:{user_id}:{wid}:{thread_id}")
 
-            mock_handle_ui.assert_called_once_with(mock_bot, 1, window_id, 42)
+        status_polling.set_transcript_poller(fake_poll)
+        try:
+            with (
+                patch("ccbot.handlers.status_polling.tmux_manager") as mock_tmux,
+                patch(
+                    "ccbot.handlers.status_polling.enqueue_interactive",
+                    side_effect=fake_enqueue,
+                ),
+            ):
+                mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+                mock_tmux.capture_pane = AsyncMock(return_value=sample_pane_settings)
+
+                await update_status_message(
+                    mock_bot, user_id=1, window_id=window_id, thread_id=42
+                )
+        finally:
+            status_polling.set_transcript_poller(None)
+
+        assert calls == ["poll", "enqueue:1:@5:42"]
 
     @pytest.mark.asyncio
     async def test_normal_pane_no_interactive_ui(self, mock_bot: AsyncMock):
-        """Normal pane text → no handle_interactive_ui call, just status check."""
+        """Normal pane text → no UI queued, just status check."""
         window_id = "@5"
         mock_window = MagicMock()
         mock_window.window_id = window_id
@@ -85,9 +97,9 @@ class TestStatusPollerSettingsDetection:
         with (
             patch("ccbot.handlers.status_polling.tmux_manager") as mock_tmux,
             patch(
-                "ccbot.handlers.status_polling.handle_interactive_ui",
+                "ccbot.handlers.status_polling.enqueue_interactive",
                 new_callable=AsyncMock,
-            ) as mock_handle_ui,
+            ) as mock_enqueue_ui,
             patch(
                 "ccbot.handlers.status_polling.enqueue_status_update",
                 new_callable=AsyncMock,
@@ -100,17 +112,49 @@ class TestStatusPollerSettingsDetection:
                 mock_bot, user_id=1, window_id=window_id, thread_id=42
             )
 
-            mock_handle_ui.assert_not_called()
+            mock_enqueue_ui.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_pending_interactive_task_keeps_mode(
+        self, mock_bot: AsyncMock, sample_pane_settings: str
+    ):
+        """UI queued from the transcript but not drawn yet: poller leaves it be."""
+        from ccbot.handlers import message_queue
+        from ccbot.handlers.interactive_ui import (
+            get_interactive_window,
+            set_interactive_mode,
+        )
+
+        window_id = "@5"
+        mock_window = MagicMock()
+        mock_window.window_id = window_id
+        set_interactive_mode(1, window_id, 42)
+        message_queue._pending_interactive[(1, 42)] = 1
+        try:
+            with (
+                patch("ccbot.handlers.status_polling.tmux_manager") as mock_tmux,
+                patch(
+                    "ccbot.handlers.status_polling.clear_interactive_msg",
+                    new_callable=AsyncMock,
+                ) as mock_clear,
+            ):
+                mock_tmux.find_window_by_id = AsyncMock(return_value=mock_window)
+                mock_tmux.capture_pane = AsyncMock(return_value="idle\n")
+                await update_status_message(
+                    mock_bot, user_id=1, window_id=window_id, thread_id=42
+                )
+            mock_clear.assert_not_called()
+            assert get_interactive_window(1, 42) == window_id
+        finally:
+            message_queue._pending_interactive.clear()
 
     @pytest.mark.asyncio
     async def test_settings_ui_end_to_end_sends_telegram_keyboard(
         self, mock_bot: AsyncMock, sample_pane_settings: str
     ):
-        """Full end-to-end: poller → is_interactive_ui → handle_interactive_ui
-        → bot.send_message with keyboard.
+        """Full path: poller → queue → worker → bot.send_message with keyboard."""
+        from ccbot.handlers import message_queue
 
-        Uses real handle_interactive_ui (not mocked) to verify the full path.
-        """
         window_id = "@5"
         mock_window = MagicMock()
         mock_window.window_id = window_id
@@ -126,18 +170,21 @@ class TestStatusPollerSettingsDetection:
             mock_tmux_ui.capture_pane = AsyncMock(return_value=sample_pane_settings)
             mock_sm.resolve_chat_id.return_value = 100
 
-            await update_status_message(
-                mock_bot, user_id=1, window_id=window_id, thread_id=42
-            )
+            try:
+                await update_status_message(
+                    mock_bot, user_id=1, window_id=window_id, thread_id=42
+                )
+                queue = message_queue.get_message_queue(1)
+                assert queue is not None
+                await queue.join()
+            finally:
+                await message_queue.shutdown_workers()
 
-            # Verify bot.send_message was called with keyboard
             mock_bot.send_message.assert_called_once()
             call_kwargs = mock_bot.send_message.call_args.kwargs
             assert call_kwargs["chat_id"] == 100
             assert call_kwargs["message_thread_id"] == 42
-            keyboard = call_kwargs["reply_markup"]
-            assert keyboard is not None
-            # Verify the message text contains model picker content
+            assert call_kwargs["reply_markup"] is not None
             assert "Select model" in call_kwargs["text"]
 
 

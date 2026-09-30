@@ -139,18 +139,15 @@ from .handlers.directory_browser import (
 from .handlers.history import send_history
 from .handlers.interactive_ui import (
     INTERACTIVE_TOOL_NAMES,
-    clear_interactive_mode,
     clear_interactive_msg,
-    get_interactive_msg_id,
     get_interactive_window,
     handle_interactive_ui,
-    set_interactive_mode,
 )
 from .handlers.message_queue import (
     clear_status_msg_info,
     enqueue_content_message,
+    enqueue_interactive,
     enqueue_status_update,
-    get_message_queue,
     shutdown_workers,
 )
 from .handlers.message_sender import (
@@ -174,7 +171,11 @@ from .handlers.special_topics import (
     special_callback_router,
     special_message_router,
 )
-from .handlers.status_polling import mark_launching, status_poll_loop
+from .handlers.status_polling import (
+    mark_launching,
+    set_transcript_poller,
+    status_poll_loop,
+)
 from .markdown_v2 import convert_markdown
 from .screenshot import text_to_image
 from .session import session_manager
@@ -3019,36 +3020,29 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
         return
 
     for user_id, wid, thread_id in active_users:
-        # Handle interactive tools specially - capture terminal and send UI
+        # Interactive tools (AskUserQuestion, ExitPlanMode): queue the UI
+        # itself, so it is shown after everything that preceded it in the
+        # transcript. The worker falls back to the plain tool_use message if
+        # the terminal never draws the UI. (An open UI message is deleted or
+        # re-posted by the worker when later content arrives — never here,
+        # out of order.)
         if msg.tool_name in INTERACTIVE_TOOL_NAMES and msg.content_type == "tool_use":
-            # Mark interactive mode BEFORE sleeping so polling skips this window
-            set_interactive_mode(user_id, wid, thread_id)
-            # Flush pending messages (e.g. plan content) before sending interactive UI
-            queue = get_message_queue(user_id)
-            if queue:
-                await queue.join()
-            # Wait briefly for Claude Code to render the question UI
-            await asyncio.sleep(0.3)
-            handled = await handle_interactive_ui(bot, user_id, wid, thread_id)
-            if handled:
-                # Update user's read offset
-                session_file = session_manager.resolve_session_file_for_window(wid)
-                if session_file:
-                    try:
-                        file_size = session_file.stat().st_size
-                        session_manager.update_user_window_offset(
-                            user_id, wid, file_size
-                        )
-                    except OSError:
-                        pass
-                continue  # Don't send the normal tool_use message
-            else:
-                # UI not rendered — clear the early-set mode
-                clear_interactive_mode(user_id, thread_id)
-
-        # Any non-interactive message means the interaction is complete — delete the UI message
-        if get_interactive_msg_id(user_id, thread_id):
-            await clear_interactive_msg(user_id, bot, thread_id)
+            await enqueue_interactive(
+                bot,
+                user_id,
+                wid,
+                thread_id,
+                fallback_parts=build_response_parts(
+                    msg.text, msg.is_complete, msg.content_type, msg.role
+                )
+                if config.show_tool_calls
+                else None,
+                tool_use_id=msg.tool_use_id,
+                text=msg.text,
+                entry_ts=msg.timestamp,
+            )
+            _mark_read(user_id, wid)
+            continue
 
         # Skip tool call notifications when CCBOT_SHOW_TOOL_CALLS=false
         if not config.show_tool_calls and msg.content_type in (
@@ -3094,15 +3088,19 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
                 entry_ts=msg.timestamp,
             )
 
-            # Update user's read offset to current file position
-            # This marks these messages as "read" for this user
-            session_file = session_manager.resolve_session_file_for_window(wid)
-            if session_file:
-                try:
-                    file_size = session_file.stat().st_size
-                    session_manager.update_user_window_offset(user_id, wid, file_size)
-                except OSError:
-                    pass
+            _mark_read(user_id, wid)
+
+
+def _mark_read(user_id: int, wid: str) -> None:
+    """Advance the user's read offset for ``wid`` to the transcript's end."""
+    session_file = session_manager.resolve_session_file_for_window(wid)
+    if session_file:
+        try:
+            session_manager.update_user_window_offset(
+                user_id, wid, session_file.stat().st_size
+            )
+        except OSError:
+            pass
 
 
 # --- App lifecycle ---
@@ -3180,6 +3178,7 @@ async def post_init(application: Application) -> None:
     monitor.set_message_callback(message_callback)
     monitor.start()
     session_monitor = monitor
+    set_transcript_poller(monitor.poll_now)
     logger.info("Session monitor started")
 
     # Start status polling task
