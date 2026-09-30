@@ -76,6 +76,14 @@ class ChoiceView:
         return any(c.checked is not None for c in self.choices)
 
     @property
+    def fingerprint(self) -> str:
+        """What is being asked, not tab / checkbox state: two prompts with the
+        same options ("Yes / No" for different commands) differ here."""
+        return label_hash(
+            "\n".join([self.ui_name, self.title, self.question, *self.context])
+        )
+
+    @property
     def signature(self) -> str:
         """Identity of what's on screen (question + tab states), for staleness."""
         tabs = "|".join(f"{s}{t}" for s, t in self.tabs)
@@ -140,11 +148,22 @@ def parse_choices(
     """
     view = ChoiceView(ui_name=ui.name)
     lines = ui.content.split("\n")
+    header: list[str] = []
     if pane_text and ui.name in ("PermissionPrompt", "BashApproval"):
-        lines = _dialog_header(pane_text, ui.content) + lines
-    first_opt = next((i for i, ln in enumerate(lines) if _OPTION_RE.match(ln)), None)
-    if first_opt is None:
+        header = _dialog_header(pane_text, ui.content)
+    # Options come only from the UI's own menu, never from the header (a
+    # command or file preview may contain "1. …" lines), and from the last
+    # numbered block starting at 1 (a numbered list in the question itself
+    # comes before the menu).
+    starts = [
+        i
+        for i, ln in enumerate(lines)
+        if (m := _OPTION_RE.match(ln)) and m.group(2) == "1"
+    ]
+    if not starts:
         return None
+    first_opt = starts[-1] + len(header)
+    lines = header + lines
 
     # -- above the options: tabs / header, context paragraphs, the question
     paragraphs: list[list[str]] = [[]]
@@ -225,6 +244,8 @@ def parse_choices(
             current = None  # a blank line ends an option's continuation
             continue
         m = _OPTION_RE.match(ln)
+        if m and any(c.number == int(m.group(2)) for c in view.choices):
+            break  # numbering restarts: a list below the menu, not options
         if m:
             label = m.group(3)
             checked: bool | None = None

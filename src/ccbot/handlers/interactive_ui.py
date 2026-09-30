@@ -77,6 +77,8 @@ _keypad_mode: set[tuple[int, int]] = set()
 _last_views: dict[tuple[int, int], ChoiceView | None] = {}
 # window_id -> AskUserQuestion "questions" input (titles for tabs)
 _questions: dict[str, list[dict[str, Any]]] = {}
+# Topics where a tapped option is being typed right now
+_answering: set[tuple[int, int]] = set()
 
 
 def get_interactive_window(user_id: int, thread_id: int | None = None) -> str | None:
@@ -330,7 +332,9 @@ def _choice_keyboard(window_id: str, view: ChoiceView) -> InlineKeyboardMarkup:
     """One button per option (tap = answer), plus navigation and escape."""
 
     def cb(c: Choice) -> str:
-        return f"{CB_CHOICE}{window_id}:{c.number}:{label_hash(c.label)}"[:64]
+        # option label hash + prompt fingerprint: a tap only acts on the very
+        # prompt it was shown for (see answer_choice)
+        return f"{CB_CHOICE}{window_id}:{c.number}:{choice_token(view, c)}"[:64]
 
     options = [c for c in view.choices if c.number <= 9]
     main = [
@@ -378,6 +382,11 @@ def _choice_keyboard(window_id: str, view: ChoiceView) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def choice_token(view: ChoiceView, choice: Choice) -> str:
+    """8 hex chars identifying ``choice`` within ``view``'s prompt."""
+    return label_hash(choice.label) + view.fingerprint
+
+
 def remember_questions(window_id: str, tool_input: dict[str, Any] | None) -> None:
     """Keep the AskUserQuestion input so tabs can be titled by their header."""
     questions = (tool_input or {}).get("questions")
@@ -406,19 +415,42 @@ async def answer_choice(
     thread_id: int | None,
     window_id: str,
     number: int,
-    expected_hash: str,
+    token: str,
 ) -> str:
     """Type option ``number`` into the UI, after checking it's still the same.
 
+    ``token`` (choice_token) must match both the option and the prompt on
+    screen now; otherwise nothing is typed and the message is refreshed.
     Returns the toast to show on the tapped button.
     """
+    ikey = (user_id, thread_id or 0)
+    _answering.add(ikey)
+    try:
+        return await _answer_choice(bot, user_id, thread_id, window_id, number, token)
+    finally:
+        _answering.discard(ikey)
+
+
+def is_answering(user_id: int, thread_id: int | None) -> bool:
+    """True while a tap is being typed (the poller must not clear the UI)."""
+    return (user_id, thread_id or 0) in _answering
+
+
+async def _answer_choice(
+    bot: Bot,
+    user_id: int,
+    thread_id: int | None,
+    window_id: str,
+    number: int,
+    token: str,
+) -> str:
     pane = await tmux_manager.capture_pane(window_id)
     ui = extract_interactive_content(pane) if pane else None
     view = parse_choices(ui, pane, _questions.get(window_id)) if ui else None
     choice = (
         next((c for c in view.choices if c.number == number), None) if view else None
     )
-    if view is None or choice is None or label_hash(choice.label) != expected_hash:
+    if view is None or choice is None or choice_token(view, choice) != token:
         if not await handle_interactive_ui(bot, user_id, window_id, thread_id):
             await clear_interactive_msg(user_id, bot, thread_id)
         return "That question has changed — showing the current one"
@@ -445,7 +477,11 @@ async def answer_choice(
         await handle_interactive_ui(bot, user_id, window_id, thread_id)
         return "✍️ Now type your answer as a message"
     if not await handle_interactive_ui(bot, user_id, window_id, thread_id):
-        await _finalize(bot, user_id, thread_id, view, choice)
+        # A half-drawn capture can look like "no UI": look once more before
+        # recording the prompt as answered
+        await asyncio.sleep(0.4)
+        if not await handle_interactive_ui(bot, user_id, window_id, thread_id):
+            await _finalize(bot, user_id, thread_id, view, choice)
     return f"✓ {choice.label[:40]}"
 
 
@@ -461,6 +497,7 @@ async def _finalize(
     msg_id = _interactive_msgs.pop(ikey, None)
     _interactive_mode.pop(ikey, None)
     _last_views.pop(ikey, None)
+    _keypad_mode.discard(ikey)
     if msg_id is None:
         return
     title = view.title or "Question"
@@ -487,6 +524,8 @@ async def clear_interactive_msg(
     ikey = (user_id, thread_id or 0)
     msg_id = _interactive_msgs.pop(ikey, None)
     _interactive_mode.pop(ikey, None)
+    _last_views.pop(ikey, None)
+    _keypad_mode.discard(ikey)
     logger.debug(
         "Clear interactive msg: user=%d, thread=%s, msg_id=%s",
         user_id,

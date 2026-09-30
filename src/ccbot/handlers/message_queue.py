@@ -226,7 +226,12 @@ async def _merge_content_tasks(
     return (
         MessageTask(
             task_type="content",
-            text="\n\n".join(t.text for t in merged_tasks if t.text) or None,
+            text="\n\n".join(
+                t.text
+                for t in merged_tasks
+                if t.text and t.content_type != "turn_duration"
+            )
+            or None,
             window_id=first.window_id,
             parts=merged_parts,
             tool_use_id=first.tool_use_id,

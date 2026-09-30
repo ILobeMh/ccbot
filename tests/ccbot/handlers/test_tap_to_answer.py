@@ -6,7 +6,6 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from ccbot.handlers import interactive_ui as iu
-from ccbot.ui_choices import label_hash
 
 PANES = Path(__file__).parent.parent / "fixtures" / "panes"
 IDLE = "done\n" + "─" * 40 + "\n❯ \n" + "─" * 40 + "\n  ⏸ manual mode on\n"
@@ -55,11 +54,23 @@ def _pane(name: str) -> str:
     return (PANES / f"{name}.txt").read_text()
 
 
+def _token(pane: str, number: int) -> str:
+    """The callback token a button for option ``number`` on ``pane`` carries."""
+    from ccbot.terminal_parser import extract_interactive_content
+    from ccbot.ui_choices import parse_choices
+
+    view = parse_choices(extract_interactive_content(pane), pane)
+    choice = next(c for c in view.choices if c.number == number)
+    return iu.choice_token(view, choice)
+
+
 @pytest.mark.asyncio
 async def test_tap_types_the_digit_and_records_the_answer(env):
     env["panes"] = [_pane("ask_single"), IDLE]
     iu._interactive_msgs[(1, 42)] = 77
-    toast = await iu.answer_choice(AsyncMock(), 1, 42, "@5", 2, label_hash("staging"))
+    toast = await iu.answer_choice(
+        AsyncMock(), 1, 42, "@5", 2, _token(_pane("ask_single"), 2)
+    )
     assert env["keys"] == ["2"]
     assert toast == "✓ staging"
     # UI gone → the question message becomes a one-line record (no keyboard)
@@ -73,7 +84,9 @@ async def test_tap_types_the_digit_and_records_the_answer(env):
 async def test_stale_tap_is_refused(env):
     env["panes"] = [_pane("ask_multi_tab1")]  # a different question is showing
     iu._interactive_msgs[(1, 42)] = 77
-    toast = await iu.answer_choice(AsyncMock(), 1, 42, "@5", 2, label_hash("staging"))
+    toast = await iu.answer_choice(
+        AsyncMock(), 1, 42, "@5", 2, _token(_pane("ask_single"), 2)
+    )
     assert env["keys"] == []
     assert "changed" in toast
     # …and the message is refreshed to the current question
@@ -87,7 +100,7 @@ async def test_picker_digit_is_confirmed_with_enter(env):
         "     4. Sonnet", "   ❯ 4. Sonnet"
     )
     env["panes"] = [picker, moved, IDLE]
-    await iu.answer_choice(AsyncMock(), 1, 42, "@5", 4, label_hash("Sonnet"))
+    await iu.answer_choice(AsyncMock(), 1, 42, "@5", 4, _token(picker, 4))
     assert env["keys"] == ["4", "Enter"]
 
 
@@ -97,7 +110,9 @@ async def test_question_digit_is_not_followed_by_enter(env):
     # Enter would answer the next question — must not happen
     env["panes"] = [_pane("ask_multi_tab1"), _pane("ask_multi_tab2")]
     iu._interactive_msgs[(1, 42)] = 77
-    await iu.answer_choice(AsyncMock(), 1, 42, "@5", 1, label_hash("red"))
+    await iu.answer_choice(
+        AsyncMock(), 1, 42, "@5", 1, _token(_pane("ask_multi_tab1"), 1)
+    )
     assert env["keys"] == ["1"]
     assert "Extras" in env["edits"][-1][1]  # message now shows the next tab
 
@@ -107,7 +122,7 @@ async def test_other_asks_to_type(env):
     env["panes"] = [_pane("ask_single")]
     iu._interactive_msgs[(1, 42)] = 77
     toast = await iu.answer_choice(
-        AsyncMock(), 1, 42, "@5", 4, label_hash("Type something.")
+        AsyncMock(), 1, 42, "@5", 4, _token(_pane("ask_single"), 4)
     )
     assert env["keys"] == ["4"]
     assert "type your answer" in toast
@@ -117,3 +132,30 @@ def test_keypad_toggle():
     iu._keypad_mode.clear()
     assert iu.toggle_keypad(1, 42) is True
     assert iu.toggle_keypad(1, 42) is False
+
+
+@pytest.mark.asyncio
+async def test_yes_for_one_command_never_approves_another(env):
+    """Review finding: a late 'Yes' tap on an old prompt is refused."""
+    first = _pane("permission_bash")
+    second = first.replace("echo hello > /tmp/ccbot_cap_test2.txt", "git push --force")
+    env["panes"] = [second]
+    iu._interactive_msgs[(1, 42)] = 77
+    toast = await iu.answer_choice(AsyncMock(), 1, 42, "@5", 1, _token(first, 1))
+    assert env["keys"] == []
+    assert "changed" in toast
+
+
+@pytest.mark.asyncio
+async def test_answering_flag_is_set_while_typing(env):
+    seen = []
+
+    async def send_keys(window_id, text, enter=True, literal=True):
+        seen.append(iu.is_answering(1, 42))
+        return True
+
+    iu.tmux_manager.send_keys = send_keys
+    env["panes"] = [_pane("ask_single"), IDLE]
+    await iu.answer_choice(AsyncMock(), 1, 42, "@5", 1, _token(_pane("ask_single"), 1))
+    assert seen == [True]
+    assert not iu.is_answering(1, 42)

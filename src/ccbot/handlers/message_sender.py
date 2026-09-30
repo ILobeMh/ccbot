@@ -49,6 +49,7 @@ from aiogram.types import (
 
 from ..markdown_v2 import convert_markdown
 from ..rich_render import is_rtl
+from ..telegram_sender import TELEGRAM_MAX_MESSAGE_LENGTH, split_message, utf16_len
 from ..transcript_parser import TranscriptParser
 
 logger = logging.getLogger(__name__)
@@ -362,30 +363,36 @@ async def send_rich(
         )
     except TelegramRetryAfter:
         raise
-    except TelegramBadRequest as e:
-        logger.warning("send_rich_message(%s) rejected, sending plain: %s", chat_id, e)
     except _TRANSPORT_ERRORS as e:
         logger.warning(
             "send_rich_message(%s): transport error, not retrying: %s", chat_id, e
         )
         return None
     except Exception as e:
-        logger.error("send_rich_message(%s) failed: %s", chat_id, e)
-        return None
+        # BadRequest (markup rejected) or anything else the API refuses:
+        # the content must not be lost — send it as plain text instead
+        logger.warning("send_rich_message(%s) failed, sending plain: %s", chat_id, e)
     kwargs.pop("link_preview_options", None)
-    try:
-        return await bot.send_message(
-            chat_id=chat_id,
-            text=markdown,
-            parse_mode=None,
-            link_preview_options=NO_LINK_PREVIEW,
-            **kwargs,
-        )
-    except TelegramRetryAfter:
-        raise
-    except Exception as e:
-        logger.error("send_message(%s) plain fallback failed: %s", chat_id, e)
-        return None
+    markup = kwargs.pop("reply_markup", None)
+    chunks = split_message(markdown) or [markdown]
+    sent: Message | None = None
+    for i, chunk in enumerate(chunks):
+        last = i == len(chunks) - 1
+        try:
+            sent = await bot.send_message(
+                chat_id=chat_id,
+                text=chunk,
+                parse_mode=None,
+                link_preview_options=NO_LINK_PREVIEW,
+                reply_markup=markup if last else None,
+                **kwargs,
+            )
+        except TelegramRetryAfter:
+            raise
+        except Exception as e:
+            logger.error("send_message(%s) plain fallback failed: %s", chat_id, e)
+            return sent
+    return sent
 
 
 async def edit_rich(
@@ -426,6 +433,8 @@ async def edit_rich(
     except Exception as e:
         logger.error("%s failed: %s", what, e)
         return False
+    if utf16_len(markdown) > TELEGRAM_MAX_MESSAGE_LENGTH:
+        return False  # too long for plain text: caller sends it anew (split)
     try:
         await bot.edit_message_text(
             chat_id=chat_id,

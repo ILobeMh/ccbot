@@ -120,7 +120,7 @@ def test_render_and_keyboard(name):
     assert all(len(b.callback_data.encode()) <= 64 for b in buttons)
     option_cbs = [b.callback_data for b in buttons if b.callback_data.startswith("ch:")]
     for c in v.choices:
-        assert f"ch:@12:{c.number}:{label_hash(c.label)}" in option_cbs
+        assert f"ch:@12:{c.number}:{label_hash(c.label)}{v.fingerprint}" in option_cbs
     assert any(b.text == "⌨️ Keys" for b in buttons)
 
 
@@ -137,3 +137,36 @@ def test_tabs_get_prev_next_and_other_buttons():
     assert "‹ Prev" in texts and "Next ›" in texts
     assert "✍️ Other…" in texts and "💬 Chat about this" in texts
     assert "☐ cheese" in texts
+
+
+def test_numbered_lines_in_a_command_are_not_options():
+    """Review finding: a heredoc with '1. Install' must not become buttons."""
+    pane = (
+        (PANES / "permission_bash.txt")
+        .read_text()
+        .replace(
+            "   echo hello > /tmp/ccbot_cap_test2.txt",
+            "   cat <<EOF\n   1. Install\n   2. Run\n   3. Deploy\n   EOF",
+        )
+    )
+    ui = extract_interactive_content(pane)
+    assert ui is not None
+    v = parse_choices(ui, pane)
+    assert v is not None
+    assert [c.label for c in v.choices] == [
+        "Yes",
+        "Yes, and always allow access to /tmp from this project",
+        "No",
+    ]
+    assert "1. Install" in v.context
+
+
+def test_same_options_different_command_have_different_fingerprints():
+    """Review finding: 'Yes' for one command must not approve another."""
+    pane = (PANES / "permission_bash.txt").read_text()
+    other = pane.replace("echo hello > /tmp/ccbot_cap_test2.txt", "git push --force")
+    a = parse_choices(extract_interactive_content(pane), pane)
+    b = parse_choices(extract_interactive_content(other), other)
+    assert a is not None and b is not None
+    assert [c.label for c in a.choices] == [c.label for c in b.choices]
+    assert a.fingerprint != b.fingerprint

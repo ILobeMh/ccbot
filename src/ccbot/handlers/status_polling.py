@@ -45,6 +45,7 @@ from .cleanup import clear_topic_state
 from .interactive_ui import (
     clear_interactive_msg,
     get_interactive_window,
+    is_answering,
 )
 from .message_queue import (
     enqueue_interactive,
@@ -223,6 +224,9 @@ async def update_status_message(
             return
         if has_pending_interactive(user_id, thread_id):
             # Queued from the transcript; the worker waits for it to render
+            return
+        if is_answering(user_id, thread_id):
+            # A tapped option is being typed; answer_choice records the result
             return
         # Interactive UI gone — clear interactive mode, fall through to status check.
         # Don't re-check for new UI this cycle (the old one just disappeared).

@@ -178,3 +178,31 @@ class TestSafeEditTargets:
         query = MagicMock(spec=CallbackQuery)
         query.message = MagicMock()  # InaccessibleMessage: not a Message
         await safe_edit(query, "hi")  # must not raise
+
+
+class TestRichFallback:
+    @pytest.mark.asyncio
+    async def test_rejected_rich_message_is_sent_as_split_plain_text(self):
+        from ccbot.handlers.message_sender import send_rich
+
+        bot = MagicMock()
+        bot.send_rich_message = AsyncMock(side_effect=BadRequest("too many blocks"))
+        sent = [MagicMock(message_id=i) for i in range(5)]
+        bot.send_message = AsyncMock(side_effect=sent)
+        long_md = "\n".join("line %04d " % i + "x" * 60 for i in range(400))
+        result = await send_rich(bot, -100, long_md, message_thread_id=7)
+        assert result is not None
+        calls = bot.send_message.await_args_list
+        assert len(calls) > 1  # split: nothing lost, no "message is too long"
+        assert all(len(c.kwargs["text"]) <= 4096 for c in calls)
+        assert all(c.kwargs["message_thread_id"] == 7 for c in calls)
+        assert all(c.kwargs["parse_mode"] is None for c in calls)
+
+    @pytest.mark.asyncio
+    async def test_rejected_long_rich_edit_asks_caller_to_resend(self):
+        from ccbot.handlers.message_sender import edit_rich
+
+        bot = MagicMock()
+        bot.edit_message_text = AsyncMock(side_effect=BadRequest("bad markup"))
+        assert await edit_rich(bot, -100, 5, "y" * 9000) is False
+        assert bot.edit_message_text.await_count == 1  # no doomed plain edit

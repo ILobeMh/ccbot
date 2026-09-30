@@ -2820,6 +2820,9 @@ async def callback_handler(
         if not number_s.isdigit():
             await query.answer("Invalid option")
             return
+        if session_manager.resolve_window_for_thread(user.id, thread_id) != window_id:
+            await query.answer("This topic is no longer bound to that window")
+            return
         toast = await answer_choice(
             bot, user.id, thread_id, window_id, int(number_s), label_h
         )

@@ -1336,9 +1336,20 @@ class SessionManager:
                 "timestamp": e.timestamp,
             }
             for e in parsed_entries
+            if not _short_turn_footer(e)
         ]
 
         return all_messages, len(all_messages)
+
+
+def _short_turn_footer(entry: Any) -> bool:
+    """ "✻ Worked for 3s" lines of quick turns are noise in /history."""
+    if entry.content_type != "turn_duration":
+        return False
+    try:
+        return float(entry.raw or 0) < 10
+    except ValueError:
+        return True
 
 
 session_manager = SessionManager()
