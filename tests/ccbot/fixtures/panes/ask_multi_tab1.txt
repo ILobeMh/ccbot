@@ -1,0 +1,24 @@
+
+
+❯ Call AskUserQuestion exactly once with TWO questions: (1) header "Color",
+  question "Which color?", single-select, options red, green, blue each with a
+  one-word description; (2) header "Extras", question "Which extras?",
+  multiSelect true, options cheese, olives, onions. Nothing else.
+
+  Thought for 2s
+────────────────────────────────────────────────────────────────────────────────
+←  ☐ Color  ☐ Extras  ✔ Submit  →
+
+Which color?
+
+❯ 1. red
+     bold
+  2. green
+     fresh
+  3. blue
+     cool
+  4. Type something.
+────────────────────────────────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel

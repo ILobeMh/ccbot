@@ -1,0 +1,24 @@
+
+❯ Call AskUserQuestion exactly once with TWO questions: (1) header "Color",
+  question "Which color?", single-select, options red, green, blue each with a
+  one-word description; (2) header "Extras", question "Which extras?",
+  multiSelect true, options cheese, olives, onions. Nothing else.
+
+  Thought for 2s
+
+────────────────────────────────────────────────────────────────────────────────
+←  ☒ Color  ☒ Extras  ✔ Submit  →
+
+Review your answers
+
+ ● Which color?
+   → green
+ ● Which extras?
+   → cheese, onions
+
+Ready to submit your answers?
+
+❯ 1. Submit answers
+  2. Cancel
+
+

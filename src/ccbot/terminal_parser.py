@@ -85,9 +85,12 @@ UI_PATTERNS: list[UIPattern] = [
             re.compile(r"^\s*Would you like to proceed\?"),
             # v2.1.29+: longer prefix that may wrap across lines
             re.compile(r"^\s*Claude has written up a plan"),
+            # 2.1.28x: the plan preview box starts with "Ready to code?"
+            re.compile(r"^\s*Ready to code\?"),
         ),
         bottom=(
-            re.compile(r"^\s*ctrl-g to edit in "),
+            # "ctrl-g to edit in …" (older) / "ctrl+g to edit in nano ·" (2.1.28x)
+            re.compile(r"^\s*ctrl[-+]g to edit in "),
             re.compile(r"^\s*Esc to (cancel|exit)"),
         ),
     ),

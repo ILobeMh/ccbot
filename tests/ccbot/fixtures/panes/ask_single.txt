@@ -1,0 +1,24 @@
+
+❯ Call the AskUserQuestion tool exactly once with ONE question: header
+  "Deploy", question "Which server should I deploy to?", single-select,
+  options: "mh-de" (description "production, Germany"), "staging" (description
+  "test box"), "both" (description "staging first, then prod"). Do nothing
+  else, no other tools.
+
+  Thought for 2s
+────────────────────────────────────────────────────────────────────────────────
+ ☐ Deploy
+
+Which server should I deploy to?
+
+❯ 1. mh-de
+     production, Germany
+  2. staging
+     test box
+  3. both
+     staging first, then prod
+  4. Type something.
+────────────────────────────────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel

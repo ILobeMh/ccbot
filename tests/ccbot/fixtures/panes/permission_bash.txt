@@ -1,0 +1,24 @@
+
+ ▐▛███▛█   Claude Code v2.1.285
+▝▜██████▀  Haiku 4.5 · Claude Pro
+ ▝▝   ▝▝   ~/tmp/ccbot-cap
+
+
+❯ Use the Bash tool to run exactly: echo hello > /tmp/ccbot_cap_test2.txt
+  (description: Write a test file). Nothing else.
+
+  Writing a test file
+  ⎿  $ echo hello > /tmp/ccbot_cap_test2.txt
+
+────────────────────────────────────────────────────────────────────────────────
+ Bash command
+
+   echo hello > /tmp/ccbot_cap_test2.txt
+   Write a test file
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and always allow access to /tmp from this project
+   3. No
+
+ Esc to cancel · Tab to amend
