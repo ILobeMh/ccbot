@@ -1,14 +1,18 @@
 """Tmux session/window management via libtmux.
 
 Wraps libtmux to provide async-friendly operations on a single tmux session:
-  - list_windows / find_window_by_name: discover Claude Code windows.
+  - list_windows / find_window_by_name: discover Claude Code windows. A tmux
+    that doesn't answer is "unknown", never "no windows": list_windows()
+    serves the last good listing briefly, list_windows_strict() raises
+    TmuxUnavailable.
   - capture_pane: read terminal content (plain or with ANSI colors) in one tmux fork.
   - send_keys: forward user input or control keys to a window.
   - create_window / kill_window: lifecycle management.
 
 All blocking libtmux calls are wrapped in asyncio.to_thread().
 
-Key class: TmuxManager (singleton instantiated as `tmux_manager`).
+Key classes: TmuxManager (singleton instantiated as `tmux_manager`),
+TmuxWindow, TmuxUnavailable.
 """
 
 from __future__ import annotations
@@ -117,6 +121,10 @@ class TmuxWindow:
     pane_current_command: str = ""  # Process running in active pane
 
 
+class TmuxUnavailable(RuntimeError):
+    """tmux did not answer (timeout, error): the window state is unknown."""
+
+
 class TmuxManager:
     """Manages tmux windows for Claude Code sessions."""
 
@@ -131,6 +139,9 @@ class TmuxManager:
         self._list_lock = asyncio.Lock()
         self._windows_cache: list[TmuxWindow] | None = None
         self._windows_cache_at = 0.0
+        # Last successful listing, served (briefly) when tmux doesn't answer
+        self._last_good: list[TmuxWindow] | None = None
+        self._last_good_at = 0.0
 
     @property
     def server(self) -> libtmux.Server:
@@ -181,6 +192,8 @@ class TmuxManager:
     # every send/capture, so it is cached briefly and done with a single
     # tmux fork instead of libtmux's per-window list-panes calls.
     _LIST_WINDOWS_TTL = 0.5
+    # How long a failed listing may fall back to the last good one
+    _STALE_WINDOWS_OK = 30.0
     # tmux ≤3.5 escapes control characters in -F output ("\037"), so the
     # separator must be printable; ␞ (U+241E) is what libtmux uses too.
     _LIST_SEP = "\u241e"
@@ -197,14 +210,25 @@ class TmuxManager:
     async def list_windows(self) -> list[TmuxWindow]:
         """List all windows in the session with their working directories.
 
-        Results are cached for _LIST_WINDOWS_TTL seconds. An empty result
-        is double-checked against the session's existence so a transient
-        tmux hiccup never looks like "all windows are gone" to callers
-        that unbind topics based on it.
-
-        Returns:
-            List of TmuxWindow with window info and cwd
+        Results are cached for _LIST_WINDOWS_TTL seconds. When tmux doesn't
+        answer (timeout under load, error), the last good listing is returned
+        for up to _STALE_WINDOWS_OK seconds instead of an empty one: callers
+        unbind topics whose window is missing, so a hiccup must never look
+        like "all windows are gone". Use list_windows_strict() where an
+        unknown state must be told apart from an empty one.
         """
+        try:
+            return await self.list_windows_strict()
+        except TmuxUnavailable as e:
+            age = time.monotonic() - self._last_good_at
+            if self._last_good is not None and age < self._STALE_WINDOWS_OK:
+                logger.warning("%s; using the window list from %.0fs ago", e, age)
+                return list(self._last_good)
+            logger.warning("%s; no recent window list to fall back on", e)
+            return []
+
+    async def list_windows_strict(self) -> list[TmuxWindow]:
+        """Like list_windows(), but raises TmuxUnavailable instead of guessing."""
         async with self._list_lock:
             now = time.monotonic()
             if self._windows_cache is not None and (
@@ -213,14 +237,15 @@ class TmuxManager:
                 return list(self._windows_cache)
 
             windows = await asyncio.to_thread(self._sync_list_windows)
+            if windows is None:
+                raise TmuxUnavailable("tmux list-panes did not answer")
             if not windows and not await asyncio.to_thread(self.get_session):
-                # Session unreachable — surface an empty list but do NOT
-                # cache it so the next call re-probes immediately.
-                logger.warning("tmux session '%s' unreachable", self.session_name)
-                return []
+                raise TmuxUnavailable(f"tmux session '{self.session_name}' unreachable")
 
             self._windows_cache = windows
             self._windows_cache_at = now
+            self._last_good = windows
+            self._last_good_at = now
             return list(windows)
 
     async def pane_pids(self) -> dict[str, int]:
@@ -290,11 +315,12 @@ class TmuxManager:
         """Drop the list_windows cache (after create/kill/rename)."""
         self._windows_cache = None
 
-    def _sync_list_windows(self) -> list[TmuxWindow]:
+    def _sync_list_windows(self) -> list[TmuxWindow] | None:
         """Single `tmux list-panes -s` call, parsed with a \x1f separator.
 
         Avoids libtmux's per-window queries and its zip(strict=True) crash
-        when any format field contains a newline.
+        when any format field contains a newline. Returns None when tmux
+        failed to answer (the window state is then unknown, not empty).
         """
         try:
             result = subprocess.run(
@@ -313,11 +339,11 @@ class TmuxManager:
                 check=False,
             )
         except (OSError, subprocess.SubprocessError) as e:
-            logger.debug("tmux list-panes failed: %s", e)
-            return []
+            logger.warning("tmux list-panes failed: %s", e)
+            return None
         if result.returncode != 0:
             logger.debug("tmux list-panes failed: %s", result.stderr.strip())
-            return []
+            return None
 
         windows: list[TmuxWindow] = []
         seen: set[str] = set()

@@ -64,6 +64,11 @@ STATUS_POLL_INTERVAL = 1.0  # seconds - faster response (rate limiting at send l
 # Topic existence probe interval
 TOPIC_CHECK_INTERVAL = 60.0  # seconds
 
+# Consecutive polls a bound window must be missing before the topic is
+# unbound (a single failed/odd tmux listing must not cost a binding)
+VANISHED_AFTER_POLLS = 3
+_missing_polls: dict[str, int] = {}
+
 
 # Runs one transcript-monitor cycle on demand (SessionMonitor.poll_now),
 # registered by the bot at startup.
@@ -273,12 +278,15 @@ async def update_status_message(
     # If no status line, keep existing status message (don't clear on transient state)
 
 
-async def _handle_vanished_window(
+async def handle_vanished_window(
     bot: Bot, user_id: int, thread_id: int, window_id: str
-) -> None:
-    """Unbind a topic whose window disappeared and offer ▶ Resume in it."""
+) -> bool:
+    """Unbind a topic whose window disappeared and offer ▶ Resume in it.
+
+    Returns True when a resume offer was posted.
+    """
     if session_manager.get_window_for_thread(user_id, thread_id) != window_id:
-        return  # unbound meanwhile (e.g. /kill) — whoever did it reports it
+        return False  # unbound meanwhile (e.g. /kill) — whoever did it reports it
     ws = session_manager.window_states.get(window_id)
     sid, cwd = (ws.session_id, ws.cwd) if ws else ("", "")
     mode = session_manager.get_launch_info(window_id).get("mode") or "default"
@@ -292,27 +300,34 @@ async def _handle_vanished_window(
         thread_id,
         window_id,
     )
-    if sid and cwd:
-        await offer_resume(
-            bot,
-            user_id,
-            thread_id,
-            headline=f"⚠️ The tmux window of `{display}` is gone.",
-            session_id=sid,
-            cwd=cwd,
-            mode=mode,
-            name=display,
-        )
+    if not (sid and cwd):
+        return False
+    return await offer_resume(
+        bot,
+        user_id,
+        thread_id,
+        headline=f"⚠️ The tmux window of `{display}` is gone.",
+        session_id=sid,
+        cwd=cwd,
+        mode=mode,
+        name=display,
+    )
 
 
 async def _poll_binding(bot: Bot, user_id: int, thread_id: int, wid: str) -> None:
     """One status-poll tick for one topic (never raises)."""
     try:
-        # Clean up stale bindings (window no longer exists)
+        # Clean up stale bindings (window no longer exists) — only after it
+        # was missing from several listings in a row, never on one miss
         w = await tmux_manager.find_window_by_id(wid)
         if not w:
-            await _handle_vanished_window(bot, user_id, thread_id, wid)
+            misses = _missing_polls.get(wid, 0) + 1
+            _missing_polls[wid] = misses
+            if misses >= VANISHED_AFTER_POLLS:
+                _missing_polls.pop(wid, None)
+                await handle_vanished_window(bot, user_id, thread_id, wid)
             return
+        _missing_polls.pop(wid, None)
 
         # UI detection happens unconditionally in update_status_message.
         # Status enqueue is skipped inside update_status_message when

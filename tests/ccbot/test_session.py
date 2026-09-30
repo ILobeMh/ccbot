@@ -230,6 +230,9 @@ class TestResolveStaleIds:
 
         monkeypatch.setattr(session_mod.tmux_manager, "list_windows", fake_list_windows)
         monkeypatch.setattr(
+            session_mod.tmux_manager, "list_windows_strict", fake_list_windows
+        )
+        monkeypatch.setattr(
             session_mod.tmux_manager, "server_start_time", fake_start_time
         )
         # Point session_map at a nonexistent file so the trailing
@@ -389,6 +392,31 @@ class TestResolveStaleIds:
         self._setup(mgr, monkeypatch, tmp_path, [TmuxWindow("@1", "x", "/x")])
         await mgr.resolve_stale_ids()
         assert mgr.get_window_for_thread(100, 42) is None
+        assert mgr.pop_lost_bindings() == []
+
+
+class TestResolveStaleIdsTmuxDown:
+    """A tmux that doesn't answer at startup must never cost a binding."""
+
+    @pytest.mark.asyncio
+    async def test_unknown_tmux_state_keeps_everything(
+        self, mgr: SessionManager, monkeypatch, tmp_path
+    ) -> None:
+        from ccbot.tmux_manager import TmuxUnavailable
+
+        async def down() -> list[TmuxWindow]:
+            raise TmuxUnavailable("tmux list-panes did not answer")
+
+        monkeypatch.setattr(session_mod.tmux_manager, "list_windows_strict", down)
+        monkeypatch.setattr(session_mod, "STARTUP_LIST_RETRY_DELAY", 0.0)
+        mgr.bind_thread(100, 42, "@5", window_name="proj")
+        state = mgr.get_window_state("@5")
+        state.session_id = "sid"
+
+        await mgr.resolve_stale_ids()
+
+        assert mgr.get_window_for_thread(100, 42) == "@5"
+        assert mgr.window_states["@5"].session_id == "sid"
         assert mgr.pop_lost_bindings() == []
 
 

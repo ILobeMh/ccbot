@@ -172,6 +172,7 @@ from .handlers.special_topics import (
     special_message_router,
 )
 from .handlers.status_polling import (
+    handle_vanished_window,
     mark_launching,
     set_transcript_poller,
     status_poll_loop,
@@ -1808,11 +1809,16 @@ async def _handle_text(
             user.id,
             thread_id,
         )
-        session_manager.unbind_thread(user.id, thread_id)
+        offered = await handle_vanished_window(context.bot, user.id, thread_id, wid)
         await safe_reply(
             update.message,
-            f"❌ Window '{display}' no longer exists. Binding removed.\n"
-            "Send a message to start a new session.",
+            f"❌ Not sent: the window of '{display}' no longer exists. "
+            + (
+                "Tap ▶ Resume above to bring the session back, or send a path "
+                "to start a new one."
+                if offered
+                else "Send a message to start a new session."
+            ),
         )
         return
 

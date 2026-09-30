@@ -86,6 +86,54 @@ class TestListWindows:
         assert calls == 1
 
 
+class TestListWindowsWhenTmuxHangs:
+    """A tmux that times out is 'unknown', never 'no windows' (a live topic
+    was once unbound because list-panes timed out under load)."""
+
+    def _ok_then_timeout(self, monkeypatch):
+        state = {"hang": False}
+
+        def fake_run(*a, **k):
+            if state["hang"]:
+                raise subprocess.TimeoutExpired(cmd="tmux", timeout=5)
+            return _completed("@11␞proj␞/p␞claude␞1")
+
+        monkeypatch.setattr(tm.subprocess, "run", fake_run)
+        return state
+
+    @pytest.mark.asyncio
+    async def test_timeout_serves_last_good_listing(self, mgr, monkeypatch):
+        state = self._ok_then_timeout(monkeypatch)
+        assert [w.window_id for w in await mgr.list_windows()] == ["@11"]
+        mgr.invalidate_windows_cache()
+        state["hang"] = True
+        assert [w.window_id for w in await mgr.list_windows()] == ["@11"]
+        assert await mgr.find_window_by_id("@11") is not None
+
+    @pytest.mark.asyncio
+    async def test_stale_listing_expires(self, mgr, monkeypatch):
+        state = self._ok_then_timeout(monkeypatch)
+        await mgr.list_windows()
+        mgr.invalidate_windows_cache()
+        mgr._last_good_at -= mgr._STALE_WINDOWS_OK + 1
+        state["hang"] = True
+        assert await mgr.list_windows() == []
+
+    @pytest.mark.asyncio
+    async def test_strict_raises_instead_of_guessing(self, mgr, monkeypatch):
+        state = self._ok_then_timeout(monkeypatch)
+        state["hang"] = True
+        with pytest.raises(tm.TmuxUnavailable):
+            await mgr.list_windows_strict()
+
+    @pytest.mark.asyncio
+    async def test_strict_raises_when_session_unreachable(self, mgr, monkeypatch):
+        monkeypatch.setattr(mgr, "get_session", lambda: None)
+        monkeypatch.setattr(tm.subprocess, "run", lambda *a, **k: _completed(""))
+        with pytest.raises(tm.TmuxUnavailable):
+            await mgr.list_windows_strict()
+
+
 class TestBuildClaudeCommand:
     @pytest.fixture(autouse=True)
     def _cfg(self, monkeypatch):

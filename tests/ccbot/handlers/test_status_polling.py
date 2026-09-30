@@ -213,7 +213,7 @@ class TestVanishedWindow:
             patch.object(status_polling, "clear_topic_state", AsyncMock()) as clear,
             patch.object(status_polling, "offer_resume", AsyncMock()) as offer,
         ):
-            await status_polling._handle_vanished_window(AsyncMock(), 1, 42, "@4")
+            await status_polling.handle_vanished_window(AsyncMock(), 1, 42, "@4")
 
         sm.unbind_thread.assert_called_once_with(1, 42)
         clear.assert_awaited_once()
@@ -240,7 +240,7 @@ class TestVanishedWindow:
             patch.object(status_polling, "clear_topic_state", AsyncMock()),
             patch.object(status_polling, "offer_resume", AsyncMock()) as offer,
         ):
-            await status_polling._handle_vanished_window(AsyncMock(), 1, 42, "@4")
+            await status_polling.handle_vanished_window(AsyncMock(), 1, 42, "@4")
 
         sm.unbind_thread.assert_called_once_with(1, 42)
         offer.assert_not_awaited()
@@ -256,6 +256,44 @@ class TestVanishedWindow:
             patch.object(status_polling, "session_manager", sm),
             patch.object(status_polling, "offer_resume", AsyncMock()) as offer,
         ):
-            await status_polling._handle_vanished_window(AsyncMock(), 1, 42, "@4")
+            await status_polling.handle_vanished_window(AsyncMock(), 1, 42, "@4")
         sm.unbind_thread.assert_not_called()
         offer.assert_not_awaited()
+
+
+class TestVanishNeedsConsecutiveMisses:
+    @pytest.mark.asyncio
+    async def test_single_miss_does_not_unbind(self):
+        from ccbot.handlers import status_polling
+
+        status_polling._missing_polls.clear()
+        tmux = MagicMock()
+        tmux.find_window_by_id = AsyncMock(side_effect=[None, None, MagicMock()])
+        with (
+            patch.object(status_polling, "tmux_manager", tmux),
+            patch.object(
+                status_polling, "handle_vanished_window", AsyncMock()
+            ) as vanish,
+            patch.object(status_polling, "update_status_message", AsyncMock()),
+        ):
+            for _ in range(3):
+                await status_polling._poll_binding(AsyncMock(), 1, 42, "@4")
+        vanish.assert_not_awaited()
+        assert "@4" not in status_polling._missing_polls
+
+    @pytest.mark.asyncio
+    async def test_consecutive_misses_unbind(self):
+        from ccbot.handlers import status_polling
+
+        status_polling._missing_polls.clear()
+        tmux = MagicMock()
+        tmux.find_window_by_id = AsyncMock(return_value=None)
+        with (
+            patch.object(status_polling, "tmux_manager", tmux),
+            patch.object(
+                status_polling, "handle_vanished_window", AsyncMock()
+            ) as vanish,
+        ):
+            for _ in range(status_polling.VANISHED_AFTER_POLLS):
+                await status_polling._poll_binding(AsyncMock(), 1, 42, "@4")
+        vanish.assert_awaited_once()

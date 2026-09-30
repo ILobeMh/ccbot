@@ -37,11 +37,21 @@ from typing import Any
 import aiofiles
 
 from .config import config
-from .tmux_manager import _UUID_RE, SHELL_COMMANDS, tmux_manager
+from .tmux_manager import (
+    _UUID_RE,
+    SHELL_COMMANDS,
+    TmuxUnavailable,
+    TmuxWindow,
+    tmux_manager,
+)
 from .transcript_parser import TranscriptParser
 from .utils import atomic_write_json, read_json_cached
 
 logger = logging.getLogger(__name__)
+
+# Startup re-resolution: tmux listing attempts before giving up (unchanged)
+STARTUP_LIST_ATTEMPTS = 4
+STARTUP_LIST_RETRY_DELAY = 1.5
 
 # Delay before a debounced state save (read offsets) hits the disk
 SAVE_DEBOUNCE_SECONDS = 1.0
@@ -332,7 +342,21 @@ class SessionManager:
         name matches carry over. Topics dropped here whose session is known
         are queued in ``lost_bindings`` for a ▶ Resume offer.
         """
-        windows = await tmux_manager.list_windows()
+        windows: list[TmuxWindow] | None = None
+        for attempt in range(STARTUP_LIST_ATTEMPTS):
+            try:
+                windows = await tmux_manager.list_windows_strict()
+                break
+            except TmuxUnavailable as e:
+                logger.warning("Startup window listing failed (%s), retrying", e)
+                await asyncio.sleep(STARTUP_LIST_RETRY_DELAY * (attempt + 1))
+        if windows is None:
+            # Never drop bindings on an unknown tmux state: a failed listing
+            # once looked like "no windows" and wiped every topic binding.
+            logger.error(
+                "tmux did not answer at startup; keeping persisted window IDs as is"
+            )
+            return
         live_by_name: dict[str, str] = {}  # window_name -> window_id
         live_ids: set[str] = set()
         for w in windows:
