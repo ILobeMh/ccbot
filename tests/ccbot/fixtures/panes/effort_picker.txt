@@ -1,9 +1,9 @@
 
- ▐▛███▛█   Claude Code v2.1.278
-▝▜██████▀  Opus 5 with high effort · API Usage Billing
-  ▝▝ ▝▝    /private/var/tmp/ccbot-cap
+ ▐▛███▛█   Claude Code v2.1.285
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/var/tmp/ccbot-cap
 
-  Updated to latest. Got 30 features, 168 bugfixes, and 70 other changes.
+  Updated to latest. Got 58 features, 352 bugfixes, and 161 other changes.
   code.claude.com/docs/en/changelog for details
 
   Opus 5.5 is now your default model and it draws down usage faster than Sonnet 5. Switch anytime with /model.
@@ -29,12 +29,12 @@
 
 
 
-▔▔▔▔▔▔▔ tmux focus-events off · add 'set -g focus-events on' to ~/.tmux.conf and reattach for focus tracking ▔
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔ ◐ medium · /effort ▔
    Effort
 
-                        Faster                                                 Smarter
-                        ────────────────────▲──────────────────────┆──────────────────
-                        low     medium     high     xhigh      max       ultracode
-                                                                     xhigh + workflows
+                        Faster                             Smarter
+                        ──────────▲───────────────────────────────      Ultracode  off
+                        low     medium     high     xhigh      max      Tab to toggle
+
 
    ←/→ to adjust · Enter to confirm · s for this session only · Esc to cancel
