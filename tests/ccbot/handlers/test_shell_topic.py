@@ -1,7 +1,6 @@
 """Tests for the shell special topic (real subprocesses, short commands)."""
 
 import asyncio
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -66,48 +65,48 @@ class TestShellTopic:
         t.cwd = str(tmp_path)
         return t
 
-    def _update(self, text: str):
+    def _message(self, text: str):
         progress = MagicMock()
         progress.message_id = 500
         progress.edit_reply_markup = AsyncMock()
         msg = MagicMock()
         msg.text = text
         msg.reply_document = AsyncMock()
-        return SimpleNamespace(message=msg), progress
+        return msg, progress
 
     @pytest.mark.asyncio
     async def test_runs_and_reports(self, topic, monkeypatch, tmp_path):
-        update, progress = self._update("echo hello")
+        msg, progress = self._message("echo hello")
         monkeypatch.setattr(sh, "safe_reply", AsyncMock(return_value=progress))
         edit = AsyncMock()
         monkeypatch.setattr(sh, "safe_edit", edit)
-        await topic.handle_text(update, SimpleNamespace(), "echo hello")
+        await topic.handle_text(msg, MagicMock(), {}, "echo hello")
         final = edit.await_args.args[1]
         assert "hello" in final
         assert "exit 0" in final
-        update.message.reply_document.assert_not_awaited()
+        msg.reply_document.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_long_output_attached(self, topic, monkeypatch):
-        update, progress = self._update("seq 1 5000")
+        msg, progress = self._message("seq 1 5000")
         monkeypatch.setattr(sh, "safe_reply", AsyncMock(return_value=progress))
         edit = AsyncMock()
         monkeypatch.setattr(sh, "safe_edit", edit)
-        await topic.handle_text(update, SimpleNamespace(), "seq 1 5000")
+        await topic.handle_text(msg, MagicMock(), {}, "seq 1 5000")
         assert "attached file" in edit.await_args.args[1]
-        update.message.reply_document.assert_awaited_once()
-        assert (
-            update.message.reply_document.await_args.kwargs["filename"] == "output.txt"
-        )
+        msg.reply_document.assert_awaited_once()
+        document = msg.reply_document.await_args.args[0]
+        assert document.filename == "output.txt"
+        assert document.data.startswith(b"1\n2\n3\n")
 
     @pytest.mark.asyncio
     async def test_cwd_tracked_across_commands(self, topic, monkeypatch, tmp_path):
         (tmp_path / "d").mkdir()
         for cmd in ("cd d", "pwd"):
-            update, progress = self._update(cmd)
+            msg, progress = self._message(cmd)
             monkeypatch.setattr(sh, "safe_reply", AsyncMock(return_value=progress))
             edit = AsyncMock()
             monkeypatch.setattr(sh, "safe_edit", edit)
-            await topic.handle_text(update, SimpleNamespace(), cmd)
+            await topic.handle_text(msg, MagicMock(), {}, cmd)
         assert topic.cwd == str((tmp_path / "d").resolve())
         assert str((tmp_path / "d").resolve()) in edit.await_args.args[1]

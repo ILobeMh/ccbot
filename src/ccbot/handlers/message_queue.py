@@ -10,7 +10,8 @@ Provides a queue-based message processing system that ensures:
   - Thread-aware sending: each MessageTask carries an optional thread_id
     for Telegram topic support
 
-Rate limiting is handled globally by AIORateLimiter on the Application.
+Rate limiting is handled globally by telegram_client.TelegramRateLimiter on
+the bot session.
 
 Key components:
   - MessageTask: Dataclass representing a queued message task (with thread_id)
@@ -26,9 +27,9 @@ import time
 from dataclasses import dataclass, field
 from typing import Literal
 
-from telegram import Bot
-from telegram.constants import ChatAction
-from telegram.error import RetryAfter
+from aiogram import Bot
+from aiogram.enums import ChatAction
+from aiogram.exceptions import TelegramRetryAfter
 
 from ..session import session_manager
 from ..terminal_parser import is_interactive_ui, parse_status_line
@@ -237,7 +238,7 @@ async def _process_content_with_retry(
     """Send a content task, retrying across RetryAfter (flood control).
 
     Content is actual Claude output — unlike ephemeral status updates it must
-    not be dropped just because a 429 bubbled past AIORateLimiter's retries.
+    not be dropped just because a 429 bubbled past TelegramRateLimiter's retries.
     Retrying re-runs the whole task, so parts already sent before the 429 may
     be duplicated; duplication is preferred over losing output.
     """
@@ -245,12 +246,8 @@ async def _process_content_with_retry(
         try:
             await _process_content_task(bot, user_id, task)
             return
-        except RetryAfter as e:
-            retry_secs = (
-                e.retry_after
-                if isinstance(e.retry_after, int)
-                else int(e.retry_after.total_seconds())
-            )
+        except TelegramRetryAfter as e:
+            retry_secs = e.retry_after
             if retry_secs > FLOOD_CONTROL_MAX_WAIT:
                 # Long ban — also pause subsequent queued tasks
                 _flood_until[user_id] = time.monotonic() + retry_secs
@@ -319,12 +316,8 @@ async def _message_queue_worker(bot: Bot, user_id: int) -> None:
                     await _do_clear_status_message(bot, user_id, task.thread_id or 0)
                 elif task.task_type == "interactive":
                     await _process_interactive_task(bot, user_id, task)
-            except RetryAfter as e:
-                retry_secs = (
-                    e.retry_after
-                    if isinstance(e.retry_after, int)
-                    else int(e.retry_after.total_seconds())
-                )
+            except TelegramRetryAfter as e:
+                retry_secs = e.retry_after
                 if retry_secs > FLOOD_CONTROL_MAX_WAIT:
                     _flood_until[user_id] = time.monotonic() + retry_secs
                     logger.warning(
@@ -633,7 +626,7 @@ async def _process_status_update_task(
                     await bot.send_chat_action(
                         chat_id=chat_id, action=ChatAction.TYPING
                     )
-                except RetryAfter:
+                except TelegramRetryAfter:
                     raise
                 except Exception:
                     pass
@@ -671,7 +664,7 @@ async def _do_send_status_message(
     if _is_working_status(text):
         try:
             await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-        except RetryAfter:
+        except TelegramRetryAfter:
             raise
         except Exception:
             pass

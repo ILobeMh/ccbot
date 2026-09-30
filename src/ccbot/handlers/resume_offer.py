@@ -14,7 +14,8 @@ the background while Telegram is unreachable, e.g. right after a reboot).
 import asyncio
 import logging
 
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram import Bot
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from ..session import LostBinding, session_manager
 from ..tmux_manager import LAUNCH_MODE_LABELS
@@ -30,10 +31,10 @@ _retry_tasks: set[asyncio.Task[None]] = set()
 
 def resume_keyboard(session_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        [
+        inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    "▶ Resume this session",
+                    text="▶ Resume this session",
                     callback_data=f"{CB_RESUME_SESSION}{session_id}"[:64],
                 )
             ]

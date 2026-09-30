@@ -4,8 +4,9 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from telegram.error import BadRequest
-from telegram.ext import ApplicationHandlerStop
+from aiogram.dispatcher.event.bases import SkipHandler
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.methods import UnpinAllForumTopicMessages
 
 import ccbot.handlers.special_topics as st
 from ccbot.session import SessionManager
@@ -20,10 +21,10 @@ class FakeTopic:
         self.callbacks: list[str] = []
         self.ready: list[tuple[int, int]] = []
 
-    async def handle_text(self, update, context, text):
+    async def handle_text(self, message, bot, user_data, text):
         self.texts.append(text)
 
-    async def handle_callback(self, update, context, data):
+    async def handle_callback(self, query, bot, user_data, data):
         self.callbacks.append(data)
 
     async def on_ready(self, bot, chat_id, thread_id):
@@ -45,16 +46,23 @@ def env(monkeypatch):
     return mgr, topic
 
 
-def _update(text: str, thread_id: int | None, user_id: int = 1, chat_type="supergroup"):
+def _message(
+    text: str, thread_id: int | None, user_id: int = 1, chat_type="supergroup"
+):
     msg = MagicMock()
     msg.text = text
     msg.message_thread_id = thread_id
-    return SimpleNamespace(
-        effective_user=SimpleNamespace(id=user_id),
-        message=msg,
-        effective_chat=SimpleNamespace(id=-100, type=chat_type),
-        callback_query=None,
-    )
+    msg.from_user = SimpleNamespace(id=user_id)
+    msg.chat = SimpleNamespace(id=-100, type=chat_type)
+    return msg
+
+
+def _query(data: str, user_id: int = 1):
+    query = MagicMock()
+    query.data = data
+    query.from_user = SimpleNamespace(id=user_id)
+    query.answer = AsyncMock()
+    return query
 
 
 class TestRegistry:
@@ -101,8 +109,12 @@ class TestEnsure:
         mgr.group_chat_ids["1:5"] = -100123
         mgr.special_topics["shell"] = 5
         bot = MagicMock()
+        # aiogram keeps Telegram's raw description (PTB capitalized it)
         bot.unpin_all_forum_topic_messages = AsyncMock(
-            side_effect=BadRequest("Topic_id_invalid")
+            side_effect=TelegramBadRequest(
+                method=UnpinAllForumTopicMessages(chat_id=-100123, message_thread_id=5),
+                message="Bad Request: TOPIC_ID_INVALID",
+            )
         )
         bot.create_forum_topic = AsyncMock(
             return_value=SimpleNamespace(message_thread_id=78)
@@ -137,49 +149,55 @@ class TestRouters:
     async def test_special_thread_is_handled_and_stops(self, env):
         mgr, topic = env
         mgr.special_topics["shell"] = 42
-        ctx = SimpleNamespace(bot=MagicMock())
-        with pytest.raises(ApplicationHandlerStop):
-            await st.special_message_router(_update("ls -la", 42), ctx)
+        # Returning (no SkipHandler) consumes the update
+        await st.special_message_router(_message("ls -la", 42), MagicMock(), {})
         assert topic.texts == ["ls -la"]
 
     @pytest.mark.asyncio
     async def test_other_thread_passes_through(self, env):
         mgr, topic = env
         mgr.special_topics["shell"] = 42
-        ctx = SimpleNamespace(bot=MagicMock())
-        await st.special_message_router(_update("hello", 7), ctx)  # no raise
+        with pytest.raises(SkipHandler):
+            await st.special_message_router(_message("hello", 7), MagicMock(), {})
         assert topic.texts == []
+
+    @pytest.mark.asyncio
+    async def test_group_chat_id_captured_on_pass_through(self, env):
+        mgr, _ = env
+        mgr.special_topics["shell"] = 42
+        with pytest.raises(SkipHandler):
+            await st.special_message_router(_message("hello", 7), MagicMock(), {})
+        assert -100 in mgr.group_chat_ids.values()
 
     @pytest.mark.asyncio
     async def test_unauthorized_user_blocked(self, env, monkeypatch):
         mgr, topic = env
         mgr.special_topics["shell"] = 42
-        monkeypatch.setattr(st, "safe_reply", AsyncMock())
-        ctx = SimpleNamespace(bot=MagicMock())
-        with pytest.raises(ApplicationHandlerStop):
-            await st.special_message_router(_update("rm -rf /", 42, user_id=2), ctx)
+        reply = AsyncMock()
+        monkeypatch.setattr(st, "safe_reply", reply)
+        await st.special_message_router(
+            _message("rm -rf /", 42, user_id=2), MagicMock(), {}
+        )
         assert topic.texts == []
+        reply.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_callback_router(self, env):
         _, topic = env
-        query = MagicMock()
-        query.data = "sh:kill:1"
-        query.answer = AsyncMock()
-        update = SimpleNamespace(
-            callback_query=query, effective_user=SimpleNamespace(id=1)
-        )
-        with pytest.raises(ApplicationHandlerStop):
-            await st.special_callback_router(update, SimpleNamespace())
+        await st.special_callback_router(_query("sh:kill:1"), MagicMock(), {})
         assert topic.callbacks == ["sh:kill:1"]
+
+    @pytest.mark.asyncio
+    async def test_callback_unauthorized_answered(self, env):
+        _, topic = env
+        query = _query("sh:kill:1", user_id=2)
+        await st.special_callback_router(query, MagicMock(), {})
+        assert topic.callbacks == []
+        query.answer.assert_awaited_once_with("Not authorized")
 
     @pytest.mark.asyncio
     async def test_callback_other_prefix_passes(self, env):
         _, topic = env
-        query = MagicMock()
-        query.data = "db:sel:1"
-        update = SimpleNamespace(
-            callback_query=query, effective_user=SimpleNamespace(id=1)
-        )
-        await st.special_callback_router(update, SimpleNamespace())
+        with pytest.raises(SkipHandler):
+            await st.special_callback_router(_query("db:sel:1"), MagicMock(), {})
         assert topic.callbacks == []

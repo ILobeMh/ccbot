@@ -18,6 +18,8 @@
 │  - Interactive UI: AskUserQuestion / ExitPlanMode / Permission     │
 │  - Per-user message queue + worker (merge, rate limit)             │
 │  - MarkdownV2 output with auto fallback to plain text              │
+│  - aiogram Dispatcher (build_dispatcher): special-topic router     │
+│    first, then the main router; handlers in fixed order            │
 ├──────────────────────┬──────────────────────────────────────────────┤
 │  markdown_v2.py      │  telegram_sender.py                         │
 │  MD → MarkdownV2     │  split_message (4096 limit)                 │
@@ -75,7 +77,9 @@ Additional modules:
   claude_config.py    ─ ~/.claude.json edits (hasTrustDialogAccepted before launch)
   screenshot.py       ─ Terminal text → PNG rendering (ANSI color, cmap-driven font chain)
   transcribe.py       ─ Voice-to-text transcription via OpenAI API (gpt-4o-transcribe)
-  main.py             ─ CLI entry point
+  main.py             ─ CLI entry point (asyncio.run(bot.run()))
+  telegram_client.py  ─ aiogram Bot factory (rate-limit request middleware,
+                        link previews off) + per-user user_data middleware
   utils.py            ─ Shared utilities (ccbot_dir, atomic_write_json)
 
 Handler modules (handlers/):
@@ -107,6 +111,6 @@ State files (~/.ccbot/ or $CCBOT_DIR/):
 - Only sessions registered in `session_map.json` (via hook) are monitored. The hook ignores nested/SDK `claude` instances and falls back to pane matching when `TMUX_PANE` is missing (`--bg-pty-host`).
 - **Launch modes** — `tmux_manager.build_claude_command(mode, resume)` maps `default | acceptEdits | plan | bypassPermissions` to CLI flags; non-bypass modes add `--allow-dangerously-skip-permissions` so `/mode` can reach bypass via Shift+Tab.
 - **Startup dialogs** — `terminal_parser.AUTO_ANSWER_DIALOGS` (trust folder, bypass warning, resume) are answered by `TmuxManager.auto_answer_dialog` (cursor moved + verified, then Enter); unknown modals (`Modal` pattern) are escaped before typing, never typed into.
-- **Delivery policy** — `message_sender.run_with_fallback`: plain-text retry only on `BadRequest`; `TimedOut`/`NetworkError` are not resent.
+- **Delivery policy** — `message_sender.run_with_fallback`: plain-text retry only on `TelegramBadRequest`; `TelegramNetworkError` (timeouts included) is not resent.
 - Notifications delivered to users via thread bindings (topic → window_id → session).
 - **Startup re-resolution** — Window IDs reset on tmux server restart. On startup, `resolve_stale_ids()` matches persisted display names against live windows to re-map IDs. Old state.json files keyed by window name are auto-migrated.

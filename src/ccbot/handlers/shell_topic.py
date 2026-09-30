@@ -15,16 +15,22 @@ Key components:
 from __future__ import annotations
 
 import asyncio
-import io
 import logging
 import os
 import shlex
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import ContextTypes
+from aiogram import Bot
+from aiogram.types import (
+    BufferedInputFile,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 
 from ..config import config
 from . import special_topics
@@ -156,11 +162,9 @@ class ShellTopic:
         )
 
     async def handle_text(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str
+        self, message: Message, bot: Bot, user_data: dict[str, Any], text: str
     ) -> None:
-        msg = update.message
-        if msg is None:
-            return
+        msg = message
         command = text.strip()
         if not command:
             return
@@ -170,10 +174,10 @@ class ShellTopic:
             msg,
             f"⏳ `{_pretty_cwd(self.cwd)}`\n{_fence('$ ' + command)}",
             reply_markup=InlineKeyboardMarkup(
-                [
+                inline_keyboard=[
                     [
                         InlineKeyboardButton(
-                            "⏹ Kill", callback_data=f"{CB_SHELL_KILL}{job_id}"
+                            text="⏹ Kill", callback_data=f"{CB_SHELL_KILL}{job_id}"
                         )
                     ]
                 ]
@@ -217,17 +221,13 @@ class ShellTopic:
         await safe_edit(progress, f"{_fence('$ ' + command)}\n{body}\n{footer}")
         if len(output) > INLINE_LIMIT:
             await msg.reply_document(
-                document=io.BytesIO(output.encode("utf-8")),
-                filename="output.txt",
+                BufferedInputFile(output.encode("utf-8"), filename="output.txt"),
                 caption=f"{command[:200]}",
             )
 
     async def handle_callback(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, data: str
+        self, query: CallbackQuery, bot: Bot, user_data: dict[str, Any], data: str
     ) -> None:
-        query = update.callback_query
-        if query is None:
-            return
         raw = data[len(CB_SHELL_KILL) :]
         proc = self._procs.get(int(raw)) if raw.isdigit() else None
         if proc is None or proc.returncode is not None:

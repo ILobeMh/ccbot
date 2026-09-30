@@ -10,7 +10,7 @@ from ccbot import bot as bot_mod
 from ccbot.bot import build_image_prompt, photo_handler
 
 
-def _make_photo_update(
+def _make_photo_message(
     *,
     unique_id: str,
     caption: str | None = None,
@@ -18,11 +18,9 @@ def _make_photo_update(
     user_id: int = 1,
     thread_id: int = 42,
 ) -> MagicMock:
-    update = MagicMock()
-    update.effective_user = MagicMock()
-    update.effective_user.id = user_id
     msg = MagicMock()
-    update.message = msg
+    msg.from_user = MagicMock()
+    msg.from_user.id = user_id
     msg.message_thread_id = thread_id
     msg.is_topic_message = True
     msg.caption = caption
@@ -31,14 +29,18 @@ def _make_photo_update(
     msg.chat = MagicMock()
     msg.chat.type = "supergroup"
     msg.chat.id = 100
-    msg.chat.send_action = AsyncMock()
     photo = MagicMock()
+    photo.file_id = f"file-{unique_id}"
     photo.file_unique_id = unique_id
-    tg_file = MagicMock()
-    tg_file.download_to_drive = AsyncMock()
-    photo.get_file = AsyncMock(return_value=tg_file)
     msg.photo = [photo]
-    return update
+    return msg
+
+
+def _make_bot() -> MagicMock:
+    bot = MagicMock()
+    bot.download = AsyncMock()
+    bot.send_chat_action = AsyncMock()
+    return bot
 
 
 def _patches(sent: list[str]):
@@ -89,16 +91,21 @@ class TestPhotoHandler:
     @pytest.mark.asyncio
     async def test_single_photo_is_staged_not_sent(self):
         sent: list[str] = []
-        update = _make_photo_update(unique_id="u1", caption="hi")
+        message = _make_photo_message(unique_id="u1", caption="hi")
+        bot = _make_bot()
         ps = _patches(sent)
         for p in ps:
             p.start()
         try:
-            await photo_handler(update, MagicMock())
+            await photo_handler(message, bot)
         finally:
             for p in ps:
                 p.stop()
         assert sent == []
+        bot.download.assert_awaited_once()
+        assert bot.download.await_args.args[0] == "file-u1"
+        dest = bot.download.await_args.kwargs["destination"]
+        assert str(dest).endswith("_u1.jpg")
         pending = bot_mod._pending_images[(1, 42)]
         assert pending["caption"] == "hi"
         assert len(pending["paths"]) == 1
@@ -106,15 +113,16 @@ class TestPhotoHandler:
     @pytest.mark.asyncio
     async def test_text_after_staging_sends_images_with_text(self):
         sent: list[str] = []
-        photo = _make_photo_update(unique_id="u1", caption="cap")
+        photo = _make_photo_message(unique_id="u1", caption="cap")
         ps = _patches(sent)
         for p in ps:
             p.start()
         try:
-            await photo_handler(photo, MagicMock())
-            reply = MagicMock()
-            reply.chat.send_action = AsyncMock()
-            consumed = await bot_mod._deliver_pending_images(reply, 1, 42, "long text")
+            bot = _make_bot()
+            await photo_handler(photo, bot)
+            consumed = await bot_mod._deliver_pending_images(
+                MagicMock(), bot, 1, 42, "long text"
+            )
         finally:
             for p in ps:
                 p.stop()
@@ -127,15 +135,14 @@ class TestPhotoHandler:
     @pytest.mark.asyncio
     async def test_skip_sends_images_without_text(self):
         sent: list[str] = []
-        photo = _make_photo_update(unique_id="u1")
+        photo = _make_photo_message(unique_id="u1")
         ps = _patches(sent)
         for p in ps:
             p.start()
         try:
-            await photo_handler(photo, MagicMock())
-            reply = MagicMock()
-            reply.chat.send_action = AsyncMock()
-            await bot_mod._deliver_pending_images(reply, 1, 42, "")
+            bot = _make_bot()
+            await photo_handler(photo, bot)
+            await bot_mod._deliver_pending_images(MagicMock(), bot, 1, 42, "")
         finally:
             for p in ps:
                 p.stop()
@@ -159,23 +166,24 @@ class TestPhotoHandler:
     @pytest.mark.asyncio
     async def test_album_is_staged_as_one_group(self):
         sent: list[str] = []
-        u1 = _make_photo_update(unique_id="a1", caption="look", media_group_id="g")
-        u2 = _make_photo_update(unique_id="a2", media_group_id="g")
-        u3 = _make_photo_update(unique_id="a3", media_group_id="g")
+        u1 = _make_photo_message(unique_id="a1", caption="look", media_group_id="g")
+        u2 = _make_photo_message(unique_id="a2", media_group_id="g")
+        u3 = _make_photo_message(unique_id="a3", media_group_id="g")
         ps = _patches(sent)
         for p in ps:
             p.start()
         try:
+            bot = _make_bot()
             for u in (u1, u2, u3):
-                await photo_handler(u, MagicMock())
+                await photo_handler(u, bot)
             assert (1, 42) not in bot_mod._pending_images  # album not settled
             await asyncio.sleep(0.2)
             pending = bot_mod._pending_images[(1, 42)]
             assert len(pending["paths"]) == 3
             assert pending["caption"] == "look"
-            reply = MagicMock()
-            reply.chat.send_action = AsyncMock()
-            await bot_mod._deliver_pending_images(reply, 1, 42, "compare them")
+            await bot_mod._deliver_pending_images(
+                MagicMock(), bot, 1, 42, "compare them"
+            )
         finally:
             for p in ps:
                 p.stop()

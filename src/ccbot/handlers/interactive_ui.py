@@ -16,8 +16,9 @@ State dicts are keyed by (user_id, thread_id_or_0) for Telegram topic support.
 
 import logging
 
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.error import BadRequest
+from aiogram import Bot
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from ..session import session_manager
 from ..terminal_parser import extract_interactive_content, is_interactive_ui
@@ -95,11 +96,13 @@ def _build_interactive_keyboard(
     rows.append(
         [
             InlineKeyboardButton(
-                "␣ Space", callback_data=f"{CB_ASK_SPACE}{window_id}"[:64]
+                text="␣ Space", callback_data=f"{CB_ASK_SPACE}{window_id}"[:64]
             ),
-            InlineKeyboardButton("↑", callback_data=f"{CB_ASK_UP}{window_id}"[:64]),
             InlineKeyboardButton(
-                "⇥ Tab", callback_data=f"{CB_ASK_TAB}{window_id}"[:64]
+                text="↑", callback_data=f"{CB_ASK_UP}{window_id}"[:64]
+            ),
+            InlineKeyboardButton(
+                text="⇥ Tab", callback_data=f"{CB_ASK_TAB}{window_id}"[:64]
             ),
         ]
     )
@@ -107,7 +110,7 @@ def _build_interactive_keyboard(
         rows.append(
             [
                 InlineKeyboardButton(
-                    "↓", callback_data=f"{CB_ASK_DOWN}{window_id}"[:64]
+                    text="↓", callback_data=f"{CB_ASK_DOWN}{window_id}"[:64]
                 ),
             ]
         )
@@ -115,13 +118,13 @@ def _build_interactive_keyboard(
         rows.append(
             [
                 InlineKeyboardButton(
-                    "←", callback_data=f"{CB_ASK_LEFT}{window_id}"[:64]
+                    text="←", callback_data=f"{CB_ASK_LEFT}{window_id}"[:64]
                 ),
                 InlineKeyboardButton(
-                    "↓", callback_data=f"{CB_ASK_DOWN}{window_id}"[:64]
+                    text="↓", callback_data=f"{CB_ASK_DOWN}{window_id}"[:64]
                 ),
                 InlineKeyboardButton(
-                    "→", callback_data=f"{CB_ASK_RIGHT}{window_id}"[:64]
+                    text="→", callback_data=f"{CB_ASK_RIGHT}{window_id}"[:64]
                 ),
             ]
         )
@@ -129,17 +132,17 @@ def _build_interactive_keyboard(
     rows.append(
         [
             InlineKeyboardButton(
-                "⎋ Esc", callback_data=f"{CB_ASK_ESC}{window_id}"[:64]
+                text="⎋ Esc", callback_data=f"{CB_ASK_ESC}{window_id}"[:64]
             ),
             InlineKeyboardButton(
-                "🔄", callback_data=f"{CB_ASK_REFRESH}{window_id}"[:64]
+                text="🔄", callback_data=f"{CB_ASK_REFRESH}{window_id}"[:64]
             ),
             InlineKeyboardButton(
-                "⏎ Enter", callback_data=f"{CB_ASK_ENTER}{window_id}"[:64]
+                text="⏎ Enter", callback_data=f"{CB_ASK_ENTER}{window_id}"[:64]
             ),
         ]
     )
-    return InlineKeyboardMarkup(rows)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def handle_interactive_ui(
@@ -209,8 +212,8 @@ async def handle_interactive_ui(
             _interactive_mode[ikey] = window_id
             await mark_ui(window_id, content.name, content.content, existing_msg_id)
             return True
-        except BadRequest as e:
-            if "Message is not modified" in str(e):
+        except TelegramBadRequest as e:
+            if "message is not modified" in str(e).lower():
                 # Content unchanged — keep existing message as-is
                 _interactive_mode[ikey] = window_id
                 await mark_ui(window_id, content.name, content.content, existing_msg_id)

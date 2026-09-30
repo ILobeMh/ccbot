@@ -18,7 +18,8 @@ Core responsibilities:
   - Automatic cleanup: closing a topic kills the associated window
     (topic_closed_handler). Unsupported content (stickers, etc.)
     is rejected with a warning (unsupported_content_handler).
-  - Bot lifecycle management: post_init, post_shutdown, create_bot.
+  - Bot lifecycle management: on_startup, on_shutdown, build_dispatcher
+    (routers in PTB's old handler order), run() (long polling).
 
 Handler modules (in handlers/):
   - callback_data: Callback data constants
@@ -30,40 +31,38 @@ Handler modules (in handlers/):
   - status_polling: Terminal status polling
   - response_builder: Response message building
 
-Key functions: create_bot(), handle_new_message().
+Key functions: build_dispatcher(), run(), handle_new_message().
 """
 
 import asyncio
-import io
 import logging
 import subprocess
 import time
 from pathlib import Path
 from typing import Any
 
-from telegram import (
-    Bot,
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.enums import ChatAction, ContentType, MessageEntityType
+from aiogram.exceptions import (
+    TelegramConflictError,
+    TelegramNetworkError,
+    TelegramRetryAfter,
+)
+from aiogram.filters import Command, CommandObject
+from aiogram.types import (
     BotCommand,
     BotCommandScopeAllGroupChats,
     BotCommandScopeAllPrivateChats,
+    BotCommandScopeDefault,
+    BufferedInputFile,
+    CallbackQuery,
+    ErrorEvent,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputMediaDocument,
     Message,
-    Update,
+    User,
 )
-from telegram.constants import ChatAction
-from telegram.error import Conflict, NetworkError, RetryAfter, TimedOut
-from telegram.ext import (
-    AIORateLimiter,
-    Application,
-    CallbackQueryHandler,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
-from telegram.request import HTTPXRequest
 
 from . import __version__, settings
 from .claude_config import ensure_trusted_directory
@@ -181,6 +180,7 @@ from .markdown_v2 import convert_markdown
 from .screenshot import text_to_image
 from .session import session_manager
 from .session_monitor import NewMessage, SessionMonitor
+from .telegram_client import UserDataMiddleware, build_bot
 from .terminal_parser import (
     extract_bash_output,
     has_update_pending,
@@ -233,116 +233,133 @@ def is_user_allowed(user_id: int | None) -> bool:
     return user_id is not None and config.is_user_allowed(user_id)
 
 
-def _get_thread_id(update: Update) -> int | None:
-    """Extract thread_id from an update, returning None if not in a named topic."""
-    msg = update.message or (
-        update.callback_query.message if update.callback_query else None
-    )
+def _get_thread_id(event: Message | CallbackQuery) -> int | None:
+    """Extract thread_id from a message / callback, None if not in a named topic."""
+    msg = event.message if isinstance(event, CallbackQuery) else event
     if msg is None:
         return None
+    # An InaccessibleMessage (callback on a deleted / too old message) has no
+    # message_thread_id, like PTB's
     tid = getattr(msg, "message_thread_id", None)
     if tid is None or tid == 1:
         return None
     return tid
 
 
+def _command_args(command: CommandObject | None) -> list[str]:
+    """Whitespace-split arguments after the command (PTB's context.args)."""
+    return (command.args or "").split() if command else []
+
+
+def _query_message(query: CallbackQuery) -> Message:
+    """The callback's message; raises if it is no longer accessible.
+
+    Callers wrap edits in try/except, as with PTB's query.edit_message_*
+    (which Telegram rejected for such messages).
+    """
+    msg = query.message
+    if not isinstance(msg, Message):
+        raise RuntimeError("callback message is inaccessible (deleted or too old)")
+    return msg
+
+
+async def _send_typing(bot: Bot, message: Message) -> None:
+    """Show "typing…" in the chat (and topic) of ``message``."""
+    await bot.send_chat_action(
+        chat_id=message.chat.id,
+        action=ChatAction.TYPING,
+        message_thread_id=message.message_thread_id
+        if message.is_topic_message
+        else None,
+    )
+
+
 # --- Command handlers ---
 
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
+async def start_command(message: Message, user_data: dict[str, Any]) -> None:
+    user = message.from_user
     if not user or not is_user_allowed(user.id):
-        if update.message:
-            await safe_reply(update.message, "You are not authorized to use this bot.")
+        await safe_reply(message, "You are not authorized to use this bot.")
         return
 
-    clear_browse_state(context.user_data)
+    clear_browse_state(user_data)
 
-    if update.message:
-        await safe_reply(
-            update.message,
-            "🤖 *Claude Code Monitor*\n\n"
-            "Each topic is a session. Create a new topic to start.",
-        )
+    await safe_reply(
+        message,
+        "🤖 *Claude Code Monitor*\n\n"
+        "Each topic is a session. Create a new topic to start.",
+    )
 
 
-async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def history_command(message: Message) -> None:
     """Show message history for the active session or bound thread."""
-    user = update.effective_user
+    user = message.from_user
     if not user or not is_user_allowed(user.id):
         return
-    if not update.message:
-        return
 
-    thread_id = _get_thread_id(update)
+    thread_id = _get_thread_id(message)
     wid = session_manager.resolve_window_for_thread(user.id, thread_id)
     if not wid:
-        await safe_reply(update.message, "❌ No session bound to this topic.")
+        await safe_reply(message, "❌ No session bound to this topic.")
         return
 
-    await send_history(update.message, wid)
+    await send_history(message, wid)
 
 
-async def screenshot_command(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
+async def screenshot_command(message: Message) -> None:
     """Capture the current tmux pane and send it as an image."""
-    user = update.effective_user
+    user = message.from_user
     if not user or not is_user_allowed(user.id):
         return
-    if not update.message:
-        return
 
-    thread_id = _get_thread_id(update)
+    thread_id = _get_thread_id(message)
     wid = session_manager.resolve_window_for_thread(user.id, thread_id)
     if not wid:
-        await safe_reply(update.message, "❌ No session bound to this topic.")
+        await safe_reply(message, "❌ No session bound to this topic.")
         return
 
     w = await tmux_manager.find_window_by_id(wid)
     if not w:
         display = session_manager.get_display_name(wid)
-        await safe_reply(update.message, f"❌ Window '{display}' no longer exists.")
+        await safe_reply(message, f"❌ Window '{display}' no longer exists.")
         return
 
     text = await tmux_manager.capture_pane(w.window_id, with_ansi=True)
     if not text:
-        await safe_reply(update.message, "❌ Failed to capture pane content.")
+        await safe_reply(message, "❌ Failed to capture pane content.")
         return
 
     png_bytes = await text_to_image(text, with_ansi=True)
     keyboard = _build_screenshot_keyboard(wid)
-    await update.message.reply_document(
-        document=io.BytesIO(png_bytes),
-        filename="screenshot.png",
+    await message.reply_document(
+        BufferedInputFile(png_bytes, filename="screenshot.png"),
         reply_markup=keyboard,
     )
 
 
-async def unbind_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def unbind_command(message: Message, bot: Bot, user_data: dict[str, Any]) -> None:
     """Unbind this topic from its Claude session without killing the window."""
-    user = update.effective_user
+    user = message.from_user
     if not user or not is_user_allowed(user.id):
         return
-    if not update.message:
-        return
 
-    thread_id = _get_thread_id(update)
+    thread_id = _get_thread_id(message)
     if thread_id is None:
-        await safe_reply(update.message, "❌ This command only works in a topic.")
+        await safe_reply(message, "❌ This command only works in a topic.")
         return
 
     wid = session_manager.get_window_for_thread(user.id, thread_id)
     if not wid:
-        await safe_reply(update.message, "❌ No session bound to this topic.")
+        await safe_reply(message, "❌ No session bound to this topic.")
         return
 
     display = session_manager.get_display_name(wid)
     session_manager.unbind_thread(user.id, thread_id)
-    await clear_topic_state(user.id, thread_id, context.bot, context.user_data)
+    await clear_topic_state(user.id, thread_id, bot, user_data)
 
     await safe_reply(
-        update.message,
+        message,
         f"✅ Topic unbound from window '{display}'.\n"
         "The Claude session is still running in tmux.\n"
         "Send a message to bind to a new session.",
@@ -403,51 +420,51 @@ async def _restart_all_claude_sessions() -> str:
     return "\n".join(lines) if lines else "No Claude Code sessions are bound."
 
 
-async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def resume_command(
+    message: Message, bot: Bot, user_data: dict[str, Any], command: CommandObject
+) -> None:
     """/resume [<path>] <session id> [mode] in an unbound topic; else forward to Claude."""
-    user = update.effective_user
-    if not user or not is_user_allowed(user.id) or not update.message:
+    user = message.from_user
+    if not user or not is_user_allowed(user.id):
         return
-    thread_id = _get_thread_id(update)
+    thread_id = _get_thread_id(message)
     bound = thread_id is not None and session_manager.get_window_for_thread(
         user.id, thread_id
     )
-    ref = resolve_session_ref(update.message.text or "")
+    ref = resolve_session_ref(message.text or "")
     if ref and not bound:
-        await _launch_session_ref(update, context, ref)
+        await _launch_session_ref(message, bot, user_data, ref)
         return
-    if not bound and context.args:
+    if not bound and _command_args(command):
         await safe_reply(
-            update.message,
+            message,
             "❌ Unknown session. Use `/resume <session id>` or "
             "`/resume <path> <session id>` (optionally followed by a mode).",
         )
         return
-    await forward_command_handler(update, context)
+    await forward_command_handler(message, bot)
 
 
-async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def restart_command(message: Message, command: CommandObject) -> None:
     """Restart Claude Code in this topic's window: /restart [normal|accept|plan|bypass]."""
-    user = update.effective_user
+    user = message.from_user
     if not user or not is_user_allowed(user.id):
         return
-    if not update.message:
-        return
-    thread_id = _get_thread_id(update)
+    thread_id = _get_thread_id(message)
     wid = session_manager.resolve_window_for_thread(user.id, thread_id)
     if not wid:
-        await safe_reply(update.message, "❌ No session bound to this topic.")
+        await safe_reply(message, "❌ No session bound to this topic.")
         return
     mode: str | None = None
-    if context.args:
-        mode = normalize_launch_mode(context.args[0])
+    if _command_args(command):
+        mode = normalize_launch_mode(_command_args(command)[0])
         if mode is None:
             await safe_reply(
-                update.message,
+                message,
                 "❌ Unknown mode. Use one of: normal, accept, plan, bypass.",
             )
             return
-    progress = await safe_reply(update.message, "⏳ Restarting Claude Code…")
+    progress = await safe_reply(message, "⏳ Restarting Claude Code…")
     ok, msg = await _restart_claude(user.id, wid, mode)
     await safe_edit(progress, msg)
     logger.info("restart window=%s user=%d ok=%s", wid, user.id, ok)
@@ -555,13 +572,14 @@ async def _build_sessions_overview(
         )
         row = [
             InlineKeyboardButton(
-                f"🗑 Kill {display[:14]}", callback_data=f"{CB_SESSIONS_KILL}{wid}"[:64]
+                text=f"🗑 Kill {display[:14]}",
+                callback_data=f"{CB_SESSIONS_KILL}{wid}"[:64],
             )
         ]
         if chat_id is not None and str(chat_id).startswith("-100"):
             row.append(
                 InlineKeyboardButton(
-                    "↗ open", url=f"https://t.me/c/{str(chat_id)[4:]}/{tid}"
+                    text="↗ open", url=f"https://t.me/c/{str(chat_id)[4:]}/{tid}"
                 )
             )
         rows.append(row)
@@ -569,38 +587,38 @@ async def _build_sessions_overview(
         lines.append("No sessions bound to topics.")
     else:
         lines.append(f"\n{len(bindings)} sessions · {_fmt_size(total_mem)} RSS total")
-    rows.append([InlineKeyboardButton("🔄 Refresh", callback_data=CB_SESSIONS_REFRESH)])
-    return "🗂 **Sessions**\n" + "\n".join(lines), InlineKeyboardMarkup(rows)
+    rows.append(
+        [InlineKeyboardButton(text="🔄 Refresh", callback_data=CB_SESSIONS_REFRESH)]
+    )
+    return "🗂 **Sessions**\n" + "\n".join(lines), InlineKeyboardMarkup(
+        inline_keyboard=rows
+    )
 
 
-async def sessions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def sessions_command(message: Message) -> None:
     """List running Claude Code sessions with state, memory and kill buttons."""
-    user = update.effective_user
-    if not user or not is_user_allowed(user.id) or not update.message:
-        return
-    chat = update.effective_chat
-    text, kb = await _build_sessions_overview(user.id, chat.id if chat else None)
-    await safe_reply(update.message, text, reply_markup=kb)
-
-
-async def kill_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Kill this topic's tmux window and forget its session."""
-    user = update.effective_user
+    user = message.from_user
     if not user or not is_user_allowed(user.id):
         return
-    if not update.message:
+    chat = message.chat
+    text, kb = await _build_sessions_overview(user.id, chat.id if chat else None)
+    await safe_reply(message, text, reply_markup=kb)
+
+
+async def kill_command(message: Message, bot: Bot, user_data: dict[str, Any]) -> None:
+    """Kill this topic's tmux window and forget its session."""
+    user = message.from_user
+    if not user or not is_user_allowed(user.id):
         return
-    thread_id = _get_thread_id(update)
+    thread_id = _get_thread_id(message)
     if thread_id is None:
-        await safe_reply(update.message, "❌ This command only works in a topic.")
+        await safe_reply(message, "❌ This command only works in a topic.")
         return
     wid = session_manager.get_window_for_thread(user.id, thread_id)
     if not wid:
-        await safe_reply(update.message, "❌ No session bound to this topic.")
+        await safe_reply(message, "❌ No session bound to this topic.")
         return
-    await _kill_window_and_offer_resume(
-        context.bot, user.id, thread_id, wid, context.user_data
-    )
+    await _kill_window_and_offer_resume(bot, user.id, thread_id, wid, user_data)
 
 
 def _mode_keyboard(window_id: str, current: str | None) -> InlineKeyboardMarkup:
@@ -610,7 +628,7 @@ def _mode_keyboard(window_id: str, current: str | None) -> InlineKeyboardMarkup:
         text = f"• {label}" if mode == current else label
         row.append(
             InlineKeyboardButton(
-                text, callback_data=f"{CB_MODE_SET}{mode}:{window_id}"[:64]
+                text=text, callback_data=f"{CB_MODE_SET}{mode}:{window_id}"[:64]
             )
         )
         if len(row) == 2:
@@ -618,7 +636,7 @@ def _mode_keyboard(window_id: str, current: str | None) -> InlineKeyboardMarkup:
             row = []
     if row:
         rows.append(row)
-    return InlineKeyboardMarkup(rows)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def _current_mode(wid: str) -> str | None:
@@ -660,32 +678,30 @@ async def _switch_mode(wid: str, target: str) -> tuple[bool, str]:
     )
 
 
-async def mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def mode_command(message: Message, command: CommandObject) -> None:
     """Show or switch the permission mode: /mode [normal|accept|plan|bypass]."""
-    user = update.effective_user
+    user = message.from_user
     if not user or not is_user_allowed(user.id):
         return
-    if not update.message:
-        return
-    thread_id = _get_thread_id(update)
+    thread_id = _get_thread_id(message)
     wid = session_manager.resolve_window_for_thread(user.id, thread_id)
     if not wid:
-        await safe_reply(update.message, "❌ No session bound to this topic.")
+        await safe_reply(message, "❌ No session bound to this topic.")
         return
-    if context.args:
-        target = normalize_launch_mode(context.args[0])
+    if _command_args(command):
+        target = normalize_launch_mode(_command_args(command)[0])
         if target is None:
             await safe_reply(
-                update.message, "❌ Unknown mode. Use: normal, accept, plan, bypass."
+                message, "❌ Unknown mode. Use: normal, accept, plan, bypass."
             )
             return
         ok, msg = await _switch_mode(wid, target)
-        await safe_reply(update.message, ("✅ " if ok else "⚠️ ") + msg)
+        await safe_reply(message, ("✅ " if ok else "⚠️ ") + msg)
         return
     current = await _current_mode(wid)
     label = LAUNCH_MODE_LABELS.get(current or "", current or "unknown")
     await safe_reply(
-        update.message,
+        message,
         f"Permission mode: **{label}**\nPick one to switch (Shift+Tab cycle):",
         reply_markup=_mode_keyboard(wid, current),
     )
@@ -753,17 +769,15 @@ def _fmt_uptime(seconds: float) -> str:
     return f"{d}d {h}h {m}m" if d else f"{h}h {m}m {s}s"
 
 
-async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def info_command(message: Message) -> None:
     """Show tmux / Claude Code / Telegram internals for this topic's session."""
-    user = update.effective_user
+    user = message.from_user
     if not user or not is_user_allowed(user.id):
         return
-    if not update.message:
-        return
-    thread_id = _get_thread_id(update)
+    thread_id = _get_thread_id(message)
     wid = session_manager.resolve_window_for_thread(user.id, thread_id)
     if not wid:
-        await safe_reply(update.message, "❌ No session bound to this topic.")
+        await safe_reply(message, "❌ No session bound to this topic.")
         return
 
     w = await tmux_manager.find_window_by_id(wid)
@@ -815,58 +829,54 @@ async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if ws.session_id:
         lines.append("resume from a terminal:")
         lines.append(f"`cd {cwd} && claude --resume {ws.session_id}`")
-    chat = update.effective_chat
+    chat = message.chat
     lines += [
         "",
         "**Telegram / bot**",
         f"user `{user.id}` · chat `{chat.id if chat else '—'}` · topic `{thread_id}`",
         f"ccbot {__version__} · config `{config.config_dir}` · up {_fmt_uptime(time.monotonic() - _BOT_STARTED_AT)}",
     ]
-    await safe_reply(update.message, "\n".join(lines))
+    await safe_reply(message, "\n".join(lines))
 
 
-async def esc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def esc_command(message: Message) -> None:
     """Send Escape key to interrupt Claude."""
-    user = update.effective_user
+    user = message.from_user
     if not user or not is_user_allowed(user.id):
         return
-    if not update.message:
-        return
 
-    thread_id = _get_thread_id(update)
+    thread_id = _get_thread_id(message)
     wid = session_manager.resolve_window_for_thread(user.id, thread_id)
     if not wid:
-        await safe_reply(update.message, "❌ No session bound to this topic.")
+        await safe_reply(message, "❌ No session bound to this topic.")
         return
 
     w = await tmux_manager.find_window_by_id(wid)
     if not w:
         display = session_manager.get_display_name(wid)
-        await safe_reply(update.message, f"❌ Window '{display}' no longer exists.")
+        await safe_reply(message, f"❌ Window '{display}' no longer exists.")
         return
 
     # Send Escape control character (no enter)
     await tmux_manager.send_keys(w.window_id, "\x1b", enter=False)
-    await safe_reply(update.message, "⎋ Sent Escape")
+    await safe_reply(message, "⎋ Sent Escape")
 
 
-async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def usage_command(message: Message) -> None:
     """Fetch Claude Code usage stats from TUI and send to Telegram."""
-    user = update.effective_user
+    user = message.from_user
     if not user or not is_user_allowed(user.id):
         return
-    if not update.message:
-        return
 
-    thread_id = _get_thread_id(update)
+    thread_id = _get_thread_id(message)
     wid = session_manager.resolve_window_for_thread(user.id, thread_id)
     if not wid:
-        await safe_reply(update.message, "No session bound to this topic.")
+        await safe_reply(message, "No session bound to this topic.")
         return
 
     w = await tmux_manager.find_window_by_id(wid)
     if not w:
-        await safe_reply(update.message, f"Window '{wid}' no longer exists.")
+        await safe_reply(message, f"Window '{wid}' no longer exists.")
         return
 
     # Send /usage command to Claude Code TUI
@@ -879,7 +889,7 @@ async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await tmux_manager.send_keys(w.window_id, "Escape", enter=False, literal=False)
 
     if not pane_text:
-        await safe_reply(update.message, "Failed to capture usage info.")
+        await safe_reply(message, "Failed to capture usage info.")
         return
 
     # Try to parse structured usage info
@@ -888,13 +898,13 @@ async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     usage = parse_usage_output(pane_text)
     if usage and usage.parsed_lines:
         text = "\n".join(usage.parsed_lines)
-        await safe_reply(update.message, f"```\n{text}\n```")
+        await safe_reply(message, f"```\n{text}\n```")
     else:
         # Fallback: send raw pane capture trimmed
         trimmed = pane_text.strip()
         if len(trimmed) > 3000:
             trimmed = trimmed[:3000] + "\n... (truncated)"
-        await safe_reply(update.message, f"```\n{trimmed}\n```")
+        await safe_reply(message, f"```\n{trimmed}\n```")
 
 
 # --- Screenshot keyboard with quick control keys ---
@@ -933,19 +943,19 @@ def _build_screenshot_keyboard(window_id: str) -> InlineKeyboardMarkup:
 
     def btn(label: str, key_id: str) -> InlineKeyboardButton:
         return InlineKeyboardButton(
-            label,
+            text=label,
             callback_data=f"{CB_KEYS_PREFIX}{key_id}:{window_id}"[:64],
         )
 
     return InlineKeyboardMarkup(
-        [
+        inline_keyboard=[
             [btn("␣ Space", "spc"), btn("↑", "up"), btn("⇥ Tab", "tab")],
             [btn("←", "lt"), btn("↓", "dn"), btn("→", "rt")],
             [btn("⎋ Esc", "esc"), btn("^C", "cc"), btn("⏎ Enter", "ent")],
             [
                 btn("⇧⇥ Mode", "btab"),
                 InlineKeyboardButton(
-                    "🔄 Refresh",
+                    text="🔄 Refresh",
                     callback_data=f"{CB_SCREENSHOT_REFRESH}{window_id}"[:64],
                 ),
             ],
@@ -954,14 +964,14 @@ def _build_screenshot_keyboard(window_id: str) -> InlineKeyboardMarkup:
 
 
 async def topic_closed_handler(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
+    message: Message, bot: Bot, user_data: dict[str, Any]
 ) -> None:
     """Handle topic closure — kill the associated tmux window and clean up state."""
-    user = update.effective_user
+    user = message.from_user
     if not user or not is_user_allowed(user.id):
         return
 
-    thread_id = _get_thread_id(update)
+    thread_id = _get_thread_id(message)
     if thread_id is None:
         return
 
@@ -993,23 +1003,21 @@ async def topic_closed_handler(
             )
         session_manager.unbind_thread(user.id, thread_id)
         # Clean up all memory state for this topic
-        await clear_topic_state(user.id, thread_id, context.bot, context.user_data)
+        await clear_topic_state(user.id, thread_id, bot, user_data)
     else:
         logger.debug(
             "Topic closed: no binding (user=%d, thread=%d)", user.id, thread_id
         )
 
 
-async def topic_edited_handler(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
+async def topic_edited_handler(message: Message) -> None:
     """Handle topic rename — sync new name to tmux window and internal state."""
-    user = update.effective_user
+    user = message.from_user
     if not user or not is_user_allowed(user.id):
         return
 
-    msg = update.message
-    if not msg or not msg.forum_topic_edited:
+    msg = message
+    if not msg.forum_topic_edited:
         return
 
     new_name = msg.forum_topic_edited.name
@@ -1017,7 +1025,7 @@ async def topic_edited_handler(
         # Icon-only change, no rename needed
         return
 
-    thread_id = _get_thread_id(update)
+    thread_id = _get_thread_id(message)
     if thread_id is None:
         return
 
@@ -1041,37 +1049,33 @@ async def topic_edited_handler(
     )
 
 
-async def forward_command_handler(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
+async def forward_command_handler(message: Message, bot: Bot) -> None:
     """Forward any non-bot command as a slash command to the active Claude Code session."""
-    user = update.effective_user
+    user = message.from_user
     if not user or not is_user_allowed(user.id):
         return
-    if not update.message:
-        return
 
-    thread_id = _get_thread_id(update)
+    thread_id = _get_thread_id(message)
 
     # Capture group chat_id for supergroup forum topic routing.
     # Required: Telegram Bot API needs group chat_id (not user_id) to send
     # messages with message_thread_id. Do NOT remove — see session.py docs.
-    chat = update.effective_chat
+    chat = message.chat
     if chat and chat.type in ("group", "supergroup"):
         session_manager.set_group_chat_id(user.id, thread_id, chat.id)
 
-    cmd_text = update.message.text or ""
+    cmd_text = message.text or ""
     # The full text is already a slash command like "/clear" or "/compact foo"
     cc_slash = cmd_text.split("@")[0]  # strip bot mention
     wid = session_manager.resolve_window_for_thread(user.id, thread_id)
     if not wid:
-        await safe_reply(update.message, "❌ No session bound to this topic.")
+        await safe_reply(message, "❌ No session bound to this topic.")
         return
 
     w = await tmux_manager.find_window_by_id(wid)
     if not w:
         display = session_manager.get_display_name(wid)
-        await safe_reply(update.message, f"❌ Window '{display}' no longer exists.")
+        await safe_reply(message, f"❌ Window '{display}' no longer exists.")
         return
 
     display = session_manager.get_display_name(wid)
@@ -1079,12 +1083,12 @@ async def forward_command_handler(
         "Forwarding command %s to window %s (user=%d)", cc_slash, display, user.id
     )
     try:
-        await update.message.chat.send_action(ChatAction.TYPING)
+        await _send_typing(bot, message)
     except Exception as e:
         logger.warning("send_action(TYPING) failed, continuing to injection: %s", e)
-    success, message = await session_manager.send_to_window(wid, cc_slash)
+    success, err = await session_manager.send_to_window(wid, cc_slash)
     if success:
-        await safe_reply(update.message, f"⚡ [{display}] Sent: {cc_slash}")
+        await safe_reply(message, f"⚡ [{display}] Sent: {cc_slash}")
         # If /clear command was sent, clear the session association
         # so we can detect the new session after first message
         if cc_slash.strip().lower() == "/clear":
@@ -1096,22 +1100,17 @@ async def forward_command_handler(
         # interactive UIs every 1s (status_polling.py), so no
         # proactive detection needed here — the poller handles it.
     else:
-        await safe_reply(update.message, f"❌ {message}")
+        await safe_reply(message, f"❌ {err}")
 
 
-async def unsupported_content_handler(
-    update: Update,
-    _context: ContextTypes.DEFAULT_TYPE,
-) -> None:
+async def unsupported_content_handler(message: Message) -> None:
     """Reply to non-text messages (stickers, video, etc.)."""
-    if not update.message:
-        return
-    user = update.effective_user
+    user = message.from_user
     if not user or not is_user_allowed(user.id):
         return
     logger.debug("Unsupported content from user %d", user.id)
     await safe_reply(
-        update.message,
+        message,
         "⚠ Only text, photo, and voice messages are supported. Stickers, video, and other media cannot be forwarded to Claude Code.",
     )
 
@@ -1149,11 +1148,11 @@ def build_image_prompt(caption: str, paths: list[Path]) -> str:
     return f"Please look at the attached {noun}.\n\n{attachment}"
 
 
-async def _download_image(message: Message) -> Path | None:
+async def _download_image(message: Message, bot: Bot) -> Path | None:
     """Download the photo or image document in *message* into _IMAGES_DIR."""
     if message.photo:
         photo = message.photo[-1]  # highest resolution
-        tg_file = await photo.get_file()
+        file_id = photo.file_id
         filename = f"{int(time.time())}_{photo.file_unique_id}.jpg"
     elif message.document:
         doc = message.document
@@ -1161,12 +1160,12 @@ async def _download_image(message: Message) -> Path | None:
         if ext not in _IMAGE_DOC_EXTENSIONS:
             mime = doc.mime_type or ""
             ext = "." + mime.split("/", 1)[1] if mime.startswith("image/") else ".img"
-        tg_file = await doc.get_file()
+        file_id = doc.file_id
         filename = f"{int(time.time())}_{doc.file_unique_id}{ext}"
     else:
         return None
     file_path = _IMAGES_DIR / filename
-    await tg_file.download_to_drive(file_path)
+    await bot.download(file_id, destination=file_path)
     return file_path
 
 
@@ -1179,10 +1178,12 @@ _pending_images: dict[tuple[int, int], dict[str, Any]] = {}
 
 def _image_prompt_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        [
+        inline_keyboard=[
             [
-                InlineKeyboardButton("⏭ Skip (no text)", callback_data=CB_IMG_SKIP),
-                InlineKeyboardButton("❌ Cancel", callback_data=CB_IMG_CANCEL),
+                InlineKeyboardButton(
+                    text="⏭ Skip (no text)", callback_data=CB_IMG_SKIP
+                ),
+                InlineKeyboardButton(text="❌ Cancel", callback_data=CB_IMG_CANCEL),
             ]
         ]
     )
@@ -1247,6 +1248,7 @@ async def _finish_image_prompt(pending: dict[str, Any], text: str) -> None:
 
 async def _deliver_pending_images(
     reply_to: Message,
+    bot: Bot,
     user_id: int,
     thread_id: int,
     extra_text: str,
@@ -1262,7 +1264,7 @@ async def _deliver_pending_images(
     caption_parts = [t for t in (pending["caption"], extra_text) if t.strip()]
     text_to_send = build_image_prompt("\n\n".join(caption_parts), pending["paths"])
     try:
-        await reply_to.chat.send_action(ChatAction.TYPING)
+        await _send_typing(bot, reply_to)
     except Exception as e:
         logger.warning("send_action(TYPING) failed, continuing to injection: %s", e)
     clear_status_msg_info(user_id, thread_id)
@@ -1308,24 +1310,22 @@ async def _flush_album(key: tuple[int, int, str]) -> None:
     )
 
 
-async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def photo_handler(message: Message, bot: Bot) -> None:
     """Handle photos / image files: download and stage them for Claude Code.
 
     Albums are buffered by media_group_id.  Nothing is forwarded yet: the
     user is asked for the prompt text (or Skip / Cancel) — see _stage_images.
     """
-    user = update.effective_user
+    user = message.from_user
     if not user or not is_user_allowed(user.id):
-        if update.message:
-            await safe_reply(update.message, "You are not authorized to use this bot.")
+        await safe_reply(message, "You are not authorized to use this bot.")
         return
 
-    message = update.message
-    if not message or not (message.photo or message.document):
+    if not (message.photo or message.document):
         return
 
     chat = message.chat
-    thread_id = _get_thread_id(update)
+    thread_id = _get_thread_id(message)
     if chat.type in ("group", "supergroup") and thread_id is not None:
         session_manager.set_group_chat_id(user.id, thread_id, chat.id)
 
@@ -1357,7 +1357,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     try:
-        file_path = await _download_image(message)
+        file_path = await _download_image(message, bot)
     except Exception as e:
         logger.error("Image download failed (user=%d): %s", user.id, e)
         await safe_reply(message, f"❌ Failed to download image: {e}")
@@ -1391,33 +1391,32 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     album["task"] = asyncio.create_task(_flush_album(key))
 
 
-async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def voice_handler(message: Message, bot: Bot) -> None:
     """Handle voice messages: transcribe via OpenAI and forward text to Claude Code."""
-    user = update.effective_user
+    user = message.from_user
     if not user or not is_user_allowed(user.id):
-        if update.message:
-            await safe_reply(update.message, "You are not authorized to use this bot.")
+        await safe_reply(message, "You are not authorized to use this bot.")
         return
 
-    if not update.message or not update.message.voice:
+    if not message.voice:
         return
 
     if not config.openai_api_key:
         await safe_reply(
-            update.message,
+            message,
             "⚠ Voice transcription requires an OpenAI API key.\n"
             "Set `OPENAI_API_KEY` in your `.env` file and restart the bot.",
         )
         return
 
-    chat = update.message.chat
-    thread_id = _get_thread_id(update)
+    chat = message.chat
+    thread_id = _get_thread_id(message)
     if chat.type in ("group", "supergroup") and thread_id is not None:
         session_manager.set_group_chat_id(user.id, thread_id, chat.id)
 
     if thread_id is None:
         await safe_reply(
-            update.message,
+            message,
             "❌ Please use a named topic. Create a new topic to start a session.",
         )
         return
@@ -1425,7 +1424,7 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     wid = session_manager.get_window_for_thread(user.id, thread_id)
     if wid is None:
         await safe_reply(
-            update.message,
+            message,
             "❌ No session bound to this topic. Send a text message first to create one.",
         )
         return
@@ -1435,45 +1434,47 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         display = session_manager.get_display_name(wid)
         session_manager.unbind_thread(user.id, thread_id)
         await safe_reply(
-            update.message,
+            message,
             f"❌ Window '{display}' no longer exists. Binding removed.\n"
             "Send a message to start a new session.",
         )
         return
 
     # Download voice as in-memory bytes
-    voice_file = await update.message.voice.get_file()
-    ogg_data = bytes(await voice_file.download_as_bytearray())
+    voice_buf = await bot.download(message.voice.file_id)
+    if voice_buf is None:  # only when a destination is given
+        return
+    ogg_data = voice_buf.read()
 
     # Transcribe
     try:
         text = await transcribe_voice(ogg_data)
     except ValueError as e:
-        await safe_reply(update.message, f"⚠ {e}")
+        await safe_reply(message, f"⚠ {e}")
         return
     except Exception as e:
         logger.error("Voice transcription failed: %s", e)
-        await safe_reply(update.message, f"⚠ Transcription failed: {e}")
+        await safe_reply(message, f"⚠ Transcription failed: {e}")
         return
 
     # A voice note can also be the prompt text for staged images.
     if (user.id, thread_id) in _pending_images:
-        await safe_reply(update.message, f'🎤 "{text}"')
-        await _deliver_pending_images(update.message, user.id, thread_id, text)
+        await safe_reply(message, f'🎤 "{text}"')
+        await _deliver_pending_images(message, bot, user.id, thread_id, text)
         return
 
     try:
-        await update.message.chat.send_action(ChatAction.TYPING)
+        await _send_typing(bot, message)
     except Exception as e:
         logger.warning("send_action(TYPING) failed, continuing to injection: %s", e)
     clear_status_msg_info(user.id, thread_id)
 
-    success, message = await session_manager.send_to_window(wid, text)
+    success, err = await session_manager.send_to_window(wid, text)
     if not success:
-        await safe_reply(update.message, f"❌ {message}")
+        await safe_reply(message, f"❌ {err}")
         return
 
-    await safe_reply(update.message, f'🎤 "{text}"')
+    await safe_reply(message, f'🎤 "{text}"')
 
 
 # Active bash capture tasks: (user_id, thread_id) → asyncio.Task
@@ -1578,28 +1579,33 @@ _pending_merges: dict[tuple[int, int | None], dict[str, Any]] = {}
 _pending_texts: dict[tuple[int, int], dict[str, Any]] = {}
 
 
-async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def text_handler(message: Message, bot: Bot, user_data: dict[str, Any]) -> None:
     """Entry point for text: merge rapid-fire parts, then process once."""
-    user = update.effective_user
+    user = message.from_user
     if not user or not is_user_allowed(user.id):
-        if update.message:
-            await safe_reply(update.message, "You are not authorized to use this bot.")
+        await safe_reply(message, "You are not authorized to use this bot.")
         return
 
-    if not update.message or not update.message.text:
+    if not message.text:
         return
 
     window = float(config.text_merge_window)
     if window <= 0:
-        await _handle_text(update, context, update.message.text)
+        await _handle_text(message, bot, user_data, message.text)
         return
 
-    key = (user.id, _get_thread_id(update))
+    key = (user.id, _get_thread_id(message))
     buf = _pending_merges.get(key)
     if buf is None:
-        buf = {"update": update, "context": context, "parts": [], "task": None}
+        buf = {
+            "message": message,
+            "bot": bot,
+            "user_data": user_data,
+            "parts": [],
+            "task": None,
+        }
         _pending_merges[key] = buf
-    buf["parts"].append(update.message.text)
+    buf["parts"].append(message.text)
     if buf["task"] is not None:
         buf["task"].cancel()
     buf["task"] = asyncio.create_task(_flush_text_merge(key, window))
@@ -1614,105 +1620,101 @@ async def _flush_text_merge(key: tuple[int, int | None], delay: float) -> None:
     if len(parts) > 1:
         logger.info("Merged %d text parts (user=%d, thread=%s)", len(parts), *key)
     try:
-        await _handle_text(buf["update"], buf["context"], "\n".join(parts))
+        await _handle_text(
+            buf["message"], buf["bot"], buf["user_data"], "\n".join(parts)
+        )
     except Exception:
         logger.exception("Text handling failed after merge (user=%d)", key[0])
 
 
 async def _handle_text(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, text: str
+    message: Message, bot: Bot, user_data: dict[str, Any], text: str
 ) -> None:
-    user = update.effective_user
-    if not user or not update.message:
+    user = message.from_user
+    if not user:
         return
 
-    thread_id = _get_thread_id(update)
+    thread_id = _get_thread_id(message)
 
     # Capture group chat_id for supergroup forum topic routing.
     # Required: Telegram Bot API needs group chat_id (not user_id) to send
     # messages with message_thread_id. Do NOT remove — see session.py docs.
-    chat = update.effective_chat
+    chat = message.chat
     if chat and chat.type in ("group", "supergroup"):
         session_manager.set_group_chat_id(user.id, thread_id, chat.id)
 
     # Ignore text in window picker mode (only for the same thread)
-    if context.user_data and context.user_data.get(STATE_KEY) == STATE_SELECTING_WINDOW:
-        pending_tid = context.user_data.get("_pending_thread_id")
+    if user_data and user_data.get(STATE_KEY) == STATE_SELECTING_WINDOW:
+        pending_tid = user_data.get("_pending_thread_id")
         if pending_tid == thread_id:
             await safe_reply(
-                update.message,
+                message,
                 "Please use the window picker above, or tap Cancel.",
             )
             return
         # Stale picker state from a different thread — clear it
-        clear_window_picker_state(context.user_data)
-        context.user_data.pop("_pending_thread_id", None)
-        context.user_data.pop("_pending_thread_text", None)
+        clear_window_picker_state(user_data)
+        user_data.pop("_pending_thread_id", None)
+        user_data.pop("_pending_thread_text", None)
 
     # Text while browsing: an absolute path selects that directory directly;
     # anything else is ignored (only for the same thread)
-    if (
-        context.user_data
-        and context.user_data.get(STATE_KEY) == STATE_BROWSING_DIRECTORY
-    ):
-        pending_tid = context.user_data.get("_pending_thread_id")
+    if user_data and user_data.get(STATE_KEY) == STATE_BROWSING_DIRECTORY:
+        pending_tid = user_data.get("_pending_thread_id")
         if pending_tid == thread_id:
             typed_dir = as_directory(text)
             if typed_dir:
-                clear_browse_state(context.user_data)
-                await _on_directory_chosen(update, context, typed_dir)
+                clear_browse_state(user_data)
+                await _on_directory_chosen(message, user_data, typed_dir)
                 return
             await safe_reply(
-                update.message,
+                message,
                 "Please use the directory browser above, send a full path "
                 "(e.g. `/home/me/project`), or tap Cancel.",
             )
             return
         # Stale browsing state from a different thread — clear it
-        clear_browse_state(context.user_data)
-        context.user_data.pop("_pending_thread_id", None)
-        context.user_data.pop("_pending_thread_text", None)
+        clear_browse_state(user_data)
+        user_data.pop("_pending_thread_id", None)
+        user_data.pop("_pending_thread_text", None)
 
     # Ignore text in session picker mode (only for the same thread)
-    if (
-        context.user_data
-        and context.user_data.get(STATE_KEY) == STATE_SELECTING_SESSION
-    ):
-        pending_tid = context.user_data.get("_pending_thread_id")
+    if user_data and user_data.get(STATE_KEY) == STATE_SELECTING_SESSION:
+        pending_tid = user_data.get("_pending_thread_id")
         if pending_tid == thread_id:
             await safe_reply(
-                update.message,
+                message,
                 "Please use the session picker above, or tap Cancel.",
             )
             return
         # Stale picker state from a different thread — clear it
-        clear_session_picker_state(context.user_data)
-        context.user_data.pop("_pending_thread_id", None)
-        context.user_data.pop("_pending_thread_text", None)
-        context.user_data.pop(SELECTED_PATH_KEY, None)
+        clear_session_picker_state(user_data)
+        user_data.pop("_pending_thread_id", None)
+        user_data.pop("_pending_thread_text", None)
+        user_data.pop(SELECTED_PATH_KEY, None)
 
     # Ignore text in mode picker mode (only for the same thread)
-    if context.user_data and context.user_data.get(STATE_KEY) == STATE_SELECTING_MODE:
-        pending_tid = context.user_data.get("_pending_thread_id")
+    if user_data and user_data.get(STATE_KEY) == STATE_SELECTING_MODE:
+        pending_tid = user_data.get("_pending_thread_id")
         if pending_tid == thread_id:
             await safe_reply(
-                update.message,
+                message,
                 "Please choose a mode above, or tap Cancel.",
             )
             return
-        clear_mode_picker_state(context.user_data)
-        context.user_data.pop("_pending_thread_id", None)
-        context.user_data.pop("_pending_thread_text", None)
+        clear_mode_picker_state(user_data)
+        user_data.pop("_pending_thread_id", None)
+        user_data.pop("_pending_thread_text", None)
 
     # Staged images waiting for their prompt text — this message is it.
     if thread_id is not None and (user.id, thread_id) in _pending_images:
-        await _deliver_pending_images(update.message, user.id, thread_id, text)
+        await _deliver_pending_images(message, bot, user.id, thread_id, text)
         return
 
     # Must be in a named topic
     if thread_id is None:
         await safe_reply(
-            update.message,
+            message,
             "❌ Please use a named topic. Create a new topic to start a session.",
         )
         return
@@ -1723,11 +1725,11 @@ async def _handle_text(
         # that session right away (last launch mode, no pickers)
         ref = resolve_session_ref(text)
         if ref:
-            await _launch_session_ref(update, context, ref)
+            await _launch_session_ref(message, bot, user_data, ref)
             return
         if looks_like_session_ref(text):
             await safe_reply(
-                update.message,
+                message,
                 "❌ No transcript found for that session id — it can't be resumed. "
                 "(A session that never received a prompt has no transcript.) "
                 "Send a path to start fresh, or `/sessions` to see what's running.",
@@ -1743,10 +1745,10 @@ async def _handle_text(
                 user.id,
                 thread_id,
             )
-            if context.user_data is not None:
-                context.user_data["_pending_thread_id"] = thread_id
-                context.user_data.pop("_pending_thread_text", None)
-            await _on_directory_chosen(update, context, typed_dir)
+            if user_data is not None:
+                user_data["_pending_thread_id"] = thread_id
+                user_data.pop("_pending_thread_text", None)
+            await _on_directory_chosen(message, user_data, typed_dir)
             return
 
         # Check for unbound windows first
@@ -1773,12 +1775,12 @@ async def _handle_text(
                 thread_id,
             )
             msg_text, keyboard, win_ids = build_window_picker(unbound)
-            if context.user_data is not None:
-                context.user_data[STATE_KEY] = STATE_SELECTING_WINDOW
-                context.user_data[UNBOUND_WINDOWS_KEY] = win_ids
-                context.user_data["_pending_thread_id"] = thread_id
-                context.user_data["_pending_thread_text"] = text
-            await safe_reply(update.message, msg_text, reply_markup=keyboard)
+            if user_data is not None:
+                user_data[STATE_KEY] = STATE_SELECTING_WINDOW
+                user_data[UNBOUND_WINDOWS_KEY] = win_ids
+                user_data["_pending_thread_id"] = thread_id
+                user_data["_pending_thread_text"] = text
+            await safe_reply(message, msg_text, reply_markup=keyboard)
             return
 
         # No unbound windows — show directory browser to create a new session
@@ -1789,14 +1791,14 @@ async def _handle_text(
         )
         start_path = browser_start_path()
         msg_text, keyboard, subdirs = build_directory_browser(start_path)
-        if context.user_data is not None:
-            context.user_data[STATE_KEY] = STATE_BROWSING_DIRECTORY
-            context.user_data[BROWSE_PATH_KEY] = start_path
-            context.user_data[BROWSE_PAGE_KEY] = 0
-            context.user_data[BROWSE_DIRS_KEY] = subdirs
-            context.user_data["_pending_thread_id"] = thread_id
-            context.user_data["_pending_thread_text"] = text
-        await safe_reply(update.message, msg_text, reply_markup=keyboard)
+        if user_data is not None:
+            user_data[STATE_KEY] = STATE_BROWSING_DIRECTORY
+            user_data[BROWSE_PATH_KEY] = start_path
+            user_data[BROWSE_PAGE_KEY] = 0
+            user_data[BROWSE_DIRS_KEY] = subdirs
+            user_data["_pending_thread_id"] = thread_id
+            user_data["_pending_thread_text"] = text
+        await safe_reply(message, msg_text, reply_markup=keyboard)
         return
 
     # Bound topic — forward to bound window
@@ -1809,9 +1811,9 @@ async def _handle_text(
             user.id,
             thread_id,
         )
-        offered = await handle_vanished_window(context.bot, user.id, thread_id, wid)
+        offered = await handle_vanished_window(bot, user.id, thread_id, wid)
         await safe_reply(
-            update.message,
+            message,
             f"❌ Not sent: the window of '{display}' no longer exists. "
             + (
                 "Tap ▶ Resume above to bring the session back, or send a path "
@@ -1823,18 +1825,18 @@ async def _handle_text(
         return
 
     if config.confirm_text:
-        await _stage_text(update.message, user.id, thread_id, wid, text)
+        await _stage_text(message, user.id, thread_id, wid, text)
         return
 
-    await _forward_text(update.message, context, user.id, thread_id, wid, text)
+    await _forward_text(message, bot, user.id, thread_id, wid, text)
 
 
 def _text_confirm_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        [
+        inline_keyboard=[
             [
-                InlineKeyboardButton("✅ Send", callback_data=CB_TXT_SEND),
-                InlineKeyboardButton("❌ Cancel", callback_data=CB_TXT_CANCEL),
+                InlineKeyboardButton(text="✅ Send", callback_data=CB_TXT_SEND),
+                InlineKeyboardButton(text="❌ Cancel", callback_data=CB_TXT_CANCEL),
             ]
         ]
     )
@@ -1879,14 +1881,14 @@ async def _reply_plain(
     message: Message, text: str, keyboard: InlineKeyboardMarkup
 ) -> Message:
     """Plain-text reply (user text is shown verbatim, not as Markdown)."""
-    return await message.reply_text(
+    return await message.reply(
         text, reply_markup=keyboard, link_preview_options=NO_LINK_PREVIEW
     )
 
 
 async def _forward_text(
     message: Message,
-    context: ContextTypes.DEFAULT_TYPE,
+    bot: Bot,
     user_id: int,
     thread_id: int,
     wid: str,
@@ -1901,17 +1903,15 @@ async def _forward_text(
 
     # Cosmetic / outbound-Telegram steps below must NEVER abort the handler
     # before the message is injected into tmux. On flaky networks the "typing…"
-    # indicator (send_action) and status enqueue time out (telegram.error.TimedOut);
+    # indicator (send_chat_action) and status enqueue time out (TelegramNetworkError);
     # since the update offset has already advanced, Telegram won't redeliver, so
     # any exception here silently drops the user's message and forces a resend.
     try:
-        await message.chat.send_action(ChatAction.TYPING)
+        await _send_typing(bot, message)
     except Exception as e:
         logger.warning("send_action(TYPING) failed, continuing to injection: %s", e)
     try:
-        await enqueue_status_update(
-            context.bot, user_id, wid, None, thread_id=thread_id
-        )
+        await enqueue_status_update(bot, user_id, wid, None, thread_id=thread_id)
     except Exception as e:
         logger.warning("enqueue_status_update failed, continuing to injection: %s", e)
 
@@ -1931,7 +1931,7 @@ async def _forward_text(
                 user_id,
                 thread_id,
             )
-            await handle_interactive_ui(context.bot, user_id, wid, thread_id)
+            await handle_interactive_ui(bot, user_id, wid, thread_id)
             # Small delay to let UI render in Telegram before text arrives
             await asyncio.sleep(0.3)
     except Exception as e:
@@ -1946,7 +1946,7 @@ async def _forward_text(
     if text.startswith("!") and len(text) > 1:
         bash_cmd = text[1:]  # strip leading "!"
         task = asyncio.create_task(
-            _capture_bash_output(context.bot, user_id, thread_id, wid, bash_cmd)
+            _capture_bash_output(bot, user_id, thread_id, wid, bash_cmd)
         )
         _bash_capture_tasks[(user_id, thread_id)] = task
 
@@ -1954,21 +1954,21 @@ async def _forward_text(
     interactive_window = get_interactive_window(user_id, thread_id)
     if interactive_window and interactive_window == wid:
         await asyncio.sleep(0.2)
-        await handle_interactive_ui(context.bot, user_id, wid, thread_id)
+        await handle_interactive_ui(bot, user_id, wid, thread_id)
 
 
 # --- Window creation helpers ---
 
 
 async def _launch_session_ref(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, ref: SessionRef
+    message: Message, bot: Bot, user_data: dict[str, Any], ref: SessionRef
 ) -> None:
     """Resume ``ref`` in the current (unbound) topic without any picker."""
-    user = update.effective_user
-    msg = update.message
-    if user is None or msg is None:
+    user = message.from_user
+    msg = message
+    if user is None:
         return
-    thread_id = _get_thread_id(update)
+    thread_id = _get_thread_id(message)
     if thread_id is None:
         await safe_reply(msg, "❌ This only works inside a topic.")
         return
@@ -1978,15 +1978,16 @@ async def _launch_session_ref(
     mode = ref.mode or session_manager.get_last_launch_mode(user.id)
     if mode not in LAUNCH_MODES:
         mode = "default"
-    if context.user_data is not None:
-        context.user_data["_pending_thread_id"] = thread_id
-        context.user_data.pop("_pending_thread_text", None)
+    if user_data is not None:
+        user_data["_pending_thread_id"] = thread_id
+        user_data.pop("_pending_thread_text", None)
     progress = await safe_reply(
         msg, f"⏳ Resuming `{ref.session_id[:8]}…` in `{ref.cwd}`…"
     )
     await _create_and_bind_window(
         progress,
-        context,
+        bot,
+        user_data,
         user,
         ref.cwd,
         thread_id,
@@ -1995,52 +1996,54 @@ async def _launch_session_ref(
     )
 
 
-async def _present(update: Update, text: str, keyboard: Any = None) -> None:
+async def _present(
+    target: Message | CallbackQuery, text: str, keyboard: Any = None
+) -> None:
     """Edit the callback message if this is a button press, else reply."""
-    if update.callback_query:
-        await safe_edit(update.callback_query, text, reply_markup=keyboard)
-    elif update.message:
-        await safe_reply(update.message, text, reply_markup=keyboard)
+    if isinstance(target, CallbackQuery):
+        await safe_edit(target, text, reply_markup=keyboard)
+    else:
+        await safe_reply(target, text, reply_markup=keyboard)
 
 
 async def _show_mode_picker(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    target: Message | CallbackQuery,
+    user_data: dict[str, Any],
     selected_path: str,
     resume_session_id: str | None = None,
 ) -> None:
     """Ask which permission mode to launch Claude Code with."""
-    user = update.effective_user
+    user = target.from_user
     last_mode = session_manager.get_last_launch_mode(user.id) if user else "default"
     if last_mode not in LAUNCH_MODES:
         last_mode = "default"
-    if context.user_data is not None:
-        context.user_data[STATE_KEY] = STATE_SELECTING_MODE
-        context.user_data[SELECTED_PATH_KEY] = selected_path
+    if user_data is not None:
+        user_data[STATE_KEY] = STATE_SELECTING_MODE
+        user_data[SELECTED_PATH_KEY] = selected_path
         if resume_session_id:
-            context.user_data[RESUME_SESSION_KEY] = resume_session_id
+            user_data[RESUME_SESSION_KEY] = resume_session_id
         else:
-            context.user_data.pop(RESUME_SESSION_KEY, None)
+            user_data.pop(RESUME_SESSION_KEY, None)
     text, keyboard = build_mode_picker(selected_path, last_mode, resume_session_id)
-    await _present(update, text, keyboard)
+    await _present(target, text, keyboard)
 
 
 async def _on_directory_chosen(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    target: Message | CallbackQuery,
+    user_data: dict[str, Any],
     selected_path: str,
 ) -> None:
     """Directory picked (browser or typed path): session picker or mode picker."""
     sessions = await session_manager.list_sessions_for_directory(selected_path)
     if sessions:
-        if context.user_data is not None:
-            context.user_data[STATE_KEY] = STATE_SELECTING_SESSION
-            context.user_data[SESSIONS_KEY] = sessions
-            context.user_data[SELECTED_PATH_KEY] = selected_path
+        if user_data is not None:
+            user_data[STATE_KEY] = STATE_SELECTING_SESSION
+            user_data[SESSIONS_KEY] = sessions
+            user_data[SELECTED_PATH_KEY] = selected_path
         text, keyboard = build_session_picker(sessions)
-        await _present(update, text, keyboard)
+        await _present(target, text, keyboard)
         return
-    await _show_mode_picker(update, context, selected_path)
+    await _show_mode_picker(target, user_data, selected_path)
 
 
 async def _launch_and_register(
@@ -2104,8 +2107,6 @@ async def _launch_and_register(
 
 async def _answer(target: object, text: str) -> None:
     """query.answer() when the progress target is a CallbackQuery; no-op for a Message."""
-    from telegram import CallbackQuery
-
     if isinstance(target, CallbackQuery):
         try:
             await target.answer(text)
@@ -2114,9 +2115,10 @@ async def _answer(target: object, text: str) -> None:
 
 
 async def _create_and_bind_window(
-    query: object,
-    context: ContextTypes.DEFAULT_TYPE,
-    user: object,
+    query: CallbackQuery | Message,
+    bot: Bot,
+    user_data: dict[str, Any],
+    user: User,
     selected_path: str,
     pending_thread_id: int | None,
     resume_session_id: str | None = None,
@@ -2130,10 +2132,6 @@ async def _create_and_bind_window(
 
     Shared by the mode picker, the ▶ Resume button and `/resume`.
     """
-    from telegram import User
-
-    assert isinstance(user, User)
-
     if config.auto_trust_dirs:
         await asyncio.to_thread(ensure_trusted_directory, selected_path)
 
@@ -2142,9 +2140,9 @@ async def _create_and_bind_window(
     )
     if not success:
         await safe_edit(query, f"❌ {message}")
-        if pending_thread_id is not None and context.user_data is not None:
-            context.user_data.pop("_pending_thread_id", None)
-            context.user_data.pop("_pending_thread_text", None)
+        if pending_thread_id is not None and user_data is not None:
+            user_data.pop("_pending_thread_id", None)
+            user_data.pop("_pending_thread_text", None)
         await _answer(query, "Failed")
         return
 
@@ -2201,18 +2199,16 @@ async def _create_and_bind_window(
 
     # Forward the first message (typed before the session existed) only
     # once Claude is actually accepting input.
-    pending_text = (
-        context.user_data.get("_pending_thread_text") if context.user_data else None
-    )
-    if context.user_data is not None:
-        context.user_data.pop("_pending_thread_text", None)
-        context.user_data.pop("_pending_thread_id", None)
+    pending_text = user_data.get("_pending_thread_text") if user_data else None
+    if user_data is not None:
+        user_data.pop("_pending_thread_text", None)
+        user_data.pop("_pending_thread_id", None)
     if not pending_text:
         return
     resolved_chat = session_manager.resolve_chat_id(user.id, pending_thread_id)
     if not ready:
         await safe_send(
-            context.bot,
+            bot,
             resolved_chat,
             "⚠️ Your first message was not sent (Claude Code isn't ready). "
             "Please resend it once the session is up.",
@@ -2228,7 +2224,7 @@ async def _create_and_bind_window(
     if not send_ok:
         logger.warning("Failed to forward pending text: %s", send_msg)
         await safe_send(
-            context.bot,
+            bot,
             resolved_chat,
             f"❌ Failed to send pending message: {send_msg}",
             message_thread_id=pending_thread_id,
@@ -2238,13 +2234,14 @@ async def _create_and_bind_window(
 # --- Callback query handler ---
 
 
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    if not query or not query.data:
+async def callback_handler(
+    query: CallbackQuery, bot: Bot, user_data: dict[str, Any]
+) -> None:
+    if not query.data:
         return
 
-    user = update.effective_user
-    if not user or not is_user_allowed(user.id):
+    user = query.from_user
+    if not is_user_allowed(user.id):
         await query.answer("Not authorized")
         return
 
@@ -2253,8 +2250,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     # Capture group chat_id for supergroup forum topic routing.
     # Required: Telegram Bot API needs group chat_id (not user_id) to send
     # messages with message_thread_id. Do NOT remove — see session.py docs.
-    cb_thread_id = _get_thread_id(update)
-    chat = update.effective_chat
+    cb_thread_id = _get_thread_id(query)
+    chat = query.message.chat if query.message else None
     if chat and chat.type in ("group", "supergroup"):
         session_manager.set_group_chat_id(user.id, cb_thread_id, chat.id)
 
@@ -2268,7 +2265,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if pending is None:
             await query.answer("Nothing pending")
             try:
-                await query.edit_message_reply_markup(reply_markup=None)
+                await _query_message(query).edit_reply_markup(reply_markup=None)
             except Exception:
                 pass
             return
@@ -2280,13 +2277,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.answer("Sending…")
             status = f"✅ Sent to Claude Code ({n} chars)."
         try:
-            await query.edit_message_text(status)
+            await _query_message(query).edit_text(status)
         except Exception as e:
             logger.debug("Could not edit confirm prompt: %s", e)
         if data == CB_TXT_SEND and cb_thread_id is not None:
             await _forward_text(
                 pending["message"],
-                context,
+                bot,
                 user.id,
                 cb_thread_id,
                 pending["wid"],
@@ -2302,7 +2299,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if (user.id, cb_thread_id) not in _pending_images:
             await query.answer("Nothing pending")
             try:
-                await query.edit_message_reply_markup(reply_markup=None)
+                await _query_message(query).edit_reply_markup(reply_markup=None)
             except Exception:
                 pass
             return
@@ -2311,14 +2308,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.answer("Cancelled")
             noun = "image" if n == 1 else "images"
             try:
-                await query.edit_message_text(f"🗑 {n} {noun} discarded.")
+                await _query_message(query).edit_text(f"🗑 {n} {noun} discarded.")
             except Exception as e:
                 logger.debug("Could not edit image prompt: %s", e)
             return
         await query.answer("Sending…")
         msg = query.message
         if isinstance(msg, Message):
-            await _deliver_pending_images(msg, user.id, cb_thread_id, "")
+            await _deliver_pending_images(msg, bot, user.id, cb_thread_id, "")
         return
 
     # History: older/newer pagination
@@ -2362,10 +2359,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     # Directory browser handlers
     elif data.startswith(CB_DIR_SELECT):
         # Validate: callback must come from the same topic that started browsing
-        pending_tid = (
-            context.user_data.get("_pending_thread_id") if context.user_data else None
-        )
-        if pending_tid is not None and _get_thread_id(update) != pending_tid:
+        pending_tid = user_data.get("_pending_thread_id") if user_data else None
+        if pending_tid is not None and _get_thread_id(query) != pending_tid:
             await query.answer("Stale browser (topic mismatch)", show_alert=True)
             return
         # callback_data contains index, not dir name (to avoid 64-byte limit)
@@ -2376,9 +2371,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             return
 
         # Look up dir name from cached subdirs
-        cached_dirs: list[str] = (
-            context.user_data.get(BROWSE_DIRS_KEY, []) if context.user_data else []
-        )
+        cached_dirs: list[str] = user_data.get(BROWSE_DIRS_KEY, []) if user_data else []
         if idx < 0 or idx >= len(cached_dirs):
             await query.answer(
                 "Directory list changed, please refresh", show_alert=True
@@ -2388,9 +2381,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
         default_path = str(Path.cwd())
         current_path = (
-            context.user_data.get(BROWSE_PATH_KEY, default_path)
-            if context.user_data
-            else default_path
+            user_data.get(BROWSE_PATH_KEY, default_path) if user_data else default_path
         )
         new_path = (Path(current_path) / subdir_name).resolve()
 
@@ -2399,49 +2390,43 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             return
 
         new_path_str = str(new_path)
-        if context.user_data is not None:
-            context.user_data[BROWSE_PATH_KEY] = new_path_str
-            context.user_data[BROWSE_PAGE_KEY] = 0
+        if user_data is not None:
+            user_data[BROWSE_PATH_KEY] = new_path_str
+            user_data[BROWSE_PAGE_KEY] = 0
 
         msg_text, keyboard, subdirs = build_directory_browser(new_path_str)
-        if context.user_data is not None:
-            context.user_data[BROWSE_DIRS_KEY] = subdirs
+        if user_data is not None:
+            user_data[BROWSE_DIRS_KEY] = subdirs
         await safe_edit(query, msg_text, reply_markup=keyboard)
         await query.answer()
 
     elif data == CB_DIR_UP:
-        pending_tid = (
-            context.user_data.get("_pending_thread_id") if context.user_data else None
-        )
-        if pending_tid is not None and _get_thread_id(update) != pending_tid:
+        pending_tid = user_data.get("_pending_thread_id") if user_data else None
+        if pending_tid is not None and _get_thread_id(query) != pending_tid:
             await query.answer("Stale browser (topic mismatch)", show_alert=True)
             return
         default_path = str(Path.cwd())
         current_path = (
-            context.user_data.get(BROWSE_PATH_KEY, default_path)
-            if context.user_data
-            else default_path
+            user_data.get(BROWSE_PATH_KEY, default_path) if user_data else default_path
         )
         current = Path(current_path).resolve()
         parent = current.parent
         # No restriction - allow navigating anywhere
 
         parent_path = str(parent)
-        if context.user_data is not None:
-            context.user_data[BROWSE_PATH_KEY] = parent_path
-            context.user_data[BROWSE_PAGE_KEY] = 0
+        if user_data is not None:
+            user_data[BROWSE_PATH_KEY] = parent_path
+            user_data[BROWSE_PAGE_KEY] = 0
 
         msg_text, keyboard, subdirs = build_directory_browser(parent_path)
-        if context.user_data is not None:
-            context.user_data[BROWSE_DIRS_KEY] = subdirs
+        if user_data is not None:
+            user_data[BROWSE_DIRS_KEY] = subdirs
         await safe_edit(query, msg_text, reply_markup=keyboard)
         await query.answer()
 
     elif data.startswith(CB_DIR_PAGE):
-        pending_tid = (
-            context.user_data.get("_pending_thread_id") if context.user_data else None
-        )
-        if pending_tid is not None and _get_thread_id(update) != pending_tid:
+        pending_tid = user_data.get("_pending_thread_id") if user_data else None
+        if pending_tid is not None and _get_thread_id(query) != pending_tid:
             await query.answer("Stale browser (topic mismatch)", show_alert=True)
             return
         try:
@@ -2451,69 +2436,61 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             return
         default_path = str(Path.cwd())
         current_path = (
-            context.user_data.get(BROWSE_PATH_KEY, default_path)
-            if context.user_data
-            else default_path
+            user_data.get(BROWSE_PATH_KEY, default_path) if user_data else default_path
         )
-        if context.user_data is not None:
-            context.user_data[BROWSE_PAGE_KEY] = pg
+        if user_data is not None:
+            user_data[BROWSE_PAGE_KEY] = pg
 
         msg_text, keyboard, subdirs = build_directory_browser(current_path, pg)
-        if context.user_data is not None:
-            context.user_data[BROWSE_DIRS_KEY] = subdirs
+        if user_data is not None:
+            user_data[BROWSE_DIRS_KEY] = subdirs
         await safe_edit(query, msg_text, reply_markup=keyboard)
         await query.answer()
 
     elif data == CB_DIR_CONFIRM:
         default_path = str(Path.cwd())
         selected_path = (
-            context.user_data.get(BROWSE_PATH_KEY, default_path)
-            if context.user_data
-            else default_path
+            user_data.get(BROWSE_PATH_KEY, default_path) if user_data else default_path
         )
         # Check if this was initiated from a thread bind flow
         pending_thread_id: int | None = (
-            context.user_data.get("_pending_thread_id") if context.user_data else None
+            user_data.get("_pending_thread_id") if user_data else None
         )
 
         # Validate: confirm button must come from the same topic that started browsing
-        confirm_thread_id = _get_thread_id(update)
+        confirm_thread_id = _get_thread_id(query)
         if pending_thread_id is not None and confirm_thread_id != pending_thread_id:
-            clear_browse_state(context.user_data)
-            if context.user_data is not None:
-                context.user_data.pop("_pending_thread_id", None)
-                context.user_data.pop("_pending_thread_text", None)
+            clear_browse_state(user_data)
+            if user_data is not None:
+                user_data.pop("_pending_thread_id", None)
+                user_data.pop("_pending_thread_text", None)
             await query.answer("Stale browser (topic mismatch)", show_alert=True)
             return
 
-        clear_browse_state(context.user_data)
-        await _on_directory_chosen(update, context, selected_path)
+        clear_browse_state(user_data)
+        await _on_directory_chosen(query, user_data, selected_path)
         await query.answer()
 
     elif data == CB_DIR_CANCEL:
-        pending_tid = (
-            context.user_data.get("_pending_thread_id") if context.user_data else None
-        )
-        if pending_tid is not None and _get_thread_id(update) != pending_tid:
+        pending_tid = user_data.get("_pending_thread_id") if user_data else None
+        if pending_tid is not None and _get_thread_id(query) != pending_tid:
             await query.answer("Stale browser (topic mismatch)", show_alert=True)
             return
-        clear_browse_state(context.user_data)
-        if context.user_data is not None:
-            context.user_data.pop("_pending_thread_id", None)
-            context.user_data.pop("_pending_thread_text", None)
+        clear_browse_state(user_data)
+        if user_data is not None:
+            user_data.pop("_pending_thread_id", None)
+            user_data.pop("_pending_thread_text", None)
         await safe_edit(query, "Cancelled")
         await query.answer("Cancelled")
 
     # Session picker: resume existing session
     elif data.startswith(CB_SESSION_SELECT):
-        pending_tid = (
-            context.user_data.get("_pending_thread_id") if context.user_data else None
-        )
+        pending_tid = user_data.get("_pending_thread_id") if user_data else None
         # Fallback: if _pending_thread_id was cleared (e.g. by a message in
         # another topic), recover it from the callback query's message context
         if pending_tid is None:
-            pending_tid = _get_thread_id(update)
-        if pending_tid is not None and _get_thread_id(update) != pending_tid:
+            pending_tid = _get_thread_id(query)
+        if pending_tid is not None and _get_thread_id(query) != pending_tid:
             await query.answer("Stale picker (topic mismatch)", show_alert=True)
             return
         try:
@@ -2522,66 +2499,58 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.answer("Invalid data")
             return
 
-        cached_sessions = (
-            context.user_data.get(SESSIONS_KEY, []) if context.user_data else []
-        )
+        cached_sessions = user_data.get(SESSIONS_KEY, []) if user_data else []
         if idx < 0 or idx >= len(cached_sessions):
             await query.answer("Session not found")
             return
 
         session = cached_sessions[idx]
         selected_path = (
-            context.user_data.get(SELECTED_PATH_KEY, str(Path.cwd()))
-            if context.user_data
+            user_data.get(SELECTED_PATH_KEY, str(Path.cwd()))
+            if user_data
             else str(Path.cwd())
         )
-        clear_session_picker_state(context.user_data)
+        clear_session_picker_state(user_data)
         await _show_mode_picker(
-            update, context, selected_path, resume_session_id=session.session_id
+            query, user_data, selected_path, resume_session_id=session.session_id
         )
         await query.answer()
 
     elif data == CB_SESSION_NEW:
-        pending_tid = (
-            context.user_data.get("_pending_thread_id") if context.user_data else None
-        )
+        pending_tid = user_data.get("_pending_thread_id") if user_data else None
         if pending_tid is None:
-            pending_tid = _get_thread_id(update)
-        if pending_tid is not None and _get_thread_id(update) != pending_tid:
+            pending_tid = _get_thread_id(query)
+        if pending_tid is not None and _get_thread_id(query) != pending_tid:
             await query.answer("Stale picker (topic mismatch)", show_alert=True)
             return
         selected_path = (
-            context.user_data.get(SELECTED_PATH_KEY, str(Path.cwd()))
-            if context.user_data
+            user_data.get(SELECTED_PATH_KEY, str(Path.cwd()))
+            if user_data
             else str(Path.cwd())
         )
-        clear_session_picker_state(context.user_data)
-        await _show_mode_picker(update, context, selected_path)
+        clear_session_picker_state(user_data)
+        await _show_mode_picker(query, user_data, selected_path)
         await query.answer()
 
     elif data == CB_SESSION_CANCEL:
-        pending_tid = (
-            context.user_data.get("_pending_thread_id") if context.user_data else None
-        )
-        if pending_tid is not None and _get_thread_id(update) != pending_tid:
+        pending_tid = user_data.get("_pending_thread_id") if user_data else None
+        if pending_tid is not None and _get_thread_id(query) != pending_tid:
             await query.answer("Stale picker (topic mismatch)", show_alert=True)
             return
-        clear_session_picker_state(context.user_data)
-        if context.user_data is not None:
-            context.user_data.pop("_pending_thread_id", None)
-            context.user_data.pop("_pending_thread_text", None)
-            context.user_data.pop(SELECTED_PATH_KEY, None)
+        clear_session_picker_state(user_data)
+        if user_data is not None:
+            user_data.pop("_pending_thread_id", None)
+            user_data.pop("_pending_thread_text", None)
+            user_data.pop(SELECTED_PATH_KEY, None)
         await safe_edit(query, "Cancelled")
         await query.answer("Cancelled")
 
     # Launch-mode picker: start Claude Code
     elif data.startswith(CB_MODE_SELECT):
-        pending_tid = (
-            context.user_data.get("_pending_thread_id") if context.user_data else None
-        )
+        pending_tid = user_data.get("_pending_thread_id") if user_data else None
         if pending_tid is None:
-            pending_tid = _get_thread_id(update)
-        if pending_tid is not None and _get_thread_id(update) != pending_tid:
+            pending_tid = _get_thread_id(query)
+        if pending_tid is not None and _get_thread_id(query) != pending_tid:
             await query.answer("Stale picker (topic mismatch)", show_alert=True)
             return
         mode = data[len(CB_MODE_SELECT) :]
@@ -2589,18 +2558,17 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.answer("Unknown mode")
             return
         selected_path = (
-            context.user_data.get(SELECTED_PATH_KEY, str(Path.cwd()))
-            if context.user_data
+            user_data.get(SELECTED_PATH_KEY, str(Path.cwd()))
+            if user_data
             else str(Path.cwd())
         )
-        resume_sid = (
-            context.user_data.get(RESUME_SESSION_KEY) if context.user_data else None
-        )
-        clear_mode_picker_state(context.user_data)
+        resume_sid = user_data.get(RESUME_SESSION_KEY) if user_data else None
+        clear_mode_picker_state(user_data)
         session_manager.set_last_launch_mode(user.id, mode)
         await _create_and_bind_window(
             query,
-            context,
+            bot,
+            user_data,
             user,
             selected_path,
             pending_tid,
@@ -2609,19 +2577,17 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
 
     elif data == CB_MODE_CANCEL:
-        clear_mode_picker_state(context.user_data)
-        if context.user_data is not None:
-            context.user_data.pop("_pending_thread_id", None)
-            context.user_data.pop("_pending_thread_text", None)
+        clear_mode_picker_state(user_data)
+        if user_data is not None:
+            user_data.pop("_pending_thread_id", None)
+            user_data.pop("_pending_thread_text", None)
         await safe_edit(query, "Cancelled")
         await query.answer("Cancelled")
 
     # Window picker: bind existing window
     elif data.startswith(CB_WIN_BIND):
-        pending_tid = (
-            context.user_data.get("_pending_thread_id") if context.user_data else None
-        )
-        if pending_tid is not None and _get_thread_id(update) != pending_tid:
+        pending_tid = user_data.get("_pending_thread_id") if user_data else None
+        if pending_tid is not None and _get_thread_id(query) != pending_tid:
             await query.answer("Stale picker (topic mismatch)", show_alert=True)
             return
         try:
@@ -2631,7 +2597,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             return
 
         cached_windows: list[str] = (
-            context.user_data.get(UNBOUND_WINDOWS_KEY, []) if context.user_data else []
+            user_data.get(UNBOUND_WINDOWS_KEY, []) if user_data else []
         )
         if idx < 0 or idx >= len(cached_windows):
             await query.answer("Window list changed, please retry", show_alert=True)
@@ -2645,13 +2611,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.answer(f"Window '{display}' no longer exists", show_alert=True)
             return
 
-        thread_id = _get_thread_id(update)
+        thread_id = _get_thread_id(query)
         if thread_id is None:
             await query.answer("Not in a topic", show_alert=True)
             return
 
         display = w.window_name
-        clear_window_picker_state(context.user_data)
+        clear_window_picker_state(user_data)
         session_manager.bind_thread(
             user.id, thread_id, selected_wid, window_name=display
         )
@@ -2662,12 +2628,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
 
         # Forward pending text if any
-        pending_text = (
-            context.user_data.get("_pending_thread_text") if context.user_data else None
-        )
-        if context.user_data is not None:
-            context.user_data.pop("_pending_thread_text", None)
-            context.user_data.pop("_pending_thread_id", None)
+        pending_text = user_data.get("_pending_thread_text") if user_data else None
+        if user_data is not None:
+            user_data.pop("_pending_thread_text", None)
+            user_data.pop("_pending_thread_id", None)
         if pending_text:
             send_ok, send_msg = await session_manager.send_to_window(
                 selected_wid, pending_text
@@ -2676,7 +2640,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 logger.warning("Failed to forward pending text: %s", send_msg)
                 resolved_chat = session_manager.resolve_chat_id(user.id, thread_id)
                 await safe_send(
-                    context.bot,
+                    bot,
                     resolved_chat,
                     f"❌ Failed to send pending message: {send_msg}",
                     message_thread_id=thread_id,
@@ -2685,36 +2649,32 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     # Window picker: new session → transition to directory browser
     elif data == CB_WIN_NEW:
-        pending_tid = (
-            context.user_data.get("_pending_thread_id") if context.user_data else None
-        )
-        if pending_tid is not None and _get_thread_id(update) != pending_tid:
+        pending_tid = user_data.get("_pending_thread_id") if user_data else None
+        if pending_tid is not None and _get_thread_id(query) != pending_tid:
             await query.answer("Stale picker (topic mismatch)", show_alert=True)
             return
         # Preserve pending thread info, clear only picker state
-        clear_window_picker_state(context.user_data)
+        clear_window_picker_state(user_data)
         start_path = browser_start_path()
         msg_text, keyboard, subdirs = build_directory_browser(start_path)
-        if context.user_data is not None:
-            context.user_data[STATE_KEY] = STATE_BROWSING_DIRECTORY
-            context.user_data[BROWSE_PATH_KEY] = start_path
-            context.user_data[BROWSE_PAGE_KEY] = 0
-            context.user_data[BROWSE_DIRS_KEY] = subdirs
+        if user_data is not None:
+            user_data[STATE_KEY] = STATE_BROWSING_DIRECTORY
+            user_data[BROWSE_PATH_KEY] = start_path
+            user_data[BROWSE_PAGE_KEY] = 0
+            user_data[BROWSE_DIRS_KEY] = subdirs
         await safe_edit(query, msg_text, reply_markup=keyboard)
         await query.answer()
 
     # Window picker: cancel
     elif data == CB_WIN_CANCEL:
-        pending_tid = (
-            context.user_data.get("_pending_thread_id") if context.user_data else None
-        )
-        if pending_tid is not None and _get_thread_id(update) != pending_tid:
+        pending_tid = user_data.get("_pending_thread_id") if user_data else None
+        if pending_tid is not None and _get_thread_id(query) != pending_tid:
             await query.answer("Stale picker (topic mismatch)", show_alert=True)
             return
-        clear_window_picker_state(context.user_data)
-        if context.user_data is not None:
-            context.user_data.pop("_pending_thread_id", None)
-            context.user_data.pop("_pending_thread_text", None)
+        clear_window_picker_state(user_data)
+        if user_data is not None:
+            user_data.pop("_pending_thread_id", None)
+            user_data.pop("_pending_thread_text", None)
         await safe_edit(query, "Cancelled")
         await query.answer("Cancelled")
 
@@ -2734,9 +2694,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         png_bytes = await text_to_image(text, with_ansi=True)
         keyboard = _build_screenshot_keyboard(window_id)
         try:
-            await query.edit_message_media(
+            await _query_message(query).edit_media(
                 media=InputMediaDocument(
-                    media=io.BytesIO(png_bytes), filename="screenshot.png"
+                    media=BufferedInputFile(png_bytes, filename="screenshot.png")
                 ),
                 reply_markup=keyboard,
             )
@@ -2751,114 +2711,114 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     # Interactive UI: Up arrow
     elif data.startswith(CB_ASK_UP):
         window_id = data[len(CB_ASK_UP) :]
-        thread_id = _get_thread_id(update)
+        thread_id = _get_thread_id(query)
         w = await tmux_manager.find_window_by_id(window_id)
         if w:
             await tmux_manager.send_keys(w.window_id, "Up", enter=False, literal=False)
             await asyncio.sleep(0.5)
-            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
+            await handle_interactive_ui(bot, user.id, window_id, thread_id)
         await query.answer()
 
     # Interactive UI: Down arrow
     elif data.startswith(CB_ASK_DOWN):
         window_id = data[len(CB_ASK_DOWN) :]
-        thread_id = _get_thread_id(update)
+        thread_id = _get_thread_id(query)
         w = await tmux_manager.find_window_by_id(window_id)
         if w:
             await tmux_manager.send_keys(
                 w.window_id, "Down", enter=False, literal=False
             )
             await asyncio.sleep(0.5)
-            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
+            await handle_interactive_ui(bot, user.id, window_id, thread_id)
         await query.answer()
 
     # Interactive UI: Left arrow
     elif data.startswith(CB_ASK_LEFT):
         window_id = data[len(CB_ASK_LEFT) :]
-        thread_id = _get_thread_id(update)
+        thread_id = _get_thread_id(query)
         w = await tmux_manager.find_window_by_id(window_id)
         if w:
             await tmux_manager.send_keys(
                 w.window_id, "Left", enter=False, literal=False
             )
             await asyncio.sleep(0.5)
-            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
+            await handle_interactive_ui(bot, user.id, window_id, thread_id)
         await query.answer()
 
     # Interactive UI: Right arrow
     elif data.startswith(CB_ASK_RIGHT):
         window_id = data[len(CB_ASK_RIGHT) :]
-        thread_id = _get_thread_id(update)
+        thread_id = _get_thread_id(query)
         w = await tmux_manager.find_window_by_id(window_id)
         if w:
             await tmux_manager.send_keys(
                 w.window_id, "Right", enter=False, literal=False
             )
             await asyncio.sleep(0.5)
-            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
+            await handle_interactive_ui(bot, user.id, window_id, thread_id)
         await query.answer()
 
     # Interactive UI: Escape
     elif data.startswith(CB_ASK_ESC):
         window_id = data[len(CB_ASK_ESC) :]
-        thread_id = _get_thread_id(update)
+        thread_id = _get_thread_id(query)
         w = await tmux_manager.find_window_by_id(window_id)
         if w:
             await tmux_manager.send_keys(
                 w.window_id, "Escape", enter=False, literal=False
             )
-            await clear_interactive_msg(user.id, context.bot, thread_id)
+            await clear_interactive_msg(user.id, bot, thread_id)
         await query.answer("⎋ Esc")
 
     # Interactive UI: Enter
     elif data.startswith(CB_ASK_ENTER):
         window_id = data[len(CB_ASK_ENTER) :]
-        thread_id = _get_thread_id(update)
+        thread_id = _get_thread_id(query)
         w = await tmux_manager.find_window_by_id(window_id)
         if w:
             await tmux_manager.send_keys(
                 w.window_id, "Enter", enter=False, literal=False
             )
             await asyncio.sleep(0.5)
-            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
+            await handle_interactive_ui(bot, user.id, window_id, thread_id)
         await query.answer("⏎ Enter")
 
     # Interactive UI: Space
     elif data.startswith(CB_ASK_SPACE):
         window_id = data[len(CB_ASK_SPACE) :]
-        thread_id = _get_thread_id(update)
+        thread_id = _get_thread_id(query)
         w = await tmux_manager.find_window_by_id(window_id)
         if w:
             await tmux_manager.send_keys(
                 w.window_id, "Space", enter=False, literal=False
             )
             await asyncio.sleep(0.5)
-            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
+            await handle_interactive_ui(bot, user.id, window_id, thread_id)
         await query.answer("␣ Space")
 
     # Interactive UI: Tab
     elif data.startswith(CB_ASK_TAB):
         window_id = data[len(CB_ASK_TAB) :]
-        thread_id = _get_thread_id(update)
+        thread_id = _get_thread_id(query)
         w = await tmux_manager.find_window_by_id(window_id)
         if w:
             await tmux_manager.send_keys(w.window_id, "Tab", enter=False, literal=False)
             await asyncio.sleep(0.5)
-            await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
+            await handle_interactive_ui(bot, user.id, window_id, thread_id)
         await query.answer("⇥ Tab")
 
     # Interactive UI: refresh display
     elif data.startswith(CB_ASK_REFRESH):
         window_id = data[len(CB_ASK_REFRESH) :]
-        thread_id = _get_thread_id(update)
-        await handle_interactive_ui(context.bot, user.id, window_id, thread_id)
+        thread_id = _get_thread_id(query)
+        await handle_interactive_ui(bot, user.id, window_id, thread_id)
         await query.answer("🔄")
 
     # /mode keyboard
     elif data.startswith(CB_MODE_SET):
         rest = data[len(CB_MODE_SET) :]
         target, _, window_id = rest.partition(":")
-        thread_id = _get_thread_id(update)
+        thread_id = _get_thread_id(query)
         if session_manager.resolve_window_for_thread(user.id, thread_id) != window_id:
             await query.answer("This topic is no longer bound to that window")
             return
@@ -2878,7 +2838,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     # Health notification buttons
     elif data.startswith(CB_RESTART):
         window_id = data[len(CB_RESTART) :]
-        thread_id = _get_thread_id(update)
+        thread_id = _get_thread_id(query)
         bound = session_manager.resolve_window_for_thread(user.id, thread_id)
         if bound != window_id:
             await query.answer("This topic is no longer bound to that window")
@@ -2891,7 +2851,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     elif data.startswith(CB_KILL):
         window_id = data[len(CB_KILL) :]
-        thread_id = _get_thread_id(update)
+        thread_id = _get_thread_id(query)
         if thread_id is None:
             await query.answer("Only in a topic")
             return
@@ -2900,14 +2860,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.answer("This topic is no longer bound to that window")
             return
         summary = await _kill_window_and_offer_resume(
-            context.bot, user.id, thread_id, window_id, context.user_data
+            bot, user.id, thread_id, window_id, user_data
         )
         await safe_edit(query, summary)
         await query.answer("Killed")
 
     # /sessions overview: kill a window from anywhere, refresh
     elif data.startswith(CB_SESSIONS_KILL) or data == CB_SESSIONS_REFRESH:
-        chat = update.effective_chat
+        chat = query.message.chat if query.message else None
         if data.startswith(CB_SESSIONS_KILL):
             wid = data[len(CB_SESSIONS_KILL) :]
             bound = next(
@@ -2922,9 +2882,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 await query.answer("Not bound anymore")
             else:
                 await query.answer("Killing…")
-                await _kill_window_and_offer_resume(
-                    context.bot, user.id, bound, wid, context.user_data
-                )
+                await _kill_window_and_offer_resume(bot, user.id, bound, wid, user_data)
         else:
             await query.answer("Refreshed")
         text, kb = await _build_sessions_overview(user.id, chat.id if chat else None)
@@ -2933,7 +2891,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     # ▶ Resume this session (posted when a window was killed)
     elif data.startswith(CB_RESUME_SESSION):
         sid = data[len(CB_RESUME_SESSION) :]
-        thread_id = _get_thread_id(update)
+        thread_id = _get_thread_id(query)
         if thread_id is None:
             await query.answer("Only in a topic", show_alert=True)
             return
@@ -2948,12 +2906,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         mode = (remembered or {}).get("mode") or session_manager.get_last_launch_mode(
             user.id
         )
-        if context.user_data is not None:
-            context.user_data["_pending_thread_id"] = thread_id
-            context.user_data.pop("_pending_thread_text", None)
+        if user_data is not None:
+            user_data["_pending_thread_id"] = thread_id
+            user_data.pop("_pending_thread_text", None)
         await _create_and_bind_window(
             query,
-            context,
+            bot,
+            user_data,
             user,
             ref.cwd,
             thread_id,
@@ -2994,10 +2953,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             png_bytes = await text_to_image(text, with_ansi=True)
             keyboard = _build_screenshot_keyboard(window_id)
             try:
-                await query.edit_message_media(
+                await _query_message(query).edit_media(
                     media=InputMediaDocument(
-                        media=io.BytesIO(png_bytes),
-                        filename="screenshot.png",
+                        media=BufferedInputFile(png_bytes, filename="screenshot.png"),
                     ),
                     reply_markup=keyboard,
                 )
@@ -3114,63 +3072,75 @@ def _mark_read(user_id: int, wid: str) -> None:
 # --- App lifecycle ---
 
 
-async def post_init(application: Application) -> None:
+async def on_startup(bot: Bot) -> None:
     global session_monitor, _status_poll_task
 
     bot_commands = [
-        BotCommand("start", "Show welcome message"),
-        BotCommand("history", "Message history for this topic"),
-        BotCommand("screenshot", "Terminal screenshot with control keys"),
-        BotCommand("esc", "Send Escape to interrupt Claude"),
-        BotCommand("sessions", "All running sessions: state, memory, kill buttons"),
-        BotCommand("info", "Session internals: tmux window, session id, launch cmd"),
-        BotCommand("settings", "Bot settings: thinking, tool calls, modes, alerts"),
+        BotCommand(command="start", description="Show welcome message"),
+        BotCommand(command="history", description="Message history for this topic"),
         BotCommand(
-            "mode", "Show / switch permission mode (normal, accept, plan, bypass)"
+            command="screenshot", description="Terminal screenshot with control keys"
         ),
-        BotCommand("restart", "Restart Claude Code (resumes session; add a mode)"),
-        BotCommand("kill", "Kill the tmux window and forget the session"),
-        BotCommand("unbind", "Unbind topic from session (keeps window running)"),
-        BotCommand("usage", "Show Claude Code usage remaining"),
+        BotCommand(command="esc", description="Send Escape to interrupt Claude"),
+        BotCommand(
+            command="sessions",
+            description="All running sessions: state, memory, kill buttons",
+        ),
+        BotCommand(
+            command="info",
+            description="Session internals: tmux window, session id, launch cmd",
+        ),
+        BotCommand(
+            command="settings",
+            description="Bot settings: thinking, tool calls, modes, alerts",
+        ),
+        BotCommand(
+            command="mode",
+            description="Show / switch permission mode (normal, accept, plan, bypass)",
+        ),
+        BotCommand(
+            command="restart",
+            description="Restart Claude Code (resumes session; add a mode)",
+        ),
+        BotCommand(
+            command="kill", description="Kill the tmux window and forget the session"
+        ),
+        BotCommand(
+            command="unbind",
+            description="Unbind topic from session (keeps window running)",
+        ),
+        BotCommand(command="usage", description="Show Claude Code usage remaining"),
     ]
     # Add Claude Code slash commands
     for cmd_name, desc in CC_COMMANDS.items():
-        bot_commands.append(BotCommand(cmd_name, desc))
+        bot_commands.append(BotCommand(command=cmd_name, description=desc))
 
     # Register for private chats AND group chats: forum topics live in
     # supergroups, and Telegram clients only show the "/" menu in a group
     # when commands are set for a group scope.
     for scope in (
-        None,
+        BotCommandScopeDefault(),
         BotCommandScopeAllPrivateChats(),
         BotCommandScopeAllGroupChats(),
     ):
         try:
-            await application.bot.delete_my_commands(scope=scope)
-            await application.bot.set_my_commands(bot_commands, scope=scope)
+            await bot.delete_my_commands(scope=scope)
+            await bot.set_my_commands(bot_commands, scope=scope)
         except Exception as e:
-            logger.warning("set_my_commands(scope=%s) failed: %s", scope, e)
+            logger.warning("set_my_commands(scope=%s) failed: %s", scope.type, e)
 
     # Re-resolve stale window IDs from persisted state against live tmux windows
     await session_manager.resolve_stale_ids()
     # Topics whose window died with the server (reboot, tmux crash): offer ▶
-    await offer_lost_bindings(application.bot, session_manager.pop_lost_bindings())
+    await offer_lost_bindings(bot, session_manager.pop_lost_bindings())
 
-    # Pre-fill global rate limiter bucket on restart.
-    # AsyncLimiter starts at _level=0 (full burst capacity), but Telegram's
-    # server-side counter persists across bot restarts.  Setting _level=max_rate
-    # forces the bucket to start "full" so capacity drains in naturally (~1s).
-    # AIORateLimiter has no per-private-chat limiter, so max_retries is the
-    # primary protection (retry + pause all concurrent requests on 429).
-    rate_limiter = application.bot.rate_limiter
-    if rate_limiter and rate_limiter._base_limiter:
-        rate_limiter._base_limiter._level = rate_limiter._base_limiter.max_rate
-        logger.info("Pre-filled global rate limiter bucket")
+    # (The global rate-limit bucket starts pre-filled: see
+    # telegram_client.TelegramRateLimiter.)
 
     monitor = SessionMonitor()
 
     async def message_callback(msg: NewMessage) -> None:
-        await handle_new_message(msg, application.bot)
+        await handle_new_message(msg, bot)
 
     monitor.set_message_callback(message_callback)
     monitor.start()
@@ -3179,15 +3149,15 @@ async def post_init(application: Application) -> None:
     logger.info("Session monitor started")
 
     # Start status polling task
-    _status_poll_task = asyncio.create_task(status_poll_loop(application.bot))
+    _status_poll_task = asyncio.create_task(status_poll_loop(bot))
     logger.info("Status polling task started")
 
     # Create bot-owned topics (shell, ccc, …) once the forum chat is known
     ccc_topic.set_restart_handler(_restart_all_claude_sessions)
-    await ensure_special_topics(application.bot)
+    await ensure_special_topics(bot)
 
 
-async def post_shutdown(application: Application) -> None:
+async def on_shutdown(bot: Bot) -> None:
     global _status_poll_task
 
     # Stop status polling
@@ -3212,99 +3182,156 @@ async def post_shutdown(application: Application) -> None:
     await close_transcribe_client()
 
 
-async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Application-level error handler.
+async def _error_handler(event: ErrorEvent) -> None:
+    """Dispatcher-level error handler.
 
-    Without one, PTB logs "No error handlers are registered" and a burst of
-    transient httpx errors in the getUpdates loop can leave the bot deaf
-    while the monitor keeps running. Transport errors are expected noise;
-    anything else is a real bug and gets the traceback.
+    Transport errors are expected noise (aiogram's polling loop retries
+    getUpdates failures itself); anything else is a real bug and gets the
+    traceback.
     """
-    err = context.error
-    if isinstance(err, (NetworkError, TimedOut, RetryAfter, Conflict)):
+    err = event.exception
+    if isinstance(
+        err, (TelegramNetworkError, TelegramRetryAfter, TelegramConflictError)
+    ):
         logger.warning("Telegram transport error: %s: %s", type(err).__name__, err)
         return
-    logger.error("Unhandled error while processing %r", update, exc_info=err)
+    logger.error("Unhandled error while processing %r", event.update, exc_info=err)
 
 
-def create_bot() -> Application:
+# --- Routing ---
+
+
+def _is_bot_command(message: Message) -> bool:
+    """The text starts with a bot_command entity (PTB's filters.COMMAND).
+
+    Not simply ``text.startswith("/")``: Telegram marks no command in
+    "/home/me/project" (a typed path goes to text_handler) or "/ foo".
+    """
+    entities = message.entities
+    return bool(
+        entities
+        and entities[0].type == MessageEntityType.BOT_COMMAND
+        and entities[0].offset == 0
+    )
+
+
+def _is_image(message: Message) -> bool:
+    """A photo or an image file (PTB's filters.PHOTO | filters.Document.IMAGE)."""
+    if message.photo:
+        return True
+    doc = message.document
+    return bool(doc and (doc.mime_type or "").startswith("image/"))
+
+
+# User content that isn't text (PTB's ~COMMAND & ~TEXT & ~StatusUpdate.ALL,
+# minus service messages: those never get the "unsupported" reply)
+_USER_CONTENT_TYPES = frozenset(
+    {
+        ContentType.ANIMATION,
+        ContentType.AUDIO,
+        ContentType.CHECKLIST,
+        ContentType.CONTACT,
+        ContentType.DICE,
+        ContentType.DOCUMENT,
+        ContentType.GAME,
+        ContentType.GIVEAWAY,
+        ContentType.GIVEAWAY_WINNERS,
+        ContentType.INVOICE,
+        ContentType.LIVE_PHOTO,
+        ContentType.LOCATION,
+        ContentType.PAID_MEDIA,
+        ContentType.PHOTO,
+        ContentType.POLL,
+        ContentType.STICKER,
+        ContentType.STORY,
+        ContentType.VENUE,
+        ContentType.VIDEO,
+        ContentType.VIDEO_NOTE,
+        ContentType.VOICE,
+    }
+)
+
+
+def _is_unsupported_content(message: Message) -> bool:
+    return message.content_type in _USER_CONTENT_TYPES
+
+
+# Bot commands handled here, in PTB's registration order
+_COMMAND_HANDLERS = (
+    ("start", start_command),
+    ("history", history_command),
+    ("screenshot", screenshot_command),
+    ("esc", esc_command),
+    ("restart", restart_command),
+    ("mode", mode_command),
+    ("info", info_command),
+    ("settings", settings_command),
+    ("resume", resume_command),
+    ("sessions", sessions_command),
+    ("kill", kill_command),
+    ("unbind", unbind_command),
+    ("usage", usage_command),
+)
+
+
+def build_dispatcher() -> Dispatcher:
+    """Dispatcher with all routers, middlewares and lifecycle hooks.
+
+    The special-topics router is included first: its handlers consume
+    updates for bot-owned topics and SkipHandler everything else, so the
+    main router (topic→window routing) never sees special-topic traffic.
+    Within a router, the first handler whose filters match wins.
+    """
     settings.load()
 
-    # Explicit timeouts: PTB's default pool_timeout of 1s makes concurrent
-    # sends fail spuriously under load; reads need headroom for long polls.
-    def _request() -> HTTPXRequest:
-        return HTTPXRequest(
-            connection_pool_size=16,
-            connect_timeout=10.0,
-            read_timeout=30.0,
-            write_timeout=30.0,
-            pool_timeout=10.0,
+    dp = Dispatcher()
+    # One shared store: callbacks and messages see the same user_data
+    user_data_middleware = UserDataMiddleware()
+    dp.message.outer_middleware(user_data_middleware)
+    dp.callback_query.outer_middleware(user_data_middleware)
+    dp.startup.register(on_startup)
+    dp.shutdown.register(on_shutdown)
+    dp.errors.register(_error_handler)
+
+    special_router = Router(name="special_topics")
+    special_router.message.register(special_message_router, F.text)
+    special_router.callback_query.register(special_callback_router)
+
+    router = Router(name="main")
+    for name, handler in _COMMAND_HANDLERS:
+        # ignore_case: PTB's CommandHandler matched "/Start" as /start too
+        router.message.register(
+            handler, Command(name, ignore_case=True), _is_bot_command
         )
-
-    application = (
-        Application.builder()
-        .token(config.telegram_bot_token)
-        .request(_request())
-        .get_updates_request(_request())
-        .rate_limiter(AIORateLimiter(max_retries=5))
-        .post_init(post_init)
-        .post_shutdown(post_shutdown)
-        .build()
-    )
-    application.add_error_handler(_error_handler)
-
-    # Special (bot-owned) topics run before everything else and swallow
-    # their updates, so the regular topic→window routing never sees them.
-    application.add_handler(
-        MessageHandler(filters.TEXT, special_message_router), group=-1
-    )
-    application.add_handler(CallbackQueryHandler(special_callback_router), group=-1)
-
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("history", history_command))
-    application.add_handler(CommandHandler("screenshot", screenshot_command))
-    application.add_handler(CommandHandler("esc", esc_command))
-    application.add_handler(CommandHandler("restart", restart_command))
-    application.add_handler(CommandHandler("mode", mode_command))
-    application.add_handler(CommandHandler("info", info_command))
-    application.add_handler(CommandHandler("settings", settings_command))
-    application.add_handler(CommandHandler("resume", resume_command))
-    application.add_handler(CommandHandler("sessions", sessions_command))
-    application.add_handler(CommandHandler("kill", kill_command))
-    application.add_handler(CommandHandler("unbind", unbind_command))
-    application.add_handler(CommandHandler("usage", usage_command))
-    application.add_handler(CallbackQueryHandler(callback_handler))
+    router.callback_query.register(callback_handler)
     # Topic closed event — auto-kill associated window
-    application.add_handler(
-        MessageHandler(
-            filters.StatusUpdate.FORUM_TOPIC_CLOSED,
-            topic_closed_handler,
-        )
-    )
+    router.message.register(topic_closed_handler, F.forum_topic_closed)
     # Topic edited event — sync renamed topic to tmux window
-    application.add_handler(
-        MessageHandler(
-            filters.StatusUpdate.FORUM_TOPIC_EDITED,
-            topic_edited_handler,
-        )
-    )
+    router.message.register(topic_edited_handler, F.forum_topic_edited)
     # Forward any other /command to Claude Code
-    application.add_handler(MessageHandler(filters.COMMAND, forward_command_handler))
-    application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler)
-    )
+    router.message.register(forward_command_handler, _is_bot_command)
+    router.message.register(text_handler, F.text)
     # Photos / image files (incl. albums): download and forward path(s) to Claude Code
-    application.add_handler(
-        MessageHandler(filters.PHOTO | filters.Document.IMAGE, photo_handler)
-    )
+    router.message.register(photo_handler, _is_image)
     # Voice: transcribe via OpenAI and forward text to Claude Code
-    application.add_handler(MessageHandler(filters.VOICE, voice_handler))
+    router.message.register(voice_handler, F.voice)
     # Catch-all: non-text content (stickers, video, etc.)
-    application.add_handler(
-        MessageHandler(
-            ~filters.COMMAND & ~filters.TEXT & ~filters.StatusUpdate.ALL,
-            unsupported_content_handler,
-        )
-    )
+    router.message.register(unsupported_content_handler, _is_unsupported_content)
 
-    return application
+    dp.include_routers(special_router, router)
+    return dp
+
+
+async def run() -> None:
+    """Long-poll Telegram until SIGINT/SIGTERM."""
+    bot = build_bot(config.telegram_bot_token)
+    dp = build_dispatcher()
+    await dp.start_polling(
+        bot,
+        allowed_updates=["message", "callback_query"],
+        # One update at a time, like PTB's default (concurrent_updates=False):
+        # handlers rely on arrival order (text merge, pickers, albums)
+        handle_as_tasks=False,
+        handle_signals=True,
+        close_bot_session=True,
+    )

@@ -25,9 +25,15 @@ import shutil
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from typing import Any
 
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import ContextTypes
+from aiogram import Bot
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 
 from ..config import config
 from ..settings import in_quiet_hours
@@ -298,7 +304,9 @@ def render_dashboard(accounts: list[Account]) -> tuple[str, InlineKeyboardMarkup
                 continue
             label = f"▶ {_short(a.name, 14)}" + (" ⛔" if a.exhausted else "")
             use_row.append(
-                InlineKeyboardButton(label, callback_data=f"{CB_CCC_USE}{a.id}"[:64])
+                InlineKeyboardButton(
+                    text=label, callback_data=f"{CB_CCC_USE}{a.id}"[:64]
+                )
             )
             if len(use_row) == 2:
                 rows.append(use_row)
@@ -308,7 +316,7 @@ def render_dashboard(accounts: list[Account]) -> tuple[str, InlineKeyboardMarkup
         rows.append(
             [
                 InlineKeyboardButton(
-                    f"⏭ Next {PROVIDER_TITLE[provider]}",
+                    text=f"⏭ Next {PROVIDER_TITLE[provider]}",
                     callback_data=f"{CB_CCC_NEXT}{provider}",
                 )
             ]
@@ -317,9 +325,11 @@ def render_dashboard(accounts: list[Account]) -> tuple[str, InlineKeyboardMarkup
         lines.append("No accounts known to ccc yet (`ccc init` / `ccc add`).")
     rows.append(
         [
-            InlineKeyboardButton("🔄 Refresh", callback_data=f"{CB_CCC_REFRESH}net"),
             InlineKeyboardButton(
-                "🔁 Restart Claude sessions", callback_data=CB_CCC_RESTART
+                text="🔄 Refresh", callback_data=f"{CB_CCC_REFRESH}net"
+            ),
+            InlineKeyboardButton(
+                text="🔁 Restart Claude sessions", callback_data=CB_CCC_RESTART
             ),
         ]
     )
@@ -327,7 +337,7 @@ def render_dashboard(accounts: list[Account]) -> tuple[str, InlineKeyboardMarkup
         f"_● in use · ↻ resets in · 🎟 reset credits · updated "
         f"{now.strftime('%H:%M')} UTC_"
     )
-    return "\n".join(lines), InlineKeyboardMarkup(rows)
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 # ── Quota watcher ────────────────────────────────────────────────────────
@@ -494,7 +504,7 @@ class CccTopic:
                 rows.append(
                     [
                         InlineKeyboardButton(
-                            f"▶ Use {_short(best.name, 20)}",
+                            text=f"▶ Use {_short(best.name, 20)}",
                             callback_data=f"{CB_CCC_USE}{best.id}"[:64],
                         )
                     ]
@@ -504,12 +514,12 @@ class CccTopic:
             rows.append(
                 [
                     InlineKeyboardButton(
-                        f"⏭ Next {PROVIDER_TITLE.get(a.provider, '')}",
+                        text=f"⏭ Next {PROVIDER_TITLE.get(a.provider, '')}",
                         callback_data=f"{CB_CCC_NEXT}{a.provider}",
                     )
                 ]
             )
-            kb = InlineKeyboardMarkup(rows)
+            kb = InlineKeyboardMarkup(inline_keyboard=rows)
         else:
             text = (
                 f"✅ {icon} **{PROVIDER_TITLE.get(a.provider, a.provider)}** account "
@@ -519,10 +529,10 @@ class CccTopic:
             )
             kb = (
                 InlineKeyboardMarkup(
-                    [
+                    inline_keyboard=[
                         [
                             InlineKeyboardButton(
-                                f"▶ Use {_short(a.name, 20)}",
+                                text=f"▶ Use {_short(a.name, 20)}",
                                 callback_data=f"{CB_CCC_USE}{a.id}"[:64],
                             )
                         ]
@@ -546,11 +556,9 @@ class CccTopic:
     # -- interaction
 
     async def handle_text(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str
+        self, message: Message, bot: Bot, user_data: dict[str, Any], text: str
     ) -> None:
-        msg = update.message
-        if msg is None:
-            return
+        msg = message
         if not self.client.available():
             await safe_reply(msg, f"⚠️ `{self.client.command}` is not installed here.")
             return
@@ -566,11 +574,8 @@ class CccTopic:
         await safe_reply(msg, body, reply_markup=kb)
 
     async def handle_callback(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, data: str
+        self, query: CallbackQuery, bot: Bot, user_data: dict[str, Any], data: str
     ) -> None:
-        query = update.callback_query
-        if query is None:
-            return
         try:
             if data.startswith(CB_CCC_USE):
                 acc_id = data[len(CB_CCC_USE) :]

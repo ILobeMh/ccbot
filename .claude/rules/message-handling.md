@@ -25,9 +25,10 @@ Per-user message queues + worker pattern for all send tasks:
 
 ## Rate Limiting
 
-- `AIORateLimiter(max_retries=5)` on the Application (30/s global)
-- On 429, AIORateLimiter pauses all concurrent requests (`_retry_after_event`) and retries after the ban
-- On restart, the global bucket is pre-filled (`_level=max_rate`) to avoid burst against Telegram's persisted server-side counter
+- `telegram_client.TelegramRateLimiter`: aiogram request middleware on the bot session (`build_bot`). 30 req/s global for every call with a `chat_id`; 20 msg/min per group only for message-creating calls (edits, deletes and chat actions don't count)
+- On 429 (`TelegramRetryAfter`) it pauses all concurrent requests and retries after the ban (`max_retries=5`); a 429 that survives reaches the queue worker, which backs off
+- The global bucket starts pre-filled (`_level=max_rate`) to avoid a burst against Telegram's persisted server-side counter on restart
+- Updates are handled one at a time (`start_polling(handle_as_tasks=False)`), in arrival order
 - Status polling interval: 1 second (skips enqueue when queue is non-empty)
 
 ## Performance Optimizations

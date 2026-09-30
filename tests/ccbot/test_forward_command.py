@@ -5,36 +5,26 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 
-def _make_update(text: str, user_id: int = 1, thread_id: int = 42) -> MagicMock:
-    """Build a minimal mock Update with message text in a forum topic."""
-    update = MagicMock()
-    update.effective_user = MagicMock()
-    update.effective_user.id = user_id
-    update.message = MagicMock()
-    update.message.text = text
-    update.message.message_thread_id = thread_id
-    update.message.chat = MagicMock()
-    update.message.chat.send_action = AsyncMock()
-    update.effective_chat = MagicMock()
-    update.effective_chat.type = "supergroup"
-    update.effective_chat.id = 100
-    return update
-
-
-def _make_context() -> MagicMock:
-    """Build a minimal mock context."""
-    context = MagicMock()
-    context.bot = AsyncMock()
-    context.user_data = {}
-    return context
+def _make_message(text: str, user_id: int = 1, thread_id: int = 42) -> MagicMock:
+    """Build a minimal mock Message with text in a forum topic."""
+    message = MagicMock()
+    message.from_user = MagicMock()
+    message.from_user.id = user_id
+    message.text = text
+    message.message_thread_id = thread_id
+    message.is_topic_message = True
+    message.chat = MagicMock()
+    message.chat.type = "supergroup"
+    message.chat.id = 100
+    return message
 
 
 class TestForwardCommand:
     @pytest.mark.asyncio
     async def test_model_sends_command_to_tmux(self):
         """/model → send_to_window called with "/model"."""
-        update = _make_update("/model")
-        context = _make_context()
+        message = _make_message("/model")
+        bot = AsyncMock()
 
         with (
             patch("ccbot.bot.is_user_allowed", return_value=True),
@@ -50,15 +40,20 @@ class TestForwardCommand:
 
             from ccbot.bot import forward_command_handler
 
-            await forward_command_handler(update, context)
+            await forward_command_handler(message, bot)
 
             mock_sm.send_to_window.assert_called_once_with("@5", "/model")
+            # "typing…" goes to the message's topic
+            bot.send_chat_action.assert_awaited_once()
+            kwargs = bot.send_chat_action.await_args.kwargs
+            assert kwargs["chat_id"] == 100
+            assert kwargs["message_thread_id"] == 42
 
     @pytest.mark.asyncio
     async def test_cost_sends_command_to_tmux(self):
         """/cost → send_to_window called with "/cost"."""
-        update = _make_update("/cost")
-        context = _make_context()
+        message = _make_message("/cost")
+        bot = AsyncMock()
 
         with (
             patch("ccbot.bot.is_user_allowed", return_value=True),
@@ -74,15 +69,15 @@ class TestForwardCommand:
 
             from ccbot.bot import forward_command_handler
 
-            await forward_command_handler(update, context)
+            await forward_command_handler(message, bot)
 
             mock_sm.send_to_window.assert_called_once_with("@5", "/cost")
 
     @pytest.mark.asyncio
     async def test_clear_clears_session(self):
         """/clear → send_to_window + clear_window_session."""
-        update = _make_update("/clear")
-        context = _make_context()
+        message = _make_message("/clear")
+        bot = AsyncMock()
 
         with (
             patch("ccbot.bot.is_user_allowed", return_value=True),
@@ -98,7 +93,7 @@ class TestForwardCommand:
 
             from ccbot.bot import forward_command_handler
 
-            await forward_command_handler(update, context)
+            await forward_command_handler(message, bot)
 
             mock_sm.send_to_window.assert_called_once_with("@5", "/clear")
             mock_sm.clear_window_session.assert_called_once_with("@5")
