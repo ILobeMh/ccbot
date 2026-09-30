@@ -106,7 +106,7 @@ class TestPickers:
         assert ui is not None
         assert ui.name == "EffortPicker"
         assert ui.content.startswith("   Effort")
-        assert "ultracode" in ui.content
+        assert "medium" in ui.content and "xhigh" in ui.content
         assert "←/→ to adjust" in ui.content
         assert is_blocking_dialog(pane)
 
