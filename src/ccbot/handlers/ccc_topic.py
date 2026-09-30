@@ -1,15 +1,18 @@
-"""The ``ccc`` special topic: Claude Code / Codex account switching via `ccc`.
+"""The ``ccc`` special topic: AI coding tool account switching via `ccc`.
 
 Wraps the `ccc` CLI (https://github.com/…/claude-code-codex-sw, JSON output)
-so accounts and their five-hour / weekly quota can be seen and switched
-from Telegram, and watches quota so the topic gets a message when the
-account in use runs out and when an exhausted account is usable again.
+so accounts (Claude, Codex, Grok, … — any provider ccc knows) and their
+quota can be seen and switched from Telegram, and watches quota so the topic
+gets a message when the account in use runs out and when an exhausted
+account is usable again. One message, edited in place: a home view with one
+line per provider, and a page per provider listing its accounts.
 
 Key components:
   - CccClient: async wrapper over `ccc … --json` (list / status / use /
     use-next / refresh); disabled when the binary is missing
   - Account / parse_accounts(): the subset of ccc's JSON the UI needs
-  - render_dashboard(): text + inline keyboard (▶ use, ⏭ next, 🔄 refresh,
+  - render_dashboard() / render_provider(): home / provider page, text +
+    inline keyboard (provider buttons, ▶ use, ⏭ next, « back, 🔄 refresh,
     🔁 restart Claude sessions)
   - QuotaWatcher: background loop; emits "exhausted" / "available again"
     events, waking up right after the earliest known reset time
@@ -39,7 +42,9 @@ from ..config import config
 from ..settings import in_quiet_hours
 from . import special_topics
 from .callback_data import (
+    CB_CCC_HOME,
     CB_CCC_NEXT,
+    CB_CCC_PROV,
     CB_CCC_REFRESH,
     CB_CCC_RESTART,
     CB_CCC_USE,
@@ -48,8 +53,12 @@ from .message_sender import safe_edit, safe_reply, safe_send
 
 logger = logging.getLogger(__name__)
 
-PROVIDER_ICON = {"claude": "✳", "codex": "❉"}
-PROVIDER_TITLE = {"claude": "Claude", "codex": "Codex"}
+PROVIDER_ICON = {"claude": "✳", "codex": "❉", "grok": "✦"}
+PROVIDER_TITLE = {"claude": "Claude", "codex": "Codex", "grok": "Grok"}
+# Windows shown in the main view, in display order (others are per-model extras)
+MAIN_WINDOWS = ("five_hour", "seven_day")
+# Target width of the monospace account blocks (phone screens)
+BLOCK_WIDTH = 34
 # A window at or below this many percent counts as exhausted
 EXHAUSTED_PCT = 1
 
@@ -121,12 +130,17 @@ class Window:
 
     @property
     def label(self) -> str:
-        return {
+        known = {
             "five_hour": "5h",
             "seven_day": "7d",
             "seven_day_opus": "7d opus",
-            "43200_minute": "30d",
-        }.get(self.name, self.name.replace("_", " "))
+        }
+        if self.name in known:
+            return known[self.name]
+        minutes = self.name.removesuffix("_minute")
+        if minutes != self.name and minutes.isdigit():
+            return _minutes_label(int(minutes))
+        return self.name.replace("_", " ")
 
 
 @dataclass
@@ -147,10 +161,21 @@ class Account:
         return self.id
 
     @property
+    def free(self) -> bool:
+        return self.plan.lower() == "free"
+
+    @property
     def main_windows(self) -> list[Window]:
-        return [w for w in self.windows if w.name in ("five_hour", "seven_day")] or [
-            w for w in self.windows if w.name == "43200_minute"
-        ]
+        """5h / 7d; else the 30-day window; else whatever the provider reports."""
+        main = sorted(
+            (w for w in self.windows if w.name in MAIN_WINDOWS),
+            key=lambda w: MAIN_WINDOWS.index(w.name),
+        )
+        return (
+            main
+            or [w for w in self.windows if w.name == "43200_minute"]
+            or self.windows[:2]
+        )
 
     @property
     def exhausted(self) -> bool:
@@ -158,12 +183,31 @@ class Account:
 
     @property
     def usable(self) -> bool:
-        return self.status == "ready" and self.plan != "free" and not self.exhausted
+        return self.status == "ready" and not self.free and not self.exhausted
 
     @property
     def next_reset(self) -> datetime | None:
         times = [w.resets_at for w in self.main_windows if w.exhausted and w.resets_at]
         return min(times) if times else None
+
+
+def _minutes_label(minutes: int) -> str:
+    """300 → ``5h``, 10080 → ``7d``, 43200 → ``30d``."""
+    if minutes and minutes % 1440 == 0:
+        return f"{minutes // 1440}d"
+    if minutes and minutes % 60 == 0:
+        return f"{minutes // 60}h"
+    return f"{minutes}m"
+
+
+def _pct(raw: object) -> int | None:
+    """remainingPercent as a whole number (ccc may send floats like 98.58)."""
+    if isinstance(raw, bool) or not isinstance(raw, (int, float, str)):
+        return None
+    try:
+        return max(0, min(100, round(float(raw))))
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def _parse_time(raw: object) -> datetime | None:
@@ -183,7 +227,7 @@ def parse_accounts(data: dict) -> list[Account]:
         windows = [
             Window(
                 name=str(w.get("name", "")),
-                remaining=w.get("remainingPercent"),
+                remaining=_pct(w.get("remainingPercent")),
                 resets_at=_parse_time(w.get("resetsAt")),
             )
             for w in quota.get("windows", [])
@@ -238,15 +282,37 @@ def _short(name: str, n: int = 18) -> str:
     return name if len(name) <= n else name[: n - 1] + "…"
 
 
+def _icon(provider: str) -> str:
+    return PROVIDER_ICON.get(provider, "•")
+
+
+def _title(provider: str) -> str:
+    return PROVIDER_TITLE.get(provider, provider.title())
+
+
+def _providers(accounts: list[Account]) -> list[str]:
+    """Providers that have accounts: known ones first, then any others."""
+    seen = list(dict.fromkeys(a.provider for a in accounts))
+    known = [p for p in PROVIDER_TITLE if p in seen]
+    return known + [p for p in seen if p not in PROVIDER_TITLE]
+
+
+def _reset_text(w: Window, now: datetime) -> str:
+    """``↻ 5d8h`` while the window is below 100%; ``↻ due`` once it has passed."""
+    if w.resets_at and w.resets_at <= now:
+        return "↻ due"  # cached quota older than its reset; 🔄 refreshes
+    if w.resets_at and (w.remaining is None or w.remaining < 100):
+        return f"↻ {_rel(w.resets_at, now)}"
+    return ""
+
+
 def _gauge_line(w: Window, now: datetime) -> str:
     """One aligned gauge row for a code block: ``5h ▕███░░░▏  51%  ↻ 5d8h``."""
     pct = "?" if w.remaining is None else f"{w.remaining}%"
-    reset = ""
-    if w.resets_at and w.resets_at <= now:
-        reset = "  ↻ due"  # cached quota older than its reset; 🔄 refreshes
-    elif w.resets_at and (w.remaining is None or w.remaining < 100):
-        reset = f"  ↻ {_rel(w.resets_at, now)}"
-    return f"  {w.label:<3}{_gauge(w.remaining)} {pct:>4}{reset}"
+    reset = _reset_text(w, now)
+    return f"  {w.label:<3}{_gauge(w.remaining)} {pct:>4}" + (
+        f"  {reset}" if reset else ""
+    )
 
 
 def _account_block(a: Account, now: datetime) -> list[str]:
@@ -260,69 +326,80 @@ def _account_block(a: Account, now: datetime) -> list[str]:
         flags.append(f"🎟{a.reset_credits}")
     if a.stale:
         flags.append("stale")
-    head = f"{mark} {_short(a.name, 24)}  {a.plan}"
+    head = [f"{mark} {_short(a.name)}  {a.plan}"]
     if flags:
-        head += "  " + " ".join(flags)
-    return [head] + [_gauge_line(w, now) for w in a.main_windows]
+        joined = " ".join(flags)
+        if len(head[0]) + 2 + len(joined) <= BLOCK_WIDTH:
+            head[0] += "  " + joined
+        else:  # keep phone-width: flags go on their own line
+            head.append("  " + joined)
+    return head + [_gauge_line(w, now) for w in a.main_windows]
+
+
+def _updated(now: datetime) -> str:
+    return f"_updated {now.strftime('%H:%M')} UTC_"
+
+
+def _home_windows(a: Account, now: datetime) -> str:
+    """``5h ▕░░░░░░▏ 4% ↻ 1h12m · 7d 51%``: gauge + reset only on the tightest window."""
+    windows = a.main_windows
+    if not windows:
+        return "no quota data"
+    below = [w for w in windows if w.remaining is not None and w.remaining < 100]
+    tight = min(below, key=lambda w: w.remaining or 0, default=None)
+    pieces = []
+    for w in windows:
+        pct = "?" if w.remaining is None else f"{w.remaining}%"
+        if w.exhausted:
+            pct = f"⛔ {pct}"
+        if w is tight:
+            reset = _reset_text(w, now)
+            pieces.append(
+                f"{w.label} {_gauge(w.remaining)} {pct}"
+                + (f" {reset}" if reset else "")
+            )
+        else:
+            pieces.append(f"{w.label} {pct}")
+    return " · ".join(pieces)
+
+
+def _home_line(provider: str, accs: list[Account], now: datetime) -> str:
+    in_use = next((a for a in accs if a.current), None)
+    parts = [f"{_icon(provider)} **{_title(provider)}**"]
+    if in_use is None:
+        parts.append("_none in use_")
+    else:
+        parts.append(f"`{_short(in_use.name, 7)}` ({in_use.plan})")
+        parts.append(_home_windows(in_use, now))
+    others = [a for a in accs if a is not in_use]
+    free = sum(1 for a in others if a.free)
+    if free:
+        parts.append(f"{free} free")
+    broken = sum(1 for a in others if a.status != "ready")
+    if broken:
+        parts.append(f"⚠ {broken} need login")
+    return " · ".join(parts)
 
 
 def render_dashboard(accounts: list[Account]) -> tuple[str, InlineKeyboardMarkup]:
-    """Dashboard text + keyboard, laid out for a phone-width screen.
-
-    Each provider is a heading followed by a monospace block: one line per
-    account (● = in use) and one aligned gauge line per quota window, so
-    nothing wraps and the bars line up.
-    """
+    """Home view: one compact line per provider, one button per provider."""
     now = datetime.now(timezone.utc)
-    lines: list[str] = []
-    rows: list[list[InlineKeyboardButton]] = []
-    for provider in ("claude", "codex"):
+    lines = ["🔀 **ccc** — accounts & quota", ""]
+    buttons: list[InlineKeyboardButton] = []
+    providers = _providers(accounts)
+    for provider in providers:
         accs = [a for a in accounts if a.provider == provider]
-        if not accs:
-            continue
-        paid = sorted(
-            [a for a in accs if a.plan != "free"], key=lambda x: (not x.current, x.name)
-        )
-        free = [a for a in accs if a.plan == "free"]
-        in_use = next((a for a in accs if a.current), None)
-        lines.append(
-            f"{PROVIDER_ICON[provider]} **{PROVIDER_TITLE[provider]}** — "
-            f"{len(accs)} accounts"
-            + (f", using `{_short(in_use.name, 24)}`" if in_use else "")
-        )
-        block: list[str] = []
-        for a in paid:
-            block.extend(_account_block(a, now))
-        if free:
-            ok = sum(1 for a in free if not a.exhausted)
-            block.append(f"○ {len(free)} free accounts ({ok} with quota)")
-        lines.append("```\n" + "\n".join(block) + "\n```")
-
-        use_row: list[InlineKeyboardButton] = []
-        for a in sorted(paid, key=lambda x: x.name):
-            if a.current:
-                continue
-            label = f"▶ {_short(a.name, 14)}" + (" ⛔" if a.exhausted else "")
-            use_row.append(
-                InlineKeyboardButton(
-                    text=label, callback_data=f"{CB_CCC_USE}{a.id}"[:64]
-                )
+        lines.append(_home_line(provider, accs, now))
+        buttons.append(
+            InlineKeyboardButton(
+                text=f"{_icon(provider)} {_title(provider)} ›",
+                callback_data=f"{CB_CCC_PROV}{provider}"[:64],
             )
-            if len(use_row) == 2:
-                rows.append(use_row)
-                use_row = []
-        if use_row:
-            rows.append(use_row)
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text=f"⏭ Next {PROVIDER_TITLE[provider]}",
-                    callback_data=f"{CB_CCC_NEXT}{provider}",
-                )
-            ]
         )
-    if not lines:
+    if not providers:
         lines.append("No accounts known to ccc yet (`ccc init` / `ccc add`).")
+    lines += ["", _updated(now)]
+    rows = [buttons[i : i + 3] for i in range(0, len(buttons), 3)]
     rows.append(
         [
             InlineKeyboardButton(
@@ -333,10 +410,70 @@ def render_dashboard(accounts: list[Account]) -> tuple[str, InlineKeyboardMarkup
             ),
         ]
     )
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def render_provider(
+    accounts: list[Account], provider: str
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Provider page: a monospace block per account, use / next / back buttons.
+
+    Paid accounts (and the one in use) get a line plus one aligned gauge line
+    per quota window, so nothing wraps and the bars line up; free accounts
+    are summarised in one line.
+    """
+    now = datetime.now(timezone.utc)
+    back = [InlineKeyboardButton(text="« Back", callback_data=CB_CCC_HOME)]
+    accs = [a for a in accounts if a.provider == provider]
+    if not accs:
+        text = f"{_icon(provider)} **{_title(provider)}** — no accounts"
+        return text, InlineKeyboardMarkup(inline_keyboard=[back])
+    shown = sorted(
+        (a for a in accs if not a.free or a.current),
+        key=lambda x: (not x.current, x.name),
+    )
+    free = [a for a in accs if a.free and not a.current]
+    count = f"{len(accs)} account{'s' if len(accs) != 1 else ''}"
+    lines = [f"{_icon(provider)} **{_title(provider)}** — {count}"]
+    block: list[str] = []
+    for a in shown:
+        block.extend(_account_block(a, now))
+    if free:
+        ok = sum(1 for a in free if a.status == "ready" and not a.exhausted)
+        broken = sum(1 for a in free if a.status != "ready")
+        summary = f"○ {len(free)} free account{'s' if len(free) != 1 else ''} ({ok} with quota"
+        if broken:
+            summary += f", {broken} need login"
+        block.append(summary + ")")
+    lines.append("```\n" + "\n".join(block) + "\n```")
     lines.append(
         f"_● in use · ↻ resets in · 🎟 reset credits · updated "
         f"{now.strftime('%H:%M')} UTC_"
     )
+
+    rows: list[list[InlineKeyboardButton]] = []
+    use_row: list[InlineKeyboardButton] = []
+    for a in shown:
+        if a.current:
+            continue
+        label = f"▶ {_short(a.name, 14)}" + (" ⛔" if a.exhausted else "")
+        use_row.append(
+            InlineKeyboardButton(text=label, callback_data=f"{CB_CCC_USE}{a.id}"[:64])
+        )
+        if len(use_row) == 2:
+            rows.append(use_row)
+            use_row = []
+    if use_row:
+        rows.append(use_row)
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text=f"⏭ Next {_title(provider)}",
+                callback_data=f"{CB_CCC_NEXT}{provider}"[:64],
+            )
+        ]
+    )
+    rows.append(back)
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -366,7 +503,7 @@ class QuotaWatcher:
                 continue
             if now and a.current:
                 events.append(QuotaEvent("exhausted", a))
-            elif was and not now and a.plan != "free":
+            elif was and not now and not a.free:
                 events.append(QuotaEvent("available", a))
         self._primed = True
         return events
@@ -397,6 +534,8 @@ class CccTopic:
         CB_CCC_NEXT,
         CB_CCC_REFRESH,
         CB_CCC_RESTART,
+        CB_CCC_HOME,
+        CB_CCC_PROV,
     )
 
     def __init__(self, client: CccClient | None = None) -> None:
@@ -432,7 +571,7 @@ class CccTopic:
             await safe_send(
                 bot,
                 chat_id,
-                "🔀 **ccc** — accounts & quota\n" + text,
+                text,
                 message_thread_id=thread_id,
                 reply_markup=kb,
             )
@@ -478,7 +617,7 @@ class CccTopic:
             logger.info("ccc alert suppressed (%s %s)", ev.kind, ev.account.name)
             return
         a = ev.account
-        icon = PROVIDER_ICON.get(a.provider, "")
+        icon = _icon(a.provider)
         if ev.kind == "exhausted":
             reset = _rel(a.next_reset)
             others = [
@@ -487,7 +626,7 @@ class CccTopic:
                 if x.provider == a.provider and not x.current and x.usable
             ]
             text = (
-                f"⛔ {icon} **{PROVIDER_TITLE.get(a.provider, a.provider)}** account "
+                f"⛔ {icon} **{_title(a.provider)}** account "
                 f"`{a.name}` (in use) is exhausted — resets in {reset}."
             )
             rows: list[list[InlineKeyboardButton]] = []
@@ -514,7 +653,7 @@ class CccTopic:
             rows.append(
                 [
                     InlineKeyboardButton(
-                        text=f"⏭ Next {PROVIDER_TITLE.get(a.provider, '')}",
+                        text=f"⏭ Next {_title(a.provider)}",
                         callback_data=f"{CB_CCC_NEXT}{a.provider}",
                     )
                 ]
@@ -522,7 +661,7 @@ class CccTopic:
             kb = InlineKeyboardMarkup(inline_keyboard=rows)
         else:
             text = (
-                f"✅ {icon} **{PROVIDER_TITLE.get(a.provider, a.provider)}** account "
+                f"✅ {icon} **{_title(a.provider)}** account "
                 f"`{a.name}` is available again ("
                 + ", ".join(f"{w.label} {w.remaining}%" for w in a.main_windows)
                 + ")."
@@ -576,8 +715,16 @@ class CccTopic:
     async def handle_callback(
         self, query: CallbackQuery, bot: Bot, user_data: dict[str, Any], data: str
     ) -> None:
+        view = ""  # provider page to re-render; "" = home
         try:
-            if data.startswith(CB_CCC_USE):
+            if data == CB_CCC_HOME:
+                await query.answer()
+                note = ""
+            elif data.startswith(CB_CCC_PROV):
+                await query.answer()
+                note = ""
+                view = data[len(CB_CCC_PROV) :]
+            elif data.startswith(CB_CCC_USE):
                 acc_id = data[len(CB_CCC_USE) :]
                 target = next((a for a in self._last if a.id == acc_id), None)
                 label = target.name if target else acc_id[:8]
@@ -587,6 +734,7 @@ class CccTopic:
                 note = f"✅ Now using `{cur.get('name', label)}` ({cur.get('provider', '')})."
                 if cur.get("provider") == "claude":
                     note += " Running Claude Code sessions keep their old login until restarted."
+                view = str(cur.get("provider") or (target.provider if target else ""))
             elif data.startswith(CB_CCC_NEXT):
                 provider = data[len(CB_CCC_NEXT) :]
                 await query.answer(f"Picking the best {provider} account…")
@@ -595,6 +743,7 @@ class CccTopic:
                 note = f"✅ Switched {provider} to `{cur.get('name', '?')}`."
                 if provider == "claude":
                     note += " Running Claude Code sessions keep their old login until restarted."
+                view = provider
             elif data.startswith(CB_CCC_REFRESH):
                 await query.answer("Refreshing from the providers…")
                 note = ""
@@ -630,7 +779,9 @@ class CccTopic:
             return
         self._last = accounts
         self.watcher.observe(accounts)
-        body, kb = render_dashboard(accounts)
+        body, kb = (
+            render_provider(accounts, view) if view else render_dashboard(accounts)
+        )
         await safe_edit(query, (note + "\n\n" if note else "") + body, reply_markup=kb)
 
 
