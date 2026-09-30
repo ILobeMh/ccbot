@@ -1,0 +1,35 @@
+# systemd user unit for ccbot — keeps the bot running across crashes and reboots.
+#
+# Install (as the user that runs Claude Code):
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/ccbot.service ~/.config/systemd/user/
+#   loginctl enable-linger "$USER"        # start at boot without a login
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now ccbot
+#   journalctl --user -u ccbot -f          # logs
+#
+# After a reboot the tmux windows (and Claude Code in them) are gone; the bot
+# posts a ▶ Resume button in every topic that lost its session.
+
+[Unit]
+Description=ccbot — Telegram topics ↔ Claude Code sessions
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h
+ExecStart=%h/.local/bin/ccbot
+# Where `claude`, `tmux`, `ccc` and `uv` live; user units don't read ~/.profile.
+Environment=PATH=%h/.local/bin:%h/.claude/local:/usr/local/bin:/usr/bin:/bin
+Restart=always
+RestartSec=5
+# The bot starts the tmux server, so tmux (and every Claude Code session in
+# it) lives in this unit's cgroup. Only stop the bot itself on restart/stop —
+# the default (control-group) would kill all running Claude sessions.
+KillMode=process
+# SIGTERM → graceful shutdown (state files flushed); give it time.
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

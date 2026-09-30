@@ -12,9 +12,11 @@ Responsibilities:
   - Manage thread↔window bindings for Telegram topic routing.
   - Send keystrokes to tmux windows and retrieve message history.
   - Maintain window_id→display name mapping for UI display.
-  - Re-resolve stale window IDs on startup (tmux server restart recovery).
+  - Re-resolve stale window IDs on startup (tmux server restart recovery);
+    topics whose window died are queued as LostBinding for a ▶ Resume offer.
 
-Key class: SessionManager (singleton instantiated as `session_manager`).
+Key classes: SessionManager (singleton instantiated as `session_manager`),
+WindowState, LostBinding.
 Key methods for thread binding access:
   - resolve_window_for_thread: Get window_id for a user's thread
   - iter_thread_bindings: Generator for iterating all (user_id, thread_id, window_id)
@@ -90,6 +92,21 @@ class ClaudeSession:
 
 
 @dataclass
+class LostBinding:
+    """A topic whose window vanished (reboot, tmux crash, window closed).
+
+    Carries what the ▶ Resume offer needs to bring the same session back.
+    """
+
+    user_id: int
+    thread_id: int
+    session_id: str
+    cwd: str
+    mode: str
+    name: str
+
+
+@dataclass
 class SessionManager:
     """Manages session state for Claude Code.
 
@@ -128,6 +145,12 @@ class SessionManager:
     # session_id -> {"cwd", "mode", "name"} for windows killed via the bot,
     # so the ▶ Resume button can bring them back with the same settings
     killed_sessions: dict[str, dict[str, str]] = field(default_factory=dict)
+    # tmux #{start_time} seen at the last startup; a different value means
+    # the server was restarted and persisted window IDs no longer hold
+    tmux_server_started: str = ""
+    # Topics that lost their window during startup re-resolution, waiting
+    # for the bot to post a ▶ Resume offer (in memory only)
+    lost_bindings: list[LostBinding] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self._load_state()
@@ -150,6 +173,7 @@ class SessionManager:
             },
             "special_topics": self.special_topics,
             "killed_sessions": self.killed_sessions,
+            "tmux_server_started": self.tmux_server_started,
         }
         atomic_write_json(config.state_file, state)
         logger.debug("State saved to %s", config.state_file)
@@ -201,6 +225,7 @@ class SessionManager:
                     for k, v in state.get("killed_sessions", {}).items()
                     if isinstance(v, dict)
                 }
+                self.tmux_server_started = str(state.get("tmux_server_started", ""))
 
                 # Detect old format: keys that don't look like window IDs
                 needs_migration = False
@@ -235,6 +260,7 @@ class SessionManager:
                 self.last_launch_modes = {}
                 self.special_topics = {}
                 self.killed_sessions = {}
+                self.tmux_server_started = ""
                 pass
 
     async def resolve_stale_ids(self) -> None:
@@ -245,6 +271,12 @@ class SessionManager:
         2. Stale IDs: window_id no longer exists but display name matches a live window
 
         Builds {window_name: window_id} from live windows, then remaps or drops entries.
+
+        When the tmux server was restarted since the last run (see
+        ``tmux_manager.server_start_time``), no persisted ID is trusted — the
+        new server reuses ``@0``, ``@1``… for unrelated windows — and only
+        name matches carry over. Topics dropped here whose session is known
+        are queued in ``lost_bindings`` for a ▶ Resume offer.
         """
         windows = await tmux_manager.list_windows()
         live_by_name: dict[str, str] = {}  # window_name -> window_id
@@ -253,6 +285,18 @@ class SessionManager:
             live_by_name[w.window_name] = w.window_id
             live_ids.add(w.window_id)
 
+        started = await tmux_manager.server_start_time()
+        server_restarted = bool(
+            started and self.tmux_server_started and started != self.tmux_server_started
+        )
+        if server_restarted:
+            logger.info(
+                "tmux server restarted (%s -> %s): persisted window IDs are stale",
+                self.tmux_server_started,
+                started,
+            )
+        trusted_ids = set() if server_restarted else live_ids
+
         # Snapshot old_id -> display_name BEFORE any mutation: the loops below
         # rewrite window_display_names as they go, and thread_bindings /
         # user_window_offsets must still resolve stale IDs against the old view.
@@ -260,14 +304,19 @@ class SessionManager:
         for key, ws in self.window_states.items():
             if ws.window_name and key not in old_names:
                 old_names[key] = ws.window_name
+        old_states: dict[str, WindowState] = dict(self.window_states)
+        remapped: dict[str, str] = {}  # stale id -> re-resolved live id
 
         changed = False
+        if started and started != self.tmux_server_started:
+            self.tmux_server_started = started
+            changed = True
 
         # --- Migrate window_states ---
         new_window_states: dict[str, WindowState] = {}
         for key, ws in self.window_states.items():
             if self._is_window_id(key):
-                if key in live_ids:
+                if key in trusted_ids:
                     new_window_states[key] = ws
                 else:
                     # Stale ID — try re-resolve by display name
@@ -284,6 +333,7 @@ class SessionManager:
                         ws.window_name = display
                         self.window_display_names[new_id] = display
                         self.window_display_names.pop(key, None)
+                        remapped[key] = new_id
                         changed = True
                     else:
                         logger.info(
@@ -311,7 +361,7 @@ class SessionManager:
             new_bindings: dict[int, str] = {}
             for tid, val in bindings.items():
                 if self._is_window_id(val):
-                    if val in live_ids:
+                    if val in trusted_ids:
                         new_bindings[tid] = val
                     else:
                         display = old_names.get(val, val)
@@ -332,6 +382,9 @@ class SessionManager:
                                 uid,
                                 tid,
                                 val,
+                            )
+                            self._queue_lost_binding(
+                                uid, tid, old_states.get(val), val, display
                             )
                             changed = True
                 else:
@@ -362,7 +415,7 @@ class SessionManager:
             new_offsets: dict[str, int] = {}
             for key, offset in offsets.items():
                 if self._is_window_id(key):
-                    if key in live_ids:
+                    if key in trusted_ids:
                         new_offsets[key] = offset
                     else:
                         display = old_names.get(key, key)
@@ -381,13 +434,47 @@ class SessionManager:
                         changed = True
             self.user_window_offsets[uid] = new_offsets
 
+        # --- Migrate window_launch_info (follows re-resolved IDs; stale
+        # entries would otherwise attach to a new window reusing the ID) ---
+        new_launch_info: dict[str, dict[str, str]] = {}
+        for key, info in self.window_launch_info.items():
+            if key in trusted_ids:
+                new_launch_info.setdefault(key, info)
+            elif key in remapped:
+                new_launch_info[remapped[key]] = info
+        if new_launch_info != self.window_launch_info:
+            self.window_launch_info = new_launch_info
+            changed = True
+
         if changed:
             self._save_state()
             logger.info("Startup re-resolution complete")
 
         # Clean up session_map.json: stale window IDs, migrate old-format keys
-        await self._cleanup_stale_session_map_entries(live_ids)
+        await self._cleanup_stale_session_map_entries(trusted_ids)
         await self._migrate_old_format_session_map_keys(live_by_name)
+
+    def _queue_lost_binding(
+        self,
+        user_id: int,
+        thread_id: int,
+        ws: WindowState | None,
+        window_id: str,
+        display: str,
+    ) -> None:
+        """Remember a dropped topic so the bot can offer ▶ Resume in it."""
+        if ws is None or not ws.session_id or not ws.cwd:
+            return
+        mode = self.window_launch_info.get(window_id, {}).get("mode") or "default"
+        self.lost_bindings.append(
+            LostBinding(user_id, thread_id, ws.session_id, ws.cwd, mode, display)
+        )
+        self._remember_killed(ws.session_id, ws.cwd, mode, display)
+
+    def pop_lost_bindings(self) -> list[LostBinding]:
+        """Hand over (and forget) topics that lost their window at startup."""
+        lost, self.lost_bindings = self.lost_bindings, []
+        return lost
 
     def _migrate_old_format_map(
         self, session_map: dict[str, dict], live_by_name: dict[str, str]
@@ -957,11 +1044,15 @@ class SessionManager:
     def remember_killed_session(
         self, session_id: str, cwd: str, mode: str, name: str
     ) -> None:
+        self._remember_killed(session_id, cwd, mode, name)
+        self._save_state()
+
+    def _remember_killed(self, session_id: str, cwd: str, mode: str, name: str) -> None:
+        self.killed_sessions.pop(session_id, None)  # re-insert as newest
         self.killed_sessions[session_id] = {"cwd": cwd, "mode": mode, "name": name}
         # keep the map small: newest 50
         for old in list(self.killed_sessions)[:-50]:
             del self.killed_sessions[old]
-        self._save_state()
 
     def get_killed_session(self, session_id: str) -> dict[str, str] | None:
         return self.killed_sessions.get(session_id)

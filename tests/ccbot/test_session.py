@@ -217,11 +217,19 @@ class TestResolveStaleIds:
     and silently dropped every topic binding.
     """
 
-    def _setup(self, mgr: SessionManager, monkeypatch, tmp_path, live) -> None:
+    def _setup(
+        self, mgr: SessionManager, monkeypatch, tmp_path, live, started=None
+    ) -> None:
         async def fake_list_windows() -> list[TmuxWindow]:
             return live
 
+        async def fake_start_time() -> str | None:
+            return started
+
         monkeypatch.setattr(session_mod.tmux_manager, "list_windows", fake_list_windows)
+        monkeypatch.setattr(
+            session_mod.tmux_manager, "server_start_time", fake_start_time
+        )
         # Point session_map at a nonexistent file so the trailing
         # session_map cleanup steps are no-ops
         monkeypatch.setattr(
@@ -292,6 +300,94 @@ class TestResolveStaleIds:
 
         assert mgr.get_window_for_thread(100, 7) == "@3"
         assert mgr.window_states["@3"].session_id == "sid-keep"
+
+    @pytest.mark.asyncio
+    async def test_reused_id_after_server_restart_is_not_trusted(
+        self, mgr: SessionManager, monkeypatch, tmp_path
+    ) -> None:
+        """A new tmux server reuses @0/@1: the old binding must not stick to it."""
+        mgr.tmux_server_started = "1000"
+        state = mgr.get_window_state("@1")
+        state.session_id = "sid-proj"
+        state.cwd = "/proj"
+        mgr.bind_thread(100, 42, "@1", window_name="proj")
+        mgr.set_launch_info("@1", "plan", "claude --permission-mode plan")
+
+        # Rebooted: a fresh server whose @1 is some unrelated window
+        self._setup(
+            mgr, monkeypatch, tmp_path, [TmuxWindow("@1", "__main__", "/")], "2000"
+        )
+        await mgr.resolve_stale_ids()
+
+        assert mgr.get_window_for_thread(100, 42) is None
+        assert "@1" not in mgr.window_states
+        assert "@1" not in mgr.window_launch_info
+        assert mgr.tmux_server_started == "2000"
+        lost = mgr.pop_lost_bindings()
+        assert [
+            (b.user_id, b.thread_id, b.session_id, b.cwd, b.mode) for b in lost
+        ] == [(100, 42, "sid-proj", "/proj", "plan")]
+        assert mgr.pop_lost_bindings() == []
+        assert mgr.get_killed_session("sid-proj") == {
+            "cwd": "/proj",
+            "mode": "plan",
+            "name": "proj",
+        }
+
+    @pytest.mark.asyncio
+    async def test_same_server_keeps_live_ids(
+        self, mgr: SessionManager, monkeypatch, tmp_path
+    ) -> None:
+        """Unchanged start time: live IDs are trusted even if names differ."""
+        mgr.tmux_server_started = "1000"
+        mgr.bind_thread(100, 7, "@3", window_name="old-name")
+        self._setup(
+            mgr, monkeypatch, tmp_path, [TmuxWindow("@3", "renamed", "/k")], "1000"
+        )
+        await mgr.resolve_stale_ids()
+        assert mgr.get_window_for_thread(100, 7) == "@3"
+        assert mgr.pop_lost_bindings() == []
+
+    @pytest.mark.asyncio
+    async def test_server_restart_still_remaps_by_name(
+        self, mgr: SessionManager, monkeypatch, tmp_path
+    ) -> None:
+        """Name matches carry over a restart, and launch info follows the id."""
+        mgr.tmux_server_started = "1000"
+        state = mgr.get_window_state("@5")
+        state.session_id = "sid-1"
+        state.cwd = "/proj"
+        mgr.bind_thread(100, 42, "@5", window_name="proj")
+        mgr.set_launch_info("@5", "acceptEdits", "claude")
+        self._setup(
+            mgr, monkeypatch, tmp_path, [TmuxWindow("@0", "proj", "/proj")], "2000"
+        )
+        await mgr.resolve_stale_ids()
+        assert mgr.get_window_for_thread(100, 42) == "@0"
+        assert mgr.get_launch_info("@0")["mode"] == "acceptEdits"
+        assert "@5" not in mgr.window_launch_info
+        assert mgr.pop_lost_bindings() == []
+
+    @pytest.mark.asyncio
+    async def test_first_run_records_start_time_and_trusts_ids(
+        self, mgr: SessionManager, monkeypatch, tmp_path
+    ) -> None:
+        """No start time persisted yet (upgrade): behave as before, then record it."""
+        mgr.bind_thread(100, 7, "@3", window_name="keep")
+        self._setup(mgr, monkeypatch, tmp_path, [TmuxWindow("@3", "keep", "/k")], "42")
+        await mgr.resolve_stale_ids()
+        assert mgr.get_window_for_thread(100, 7) == "@3"
+        assert mgr.tmux_server_started == "42"
+
+    @pytest.mark.asyncio
+    async def test_dropped_binding_without_session_is_not_offered(
+        self, mgr: SessionManager, monkeypatch, tmp_path
+    ) -> None:
+        mgr.bind_thread(100, 42, "@5", window_name="gone")
+        self._setup(mgr, monkeypatch, tmp_path, [TmuxWindow("@1", "x", "/x")])
+        await mgr.resolve_stale_ids()
+        assert mgr.get_window_for_thread(100, 42) is None
+        assert mgr.pop_lost_bindings() == []
 
 
 class TestLoadSessionMapMigration:

@@ -251,6 +251,38 @@ class TmuxManager:
 
         return await asyncio.to_thread(_run)
 
+    async def server_start_time(self) -> str | None:
+        """The tmux server's start time (``#{start_time}``), or None.
+
+        Window IDs are only unique per server lifetime: after a reboot or a
+        tmux crash the new server hands out ``@0``, ``@1``… again, so a
+        persisted ``@1`` may name an unrelated window. Comparing this value
+        with the one saved last run tells whether persisted IDs still hold.
+        """
+
+        def _run() -> str | None:
+            try:
+                out = subprocess.run(
+                    [
+                        "tmux",
+                        "display-message",
+                        "-p",
+                        "-t",
+                        self.session_name,
+                        "#{start_time}",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    check=False,
+                )
+            except (OSError, subprocess.SubprocessError):
+                return None
+            value = out.stdout.strip()
+            return value if out.returncode == 0 and value.isdigit() else None
+
+        return await asyncio.to_thread(_run)
+
     def invalidate_windows_cache(self) -> None:
         """Drop the list_windows cache (after create/kill/rename)."""
         self._windows_cache = None

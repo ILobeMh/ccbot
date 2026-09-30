@@ -139,3 +139,52 @@ class TestStatusPollerSettingsDetection:
             assert keyboard is not None
             # Verify the message text contains model picker content
             assert "Select model" in call_kwargs["text"]
+
+
+class TestVanishedWindow:
+    """A topic whose window disappeared is unbound and offered ▶ Resume."""
+
+    @pytest.mark.asyncio
+    async def test_offers_resume_when_session_known(self):
+        from ccbot.handlers import status_polling
+        from ccbot.session import WindowState
+
+        ws = WindowState(session_id="sid-9", cwd="/proj")
+        sm = MagicMock()
+        sm.window_states = {"@4": ws}
+        sm.get_launch_info.return_value = {"mode": "plan"}
+        sm.get_display_name.return_value = "proj"
+        with (
+            patch.object(status_polling, "session_manager", sm),
+            patch.object(status_polling, "clear_topic_state", AsyncMock()) as clear,
+            patch.object(status_polling, "offer_resume", AsyncMock()) as offer,
+        ):
+            await status_polling._handle_vanished_window(AsyncMock(), 1, 42, "@4")
+
+        sm.unbind_thread.assert_called_once_with(1, 42)
+        clear.assert_awaited_once()
+        offer.assert_awaited_once()
+        kwargs = offer.await_args.kwargs
+        assert (kwargs["session_id"], kwargs["cwd"], kwargs["mode"]) == (
+            "sid-9",
+            "/proj",
+            "plan",
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_offer_without_session(self):
+        from ccbot.handlers import status_polling
+
+        sm = MagicMock()
+        sm.window_states = {}
+        sm.get_launch_info.return_value = {}
+        sm.get_display_name.return_value = "x"
+        with (
+            patch.object(status_polling, "session_manager", sm),
+            patch.object(status_polling, "clear_topic_state", AsyncMock()),
+            patch.object(status_polling, "offer_resume", AsyncMock()) as offer,
+        ):
+            await status_polling._handle_vanished_window(AsyncMock(), 1, 42, "@4")
+
+        sm.unbind_thread.assert_called_once_with(1, 42)
+        offer.assert_not_awaited()

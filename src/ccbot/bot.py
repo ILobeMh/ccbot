@@ -166,6 +166,7 @@ from .handlers.notifications_topic import (
     record_turn_start,
 )
 from .handlers.response_builder import build_response_parts
+from .handlers.resume_offer import offer_resume
 from .handlers.settings_topic import settings_command
 from .handlers.special_topics import (
     ensure_special_topics,
@@ -476,25 +477,16 @@ async def _kill_window_and_offer_resume(
     chat_id = session_manager.resolve_chat_id(user_id, thread_id)
 
     if sid and cwd:
-        session_manager.remember_killed_session(sid, cwd, mode, display)
-        mode_label = LAUNCH_MODE_LABELS.get(mode, mode)
-        await safe_send(
+        await offer_resume(
             bot,
-            chat_id,
-            f"🗑 Killed `{display}` — the session is kept and can be resumed here.\n"
-            f"cwd `{cwd}`\nsession `{sid}`\nmode {mode_label}\n\n"
-            f"Tap ▶ or send `/resume {sid}`.",
-            message_thread_id=thread_id,
-            reply_markup=InlineKeyboardMarkup(
-                [
-                    [
-                        InlineKeyboardButton(
-                            "▶ Resume this session",
-                            callback_data=f"{CB_RESUME_SESSION}{sid}"[:64],
-                        )
-                    ]
-                ]
-            ),
+            user_id,
+            thread_id,
+            headline=f"🗑 Killed `{display}` — the session is kept and can be "
+            "resumed here.",
+            session_id=sid,
+            cwd=cwd,
+            mode=mode,
+            name=display,
         )
     else:
         await safe_send(
@@ -3155,6 +3147,19 @@ async def post_init(application: Application) -> None:
 
     # Re-resolve stale window IDs from persisted state against live tmux windows
     await session_manager.resolve_stale_ids()
+    # Topics whose window died with the server (reboot, tmux crash): offer ▶
+    for lost in session_manager.pop_lost_bindings():
+        await offer_resume(
+            application.bot,
+            lost.user_id,
+            lost.thread_id,
+            headline=f"⚠️ `{lost.name}` stopped while the bot was down "
+            "(server reboot or tmux restart).",
+            session_id=lost.session_id,
+            cwd=lost.cwd,
+            mode=lost.mode,
+            name=lost.name,
+        )
 
     # Pre-fill global rate limiter bucket on restart.
     # AsyncLimiter starts at _level=0 (full burst capacity), but Telegram's

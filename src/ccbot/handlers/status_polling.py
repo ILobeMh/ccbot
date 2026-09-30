@@ -7,7 +7,8 @@ Provides background polling of terminal status lines for all active users:
   - Notifies once when Claude Code exited (shell prompt) or an update is
     installed, with Restart / Kill buttons
   - Updates status messages in Telegram
-  - Polls thread_bindings (each topic = one window)
+  - Polls thread_bindings (each topic = one window); a topic whose window
+    vanished is unbound and offered ▶ Resume (resume_offer.offer_resume)
   - Periodically probes topic existence via unpin_all_forum_topic_messages
     (silent no-op when no pins); cleans up deleted topics (kills tmux window
     + unbinds thread)
@@ -47,6 +48,7 @@ from .interactive_ui import (
 from .message_queue import enqueue_status_update, get_message_queue
 from .message_sender import safe_send
 from .notifications_topic import mark_ui, notify
+from .resume_offer import offer_resume
 
 logger = logging.getLogger(__name__)
 
@@ -243,6 +245,35 @@ async def update_status_message(
     # If no status line, keep existing status message (don't clear on transient state)
 
 
+async def _handle_vanished_window(
+    bot: Bot, user_id: int, thread_id: int, window_id: str
+) -> None:
+    """Unbind a topic whose window disappeared and offer ▶ Resume in it."""
+    ws = session_manager.window_states.get(window_id)
+    sid, cwd = (ws.session_id, ws.cwd) if ws else ("", "")
+    mode = session_manager.get_launch_info(window_id).get("mode") or "default"
+    display = session_manager.get_display_name(window_id)
+    session_manager.unbind_thread(user_id, thread_id)
+    await clear_topic_state(user_id, thread_id, bot)
+    logger.info(
+        "Cleaned up stale binding: user=%d thread=%d window_id=%s",
+        user_id,
+        thread_id,
+        window_id,
+    )
+    if sid and cwd:
+        await offer_resume(
+            bot,
+            user_id,
+            thread_id,
+            headline=f"⚠️ The tmux window of `{display}` is gone.",
+            session_id=sid,
+            cwd=cwd,
+            mode=mode,
+            name=display,
+        )
+
+
 async def status_poll_loop(bot: Bot) -> None:
     """Background task to poll terminal status for all thread-bound windows."""
     logger.info("Status polling started (interval: %ss)", STATUS_POLL_INTERVAL)
@@ -294,14 +325,7 @@ async def status_poll_loop(bot: Bot) -> None:
                     # Clean up stale bindings (window no longer exists)
                     w = await tmux_manager.find_window_by_id(wid)
                     if not w:
-                        session_manager.unbind_thread(user_id, thread_id)
-                        await clear_topic_state(user_id, thread_id, bot)
-                        logger.info(
-                            "Cleaned up stale binding: user=%d thread=%d window_id=%s",
-                            user_id,
-                            thread_id,
-                            wid,
-                        )
+                        await _handle_vanished_window(bot, user_id, thread_id, wid)
                         continue
 
                     # UI detection happens unconditionally in update_status_message.

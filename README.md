@@ -259,6 +259,21 @@ Formatting note:
 - Telegram messages are rendered with parse mode `HTML` using `chatgpt-md-converter`
 - Long messages are split with HTML tag awareness to preserve code blocks and formatting
 
+### Run as a service (systemd)
+
+`deploy/ccbot.service` is a systemd user unit that restarts the bot if it crashes and starts it at boot:
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp deploy/ccbot.service ~/.config/systemd/user/
+loginctl enable-linger "$USER"   # start at boot without logging in
+systemctl --user daemon-reload
+systemctl --user enable --now ccbot
+journalctl --user -u ccbot -f    # logs
+```
+
+It uses `KillMode=process`, so restarting the bot never kills the tmux server or the Claude Code sessions in it. After a reboot those sessions are gone; the bot posts a **▶ Resume** button in every topic that lost its session (`claude --resume` in the same directory and permission mode).
+
 ## Running Claude Code in tmux
 
 ### Option 1: Create via Telegram (Recommended)
