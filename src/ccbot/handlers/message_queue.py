@@ -100,6 +100,9 @@ class MessageTask:
     # offered by a short one-line reply (rich_render.text_caption)
     thinking: str | None = None
     caption: str | None = None
+    # A tool_result worth showing only as an edit of its tool_use message
+    # (question / plan results: the interactive UI message already says it)
+    edit_only: bool = False
 
 
 # Per-user message queues and worker tasks
@@ -586,6 +589,10 @@ async def _send_content_task(bot: Bot, user_id: int, task: MessageTask) -> None:
             logger.debug(f"Failed to edit tool msg {edit_msg_id}, sending new")
             # Fall through to send as new message
 
+    if task.edit_only:
+        await _check_and_send_status(bot, user_id, wid, task.thread_id)
+        return
+
     last_msg_id: int | None = None
 
     # 2a. A short reply line right after a sent thinking block: edit it in as
@@ -907,9 +914,10 @@ async def enqueue_content_message(
     rich: bool = False,
     thinking: str | None = None,
     caption: str | None = None,
+    edit_only: bool = False,
 ) -> None:
     """Enqueue a content message task (``rich``: parts are rich markdown;
-    ``thinking`` / ``caption``: see MessageTask)."""
+    ``thinking`` / ``caption`` / ``edit_only``: see MessageTask)."""
     logger.debug(
         "Enqueue content: user=%d, window_id=%s, content_type=%s",
         user_id,
@@ -933,6 +941,7 @@ async def enqueue_content_message(
         rich=rich,
         thinking=thinking,
         caption=caption,
+        edit_only=edit_only,
     )
     queue.put_nowait(task)
 

@@ -170,3 +170,46 @@ def test_same_options_different_command_have_different_fingerprints():
     assert a is not None and b is not None
     assert [c.label for c in a.choices] == [c.label for c in b.choices]
     assert a.fingerprint != b.fingerprint
+
+
+def test_scrolling_picker_marks_and_hidden_count():
+    """2.1.286 draws "↓ 3." on the last visible row and "… +9 models"."""
+    v = _view("model_picker_small")
+    assert [c.number for c in v.choices] == [1, 2, 3]
+    assert v.choices[2].label == "Sonnet 5.5"
+    assert v.choices[2].description.startswith("Most efficient")
+    assert v.hidden == 9
+    assert "models" not in v.choices[-1].description  # not a continuation line
+    assert "✔" in v.choices[0].label  # the current model
+
+
+def test_enlarged_picker_shows_ten_models():
+    v = _view("model_picker_scroll")
+    assert [c.number for c in v.choices] == list(range(1, 11))
+    assert v.choices[9].label == "Opus 4.7"
+    assert v.hidden == 2
+    kb = _choice_keyboard("@1", v)
+    texts = [b.text for row in kb.inline_keyboard for b in row]
+    assert "10 · Opus 4.7" in texts and "3 · Sonnet 5.5" in texts
+    assert "more" in render_view(v)
+
+
+def test_rendering_keeps_one_item_per_line():
+    """A bare newline is a soft break in rich messages: options are list items
+    and the tab strip is its own paragraph."""
+    v = _view("ask_multi_tab2")
+    text = render_view(v)
+    assert "\n\n_" in text  # tab strip after a blank line
+    assert all(line.startswith("- ") for line in text.split("\n\n")[-1].split("\n"))
+    review = render_view(_view("ask_submit_tab"))
+    assert "\n- " in review
+
+
+def test_no_next_button_on_the_submit_tab():
+    def texts(name):
+        kb = _choice_keyboard("@1", _view(name))
+        return [b.text for row in kb.inline_keyboard for b in row]
+
+    assert "Next ›" not in texts("ask_submit_tab")
+    assert "‹ Prev" in texts("ask_submit_tab")
+    assert "Next ›" in texts("ask_multi_tab1")

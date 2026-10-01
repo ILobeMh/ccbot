@@ -329,3 +329,58 @@ def test_is_rtl(text, rtl):
 )
 def test_format_duration(seconds, expected):
     assert rr.format_duration(seconds) == expected
+
+
+class TestAskUserQuestion:
+    INP = {
+        "questions": [
+            {
+                "header": "Language",
+                "question": "Which language?",
+                "options": [
+                    {"label": "Python", "description": "Dynamic"},
+                    {"label": "Go", "description": "Fast"},
+                ],
+            },
+            {
+                "header": "Features",
+                "question": "Which features? (pick any)",
+                "options": [{"label": "Notifications", "description": "Push"}],
+            },
+        ]
+    }
+    RESULT = (
+        'Your questions have been answered: "Which language?"="Python", '
+        '"Which features? (pick any)"="Notifications, Approvals". '
+        "You can now continue with these answers in mind."
+    )
+
+    def test_questions_are_separate_blocks(self):
+        (msg,) = rr.render_tool_use(ToolCall(name="AskUserQuestion", input=self.INP))
+        assert "**Language**\n\nWhich language?\n\n1. **Python** — Dynamic\n" in msg
+        assert "\n\n❓ **Features**" in msg
+
+    def test_result_is_an_answer_list_not_raw_text(self):
+        call = ToolCall(
+            name="AskUserQuestion",
+            input=self.INP,
+            result_text=self.RESULT,
+            started_at="2026-09-30T19:52:00Z",
+            finished_at="2026-09-30T19:53:15Z",
+        )
+        (msg,) = rr.render_tool_result(call, rr.RenderOptions())
+        assert msg == (
+            "⎿ ✅ Answered · 1m 15s\n\n"
+            "- **Language** → Python\n"
+            "- **Features** → Notifications, Approvals"
+        )
+
+    def test_list_header_never_runs_into_a_details_block(self):
+        """Telegram rejects (RICH_MESSAGE_CONTENT_REQUIRED) a list item that
+        runs straight into <details>."""
+        call = ToolCall(
+            name="AskUserQuestion", input=self.INP, result_text="unparsable result"
+        )
+        (msg,) = rr.render_tool_result(call, rr.RenderOptions())
+        assert "1. **Notifications** — Push\n\n⎿ ✅" in msg
+        assert "<details>" in msg

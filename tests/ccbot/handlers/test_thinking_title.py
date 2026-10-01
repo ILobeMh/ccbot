@@ -237,3 +237,23 @@ async def test_task_notification_replies_to_its_tool_call(calls):
     assert reply is not None and reply.message_id == 500
     # the notification is a message of its own (never merged with the reply)
     assert calls[-1][1] == "All green." and calls[-1][2] is None
+
+
+@pytest.mark.asyncio
+async def test_interactive_result_without_its_message_is_dropped(calls):
+    """The question UI message already records the answer: its tool_result is
+    only an edit of the fallback message, never a new message."""
+    bot = AsyncMock()
+    await message_queue.enqueue_content_message(
+        bot,
+        1,
+        "@5",
+        ["⎿ ✅ Answered\n\n- **A** → b"],
+        tool_use_id="toolu_q",
+        content_type="tool_result",
+        thread_id=42,
+        rich=True,
+        edit_only=True,
+    )
+    await _settle()
+    assert calls == []

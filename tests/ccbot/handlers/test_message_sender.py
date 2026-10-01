@@ -182,13 +182,14 @@ class TestSafeEditTargets:
 
 class TestRichFallback:
     @pytest.mark.asyncio
-    async def test_rejected_rich_message_is_sent_as_split_plain_text(self):
+    async def test_rejected_rich_message_is_sent_as_split_classic_text(self):
         from ccbot.handlers.message_sender import send_rich
 
         bot = MagicMock()
         bot.send_rich_message = AsyncMock(side_effect=BadRequest("too many blocks"))
-        sent = [MagicMock(message_id=i) for i in range(5)]
-        bot.send_message = AsyncMock(side_effect=sent)
+        bot.send_message = AsyncMock(
+            side_effect=[MagicMock(message_id=i) for i in range(30)]
+        )
         long_md = "\n".join("line %04d " % i + "x" * 60 for i in range(400))
         result = await send_rich(bot, -100, long_md, message_thread_id=7)
         assert result is not None
@@ -196,7 +197,35 @@ class TestRichFallback:
         assert len(calls) > 1  # split: nothing lost, no "message is too long"
         assert all(len(c.kwargs["text"]) <= 4096 for c in calls)
         assert all(c.kwargs["message_thread_id"] == 7 for c in calls)
-        assert all(c.kwargs["parse_mode"] is None for c in calls)
+        assert all(c.kwargs["parse_mode"] == "MarkdownV2" for c in calls)
+
+    def test_flatten_rich_unfolds_details_and_entities(self):
+        from ccbot.handlers.message_sender import flatten_rich
+
+        rich = (
+            "⎿ ✅ 3s\n<details><summary>Result · 1 line</summary>\n\n"
+            "```text\na &amp; b <details>\n```\n\n</details>\n\n"
+            "x &lt; y &amp;&amp; z"
+        )
+        flat = flatten_rich(rich)
+        assert "<summary>" not in flat and "</details>" not in flat.split("```")[-1]
+        assert "**Result · 1 line**" in flat
+        assert "a &amp; b <details>" in flat  # code is untouched
+        assert flat.endswith("x < y && z")
+
+    @pytest.mark.asyncio
+    async def test_rejected_rich_edit_is_edited_as_classic_text(self):
+        from ccbot.handlers.message_sender import edit_rich
+
+        bot = MagicMock()
+        bot.edit_message_text = AsyncMock(
+            side_effect=[BadRequest("RICH_MESSAGE_CONTENT_REQUIRED"), None]
+        )
+        md = "- item\n<details><summary>Result</summary>\n\nbody\n\n</details>"
+        assert await edit_rich(bot, -100, 5, md) is True
+        retry = bot.edit_message_text.await_args_list[1].kwargs
+        assert retry["parse_mode"] == "MarkdownV2" and "rich_message" not in retry
+        assert "<details>" not in retry["text"]
 
     @pytest.mark.asyncio
     async def test_rejected_long_rich_edit_asks_caller_to_resend(self):

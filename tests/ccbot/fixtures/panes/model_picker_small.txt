@@ -1,0 +1,24 @@
+▎ Your voice can help guide AI
+▎ Take 15 min to share your experiences with Anthropic Interviewer. Start now
+
+❯ /model
+  ⎿  Set model to Haiku 4.5 and saved as your default for new sessions
+
+❯ /model
+  ⎿  Set model to Opus 5.5 (default) and saved as your default for new sessions
+
+❯ /model
+  ⎿  Kept model as Opus 5.5 (default)
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   Select model
+   Switch between Claude models. Your pick becomes the default for new sessions. For
+   other/previous model names, specify with --model.
+
+   ❯ 1.  Default (recommended) ✔  Opus 5.5 · Best for everyday, complex tasks
+     2.  Opus 5.5                 For complex work and everyday tasks
+   ↓ 3.  Sonnet 5.5               Most efficient for simpler tasks
+      … +9 models
+
+   ◐ Medium effort (default) ←/→ to adjust
+
+   Enter to set as default · s to use this session only · Esc to cancel

@@ -589,6 +589,8 @@ def tool_header(call: ToolCall) -> str:
         return head + (f" · {escape_inline(args)}" if args else "")
     if name == "AskUserQuestion":
         return _questions(inp)
+    if name == "ExitPlanMode":
+        return "📋 **Plan** · waiting for approval"
     mcp = _mcp_parts(name)
     if mcp:
         server, tool = mcp
@@ -599,22 +601,51 @@ def tool_header(call: ToolCall) -> str:
 
 
 def _questions(inp: dict[str, Any]) -> str:
-    """AskUserQuestion as a readable list (fallback when no UI is drawn)."""
+    """AskUserQuestion as a readable list (fallback when no UI is drawn).
+
+    Blocks are separated by blank lines: a bare newline is only a soft line
+    break in rich messages, and Telegram rejects a list that runs straight
+    into the ``<details>`` block of a result.
+    """
     out = []
     for q in inp.get("questions") or []:
         if not isinstance(q, dict):
             continue
         header = _s(q, "header")
-        title = f"❓ **{escape_inline(header)}**\n" if header else "❓ "
+        title = f"❓ **{escape_inline(header)}**\n\n" if header else "❓ "
         out.append(title + escape_prose(_s(q, "question")))
+        items = []
         for i, opt in enumerate(q.get("options") or [], 1):
             if isinstance(opt, dict):
                 label = escape_inline(str(opt.get("label", "")))
                 desc = str(opt.get("description", ""))
-                out.append(
+                items.append(
                     f"{i}. **{label}**" + (f" — {escape_prose(desc)}" if desc else "")
                 )
-    return "\n".join(out) or "❓ **Question**"
+        if items:
+            out.append("\n".join(items))
+    return "\n\n".join(out) or "❓ **Question**"
+
+
+_ANSWER_RE = re.compile(r'"((?:[^"\\]|\\.)*)"="((?:[^"\\]|\\.)*)"')
+
+
+def _answers(call: ToolCall) -> str | None:
+    """The answered AskUserQuestion as a list, from the result text
+    (``Your questions have been answered: "q"="a", …``)."""
+    pairs = _ANSWER_RE.findall(call.result_text or "")
+    if not pairs:
+        return None
+    headers = {
+        " ".join(_s(q, "question").split()): _s(q, "header")
+        for q in call.input.get("questions") or []
+        if isinstance(q, dict)
+    }
+    lines = []
+    for question, answer in pairs:
+        label = headers.get(" ".join(question.split())) or question
+        lines.append(f"- **{escape_inline(label)}** → {escape_inline(answer)}")
+    return "\n".join(lines)
 
 
 def render_tool_use(call: ToolCall) -> list[str]:
@@ -731,6 +762,10 @@ def tool_result_body(call: ToolCall, opts: RenderOptions) -> str | None:
         )
     if name in ("TodoWrite", "TaskCreate", "TaskUpdate", "Skill", "ToolSearch"):
         return None  # the header says it all; results are boilerplate
+    if name == "AskUserQuestion":
+        answers = _answers(call)
+        if answers:
+            return _status("✅", "Answered", took) + "\n\n" + answers
     head = _status("✅", took)
     block = _output_block(text, "Result", opts)
     return head + ("\n" + block if block else "")
@@ -744,4 +779,21 @@ def render_tool_result(call: ToolCall, opts: RenderOptions) -> list[str]:
     body = tool_result_body(call, opts)
     if body is None:
         return []
-    return _numbered(split_rich(f"{tool_header(call)}\n{body}"), "continued")
+    header = tool_header(call)
+    if call.name == "AskUserQuestion" and body.startswith("⎿ ✅ Answered"):
+        header = ""  # the answers replace the list of questions
+    return _numbered(split_rich(_join_blocks(header, body)), "continued")
+
+
+_LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s")
+
+
+def _join_blocks(header: str, body: str) -> str:
+    """Header, then the result. A header ending in a list item needs a blank
+    line before the result (else the result is read as part of the item and
+    Telegram rejects the message)."""
+    if not header:
+        return body
+    last = header.rstrip("\n").rsplit("\n", 1)[-1]
+    sep = "\n\n" if _LIST_ITEM_RE.match(last) else "\n"
+    return f"{header}{sep}{body}"

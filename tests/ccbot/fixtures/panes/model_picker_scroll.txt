@@ -1,0 +1,60 @@
+
+ ▐▛███▛█   Claude Code v2.1.286
+▝▜██████▀  Opus 5.5 · Claude Pro
+ ▝▝   ▝▝   /tmp/ccbot-cap
+
+▎ Your voice can help guide AI
+▎ Take 15 min to share your experiences with Anthropic Interviewer. Start now
+
+❯ /model
+  ⎿  Set model to Haiku 4.5 and saved as your default for new sessions
+
+❯ /model
+  ⎿  Set model to Opus 5.5 (default) and saved as your default for new sessions
+
+❯ /model
+  ⎿  Kept model as Opus 5.5 (default)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   Select model
+   Switch between Claude models. Your pick becomes the default for new sessions. For
+   other/previous model names, specify with --model.
+
+   ❯ 1.  Default (recommended) ✔  Opus 5.5 · Best for everyday, complex tasks
+     2.  Opus 5.5                 For complex work and everyday tasks
+     3.  Sonnet 5.5               Most efficient for simpler tasks
+     4.  Fable 5.1                For your toughest challenges
+     5.  Haiku 4.5                Fastest for quick answers
+     6.  Sonnet 5                 Efficient for routine tasks
+     7.  Opus 5                   Best for everyday, complex tasks
+     8.  Fable 5                  Most capable for your hardest and longest-running tasks
+     9.  Opus 4.8                 Best for everyday, complex tasks
+   ↓ 10. Opus 4.7                 Best for everyday, complex tasks
+      … +2 models
+
+   ◐ Medium effort (default) ←/→ to adjust
+
+   Enter to set as default · s to use this session only · Esc to cancel

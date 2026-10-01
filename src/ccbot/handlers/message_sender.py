@@ -27,7 +27,9 @@ session. TelegramRetryAfter that survives its retries is re-raised so
 callers (queue worker) can handle it.
 """
 
+import html
 import logging
+import re
 from collections.abc import Awaitable, Callable
 from typing import Any, TypeVar
 
@@ -49,7 +51,7 @@ from aiogram.types import (
 
 from ..markdown_v2 import convert_markdown
 from ..rich_render import is_rtl
-from ..telegram_sender import TELEGRAM_MAX_MESSAGE_LENGTH, split_message, utf16_len
+from ..telegram_sender import split_message
 from ..transcript_parser import TranscriptParser
 
 logger = logging.getLogger(__name__)
@@ -336,6 +338,27 @@ async def safe_send(
     )
 
 
+_DETAILS_OPEN_RE = re.compile(r"<details(?: open)?><summary>(.*?)</summary>\n*")
+_FENCE_SPLIT_RE = re.compile(
+    r"(^(?:`{3,}|~{3,}).*?^(?:`{3,}|~{3,})[ \t]*$)", re.M | re.S
+)
+
+
+def flatten_rich(markdown: str) -> str:
+    """Rich markdown as ordinary GFM, for when Telegram rejects the rich form.
+
+    ``<details>`` become a bold title followed by the body, and the HTML
+    entities that escape_prose adds are undone (outside code); the result goes
+    through the MarkdownV2 converter like any classic message.
+    """
+    parts = _FENCE_SPLIT_RE.split(markdown)
+    for i in range(0, len(parts), 2):  # odd parts are fenced code: untouched
+        text = _DETAILS_OPEN_RE.sub(lambda m: f"**{m.group(1)}**\n\n", parts[i])
+        text = text.replace("</details>", "")
+        parts[i] = html.unescape(text)
+    return re.sub(r"\n{3,}", "\n\n", "".join(parts)).strip()
+
+
 def _rich(markdown: str) -> InputRichMessage:
     return InputRichMessage(
         markdown=markdown, is_rtl=True if is_rtl(markdown) else None
@@ -372,26 +395,15 @@ async def send_rich(
         # BadRequest (markup rejected) or anything else the API refuses:
         # the content must not be lost — send it as plain text instead
         logger.warning("send_rich_message(%s) failed, sending plain: %s", chat_id, e)
-    kwargs.pop("link_preview_options", None)
+    # The content must not be lost: send it as a classic (MarkdownV2) message
+    chunks = split_message(flatten_rich(markdown), max_length=3000) or [markdown]
     markup = kwargs.pop("reply_markup", None)
-    chunks = split_message(markdown) or [markdown]
     sent: Message | None = None
     for i, chunk in enumerate(chunks):
-        last = i == len(chunks) - 1
-        try:
-            sent = await bot.send_message(
-                chat_id=chat_id,
-                text=chunk,
-                parse_mode=None,
-                link_preview_options=NO_LINK_PREVIEW,
-                reply_markup=markup if last else None,
-                **kwargs,
-            )
-        except TelegramRetryAfter:
-            raise
-        except Exception as e:
-            logger.error("send_message(%s) plain fallback failed: %s", chat_id, e)
-            return sent
+        extra = dict(kwargs)
+        if markup is not None and i == len(chunks) - 1:
+            extra["reply_markup"] = markup
+        sent = await send_with_fallback(bot, chat_id, chunk, **extra) or sent
     return sent
 
 
@@ -407,7 +419,7 @@ async def edit_rich(
     Same contract as edit_with_fallback: True when edited, unchanged, or the
     outcome is unknown (transport error); False when the message can't be
     edited any more (caller sends a new one). Markdown Telegram rejects is
-    re-edited as plain text.
+    re-edited as a classic (MarkdownV2) message.
     """
     what = f"edit_rich({message_id})"
     try:
@@ -433,24 +445,7 @@ async def edit_rich(
     except Exception as e:
         logger.error("%s failed: %s", what, e)
         return False
-    if utf16_len(markdown) > TELEGRAM_MAX_MESSAGE_LENGTH:
-        return False  # too long for plain text: caller sends it anew (split)
-    try:
-        await bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=message_id,
-            text=markdown,
-            parse_mode=None,
-            link_preview_options=NO_LINK_PREVIEW,
-            **kwargs,
-        )
-        return True
-    except TelegramRetryAfter:
-        raise
-    except TelegramBadRequest as e:
-        return _is_not_modified(e)
-    except _TRANSPORT_ERRORS:
-        return True
-    except Exception as e:
-        logger.error("%s: plain fallback failed: %s", what, e)
-        return False
+    flat = flatten_rich(markdown)
+    if len(flat) > 3000:
+        return False  # too long for one classic message: caller sends it anew
+    return await edit_with_fallback(bot, chat_id, message_id, flat, **kwargs)

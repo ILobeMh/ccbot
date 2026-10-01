@@ -24,8 +24,16 @@ def env(monkeypatch):
         state["keys"].append(text)
         return True
 
+    async def capture_expanded(window_id, before=None, rows=60):
+        # the enlarged capture (scripted by tests that need it), else as is
+        scripted = state.get("expanded")
+        if scripted:
+            return scripted.pop(0) if len(scripted) > 1 else scripted[0]
+        return await capture(window_id)
+
     tmux = MagicMock()
     tmux.capture_pane = capture
+    tmux.capture_pane_expanded = capture_expanded
     tmux.send_keys = send_keys
     tmux.find_window_by_id = AsyncMock(return_value=MagicMock(window_id="@5"))
     sm = MagicMock()
@@ -159,3 +167,27 @@ async def test_answering_flag_is_set_while_typing(env):
     await iu.answer_choice(AsyncMock(), 1, 42, "@5", 1, _token(_pane("ask_single"), 1))
     assert seen == [True]
     assert not iu.is_answering(1, 42)
+
+
+@pytest.mark.asyncio
+async def test_option_ten_walks_the_cursor_and_never_types_digits(env):
+    """Typing "10" would pick option 1 first (a digit selects at once)."""
+    big = _pane("model_picker_scroll")
+    at_ten = big.replace("   ❯ 1.  ", "     1.  ").replace(
+        "   ↓ 10. Opus 4.7", "   ❯ 10. Opus 4.7"
+    )
+    env["panes"] = [big, at_ten, IDLE]
+    # the small capture has hidden options: the enlarged one is used instead
+    env["expanded"] = [big, at_ten]
+    toast = await iu.answer_choice(AsyncMock(), 1, 42, "@5", 10, _token(big, 10))
+    assert env["keys"] == ["Down"] * 9 + ["Enter"]
+    assert toast == "✓ Opus 4.7"
+
+
+@pytest.mark.asyncio
+async def test_unreachable_option_is_reported(env):
+    big = _pane("model_picker_scroll")
+    env["panes"] = [big]
+    env["expanded"] = [big, big]  # the cursor never moves
+    toast = await iu.answer_choice(AsyncMock(), 1, 42, "@5", 10, _token(big, 10))
+    assert "Keys" in toast and "Enter" not in env["keys"]

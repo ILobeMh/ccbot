@@ -33,7 +33,9 @@ from ..ui_choices import (
     ChoiceView,
     button_style,
     button_text,
+    cursor_number,
     escape_literal,
+    has_hidden_options,
     label_hash,
     parse_choices,
     render_view,
@@ -79,6 +81,15 @@ _last_views: dict[tuple[int, int], ChoiceView | None] = {}
 _questions: dict[str, list[dict[str, Any]]] = {}
 # Topics where a tapped option is being typed right now
 _answering: set[tuple[int, int]] = set()
+
+
+async def _capture_ui(window_id: str) -> str | None:
+    """Pane text; for a picker that scrolls ("… +10 models") the window is
+    briefly grown so more of its options are drawn."""
+    pane = await tmux_manager.capture_pane(window_id)
+    if pane and has_hidden_options(pane) and is_interactive_ui(pane):
+        return await tmux_manager.capture_pane_expanded(window_id, before=pane) or pane
+    return pane
 
 
 def get_interactive_window(user_id: int, thread_id: int | None = None) -> str | None:
@@ -209,7 +220,7 @@ async def handle_interactive_ui(
         return False
 
     # Capture plain text (no ANSI colors)
-    pane_text = await tmux_manager.capture_pane(w.window_id)
+    pane_text = await _capture_ui(w.window_id)
     if not pane_text:
         logger.debug("No pane text captured for window_id %s", window_id)
         return False
@@ -336,7 +347,7 @@ def _choice_keyboard(window_id: str, view: ChoiceView) -> InlineKeyboardMarkup:
         # prompt it was shown for (see answer_choice)
         return f"{CB_CHOICE}{window_id}:{c.number}:{choice_token(view, c)}"[:64]
 
-    options = [c for c in view.choices if c.number <= 9]
+    options = view.choices
     main = [
         InlineKeyboardButton(
             text=button_text(c), callback_data=cb(c), style=button_style(c)
@@ -354,16 +365,18 @@ def _choice_keyboard(window_id: str, view: ChoiceView) -> InlineKeyboardMarkup:
     if extra:
         rows.append(extra)
     if view.tabs or view.multi:
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text="‹ Prev", callback_data=f"{CB_ASK_LEFT}{window_id}"[:64]
-                ),
+        tab_nav = [
+            InlineKeyboardButton(
+                text="‹ Prev", callback_data=f"{CB_ASK_LEFT}{window_id}"[:64]
+            )
+        ]
+        if not view.is_submit_tab:  # nothing after the Submit tab
+            tab_nav.append(
                 InlineKeyboardButton(
                     text="Next ›", callback_data=f"{CB_ASK_RIGHT}{window_id}"[:64]
-                ),
-            ]
-        )
+                )
+            )
+        rows.append(tab_nav)
     rows.append(
         [
             InlineKeyboardButton(
@@ -444,7 +457,7 @@ async def _answer_choice(
     number: int,
     token: str,
 ) -> str:
-    pane = await tmux_manager.capture_pane(window_id)
+    pane = await _capture_ui(window_id)
     ui = extract_interactive_content(pane) if pane else None
     view = parse_choices(ui, pane, _questions.get(window_id)) if ui else None
     choice = (
@@ -455,10 +468,19 @@ async def _answer_choice(
             await clear_interactive_msg(user_id, bot, thread_id)
         return "That question has changed — showing the current one"
 
-    await tmux_manager.send_keys(window_id, str(number), enter=False, literal=True)
-    await asyncio.sleep(0.5)
+    if number > 9:
+        # No single key: a typed "10" would pick option 1 first. Walk the
+        # cursor there instead and confirm
+        if not await _walk_cursor(window_id, number, pane or ""):
+            return "Couldn't reach that option — use ⌨️ Keys"
+        await tmux_manager.send_keys(window_id, "Enter", enter=False, literal=False)
+        await asyncio.sleep(0.4)
+    else:
+        await tmux_manager.send_keys(window_id, str(number), enter=False, literal=True)
+        await asyncio.sleep(0.5)
     if (
-        view.ui_name in _CONFIRM_AFTER_DIGIT
+        number <= 9
+        and view.ui_name in _CONFIRM_AFTER_DIGIT
         and not view.multi
         and choice.kind == "option"
     ):
@@ -483,6 +505,20 @@ async def _answer_choice(
         if not await handle_interactive_ui(bot, user_id, window_id, thread_id):
             await _finalize(bot, user_id, thread_id, view, choice)
     return f"✓ {choice.label[:40]}"
+
+
+async def _walk_cursor(window_id: str, number: int, pane: str) -> bool:
+    """Move the picker's ``❯`` cursor onto option ``number`` with Up / Down."""
+    start = cursor_number(pane)
+    if start is None:
+        return False
+    key = "Down" if number > start else "Up"
+    for _ in range(abs(number - start)):
+        await tmux_manager.send_keys(window_id, key, enter=False, literal=False)
+        await asyncio.sleep(0.05)
+    await asyncio.sleep(0.3)
+    now = await _capture_ui(window_id)
+    return now is not None and cursor_number(now) == number
 
 
 async def _finalize(

@@ -12,7 +12,8 @@ re-parses the pane and checks the hash, so a tap on an outdated message can
 never answer a different question.
 
 Key components: Choice, ChoiceView, parse_choices(), render_view(),
-button_text() / button_style(), label_hash(), escape_literal().
+button_text() / button_style(), label_hash(), escape_literal(),
+has_hidden_options() / cursor_number() (scrolling pickers).
 """
 
 from __future__ import annotations
@@ -23,7 +24,10 @@ from dataclasses import dataclass, field
 
 from .terminal_parser import InteractiveUIContent
 
-_OPTION_RE = re.compile(r"^(\s*)(?:❯\s*)?(\d+)\.\s+(.*\S)\s*$")
+# "❯ 1." marks the cursor; "↓ 10." / "↑ 3." mark a list that scrolls beyond them
+_OPTION_RE = re.compile(r"^(\s*)(?:[❯↓↑]\s*)?(\d+)\.\s+(.*\S)\s*$")
+# "… +10 models": options the picker doesn't draw (it shows at most 10)
+_MORE_RE = re.compile(r"^\s*…\s*\+(\d+)\s+\S")
 _CHECK_RE = re.compile(r"^\[([ ✔✓x×])\]\s*(.*)$")
 _TABS_RE = re.compile(r"^\s*←\s+(.*?)\s*→\s*$")
 _TAB_ITEM_RE = re.compile(r"([☐☒✔])\s+(.+?)(?=\s{2,}[☐☒✔]|$)")
@@ -52,6 +56,19 @@ DIGIT_UIS = {
 }
 
 
+def has_hidden_options(pane_text: str) -> bool:
+    """The pane draws a picker that scrolls ("… +10 models")."""
+    return any(_MORE_RE.match(ln) for ln in pane_text.split("\n"))
+
+
+def cursor_number(pane_text: str) -> int | None:
+    """Number of the option the ``❯`` cursor is on (None: not on a numbered row)."""
+    for ln in pane_text.split("\n"):
+        if (m := re.match(r"^\s*❯\s*(\d+)\.\s", ln)) is not None:
+            return int(m.group(1))
+    return None
+
+
 @dataclass
 class Choice:
     number: int
@@ -70,6 +87,12 @@ class ChoiceView:
     tabs: list[tuple[str, str]] = field(default_factory=list)  # (state, label)
     choices: list[Choice] = field(default_factory=list)
     review: list[tuple[str, str]] = field(default_factory=list)  # (q, answer)
+    hidden: int = 0  # options the UI scrolls out of view ("… +10 models")
+
+    @property
+    def is_submit_tab(self) -> bool:
+        """The last tab of a multi-question prompt (review + Submit / Cancel)."""
+        return bool(self.review) or self.title.startswith("Review your answers")
 
     @property
     def multi(self) -> bool:
@@ -240,6 +263,10 @@ def parse_choices(
             break
         if _SEPARATOR_RE.match(ln):
             continue
+        if more := _MORE_RE.match(ln):
+            view.hidden = int(more.group(1))
+            current = None
+            continue
         if not ln.strip():
             current = None  # a blank line ends an option's continuation
             continue
@@ -306,7 +333,7 @@ def render_view(view: ChoiceView) -> str:
             f"{'☒' if s == 'answered' else '☐' if s == 'pending' else '✔'} {escape_literal(t)}"
             for s, t in view.tabs
         )
-        head += f"\n_{strip}_"
+        head += f"\n\n_{strip}_"
     out.append(head)
     if view.context:
         if view.ui_name in ("PermissionPrompt", "BashApproval"):
@@ -316,7 +343,7 @@ def render_view(view: ChoiceView) -> str:
     if view.review:
         out.append(
             "\n".join(
-                f"• {escape_literal(q)} → **{escape_literal(a)}**"
+                f"- {escape_literal(q)} → **{escape_literal(a)}**"
                 for q, a in view.review
             )
         )
@@ -327,15 +354,18 @@ def render_view(view: ChoiceView) -> str:
     for c in view.choices:
         if c.kind != "option":
             continue
+        # A real list: a bare newline is only a soft break in rich messages
         mark = (
             ("☑" if c.checked else "☐") + " "
             if c.checked is not None
-            else f"**{c.number}.** "
+            else f"**{c.number}** · "
         )
         desc = f" — _{escape_literal(c.description)}_" if c.description else ""
-        lines.append(f"{mark}{escape_literal(c.label)}{desc}")
+        lines.append(f"- {mark}{escape_literal(c.label)}{desc}")
     if lines:
         out.append("\n".join(lines))
+    if view.hidden:
+        out.append(f"_… and {view.hidden} more — use ⌨️ Keys to scroll to them_")
     return "\n\n".join(out)
 
 

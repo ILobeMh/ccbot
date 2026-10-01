@@ -3101,6 +3101,9 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
                 rich=rich,
                 thinking=thinking,
                 caption=caption,
+                edit_only=msg.content_type == "tool_result"
+                and msg.tool is not None
+                and msg.tool.name in INTERACTIVE_TOOL_NAMES,
             )
 
             _mark_read(user_id, wid)

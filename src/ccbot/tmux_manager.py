@@ -104,6 +104,8 @@ logger = logging.getLogger(__name__)
 
 # Upper bound for one `tmux capture-pane` call
 CAPTURE_TIMEOUT_SECONDS = 5.0
+# Rows a window is grown to while a scrolling picker is read (see capture_pane_expanded)
+EXPANDED_ROWS = 60
 
 # Claude session IDs are UUIDs (JSONL filename stems)
 _UUID_RE = re.compile(
@@ -445,6 +447,63 @@ class TmuxManager:
         # Match the old libtmux behaviour: trailing empty lines dropped, no
         # trailing newline, spaces inside lines untouched.
         return text.rstrip("\n")
+
+    async def _tmux(self, *args: str) -> str | None:
+        """Run one tmux command; stdout, or None on failure / timeout."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "tmux",
+                *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await asyncio.wait_for(
+                proc.communicate(), timeout=CAPTURE_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return None
+        except OSError:
+            return None
+        return stdout.decode("utf-8") if proc.returncode == 0 else None
+
+    async def capture_pane_expanded(
+        self, window_id: str, before: str | None = None, rows: int = EXPANDED_ROWS
+    ) -> str | None:
+        """Capture with the window temporarily ``rows`` tall.
+
+        Claude Code's pickers draw only what fits ("… +10 models"); bot
+        windows are 80x24, so /model would show two models. The window is
+        grown, redrawn, captured and put back at its old size. ``before`` is
+        the capture at the old size (a redraw is a capture that differs).
+        """
+        size = await self._tmux(
+            "display-message", "-p", "-t", window_id, "#{window_width} #{window_height}"
+        )
+        try:
+            width, height = (int(x) for x in (size or "").split())
+        except ValueError:
+            return await self.capture_pane(window_id)
+        if height >= rows:
+            return await self.capture_pane(window_id)
+        grown = await self._tmux(
+            "resize-window", "-t", window_id, "-x", str(width), "-y", str(rows)
+        )
+        if grown is None:
+            return await self.capture_pane(window_id)
+        try:
+            pane = before
+            for _ in range(5):  # Claude redraws on SIGWINCH: wait until it did
+                await asyncio.sleep(0.3)
+                pane = await self.capture_pane(window_id)
+                if pane != before:
+                    break
+            return pane
+        finally:
+            await self._tmux(
+                "resize-window", "-t", window_id, "-x", str(width), "-y", str(height)
+            )
 
     async def send_key(self, window_id: str, key: str) -> bool:
         """Send a single tmux key name (``Down``, ``Enter``, ``Escape``, ``BTab``)."""

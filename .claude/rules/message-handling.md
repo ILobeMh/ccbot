@@ -15,6 +15,12 @@ Per-user message queues + worker pattern for all send tasks:
 - Rich style: a short one-line reply right after a thinking block (not the turn's final text) becomes that block's `<summary>` instead of a thinking preview — merged when both are queued together, otherwise edited into the thinking message if it is still the topic's last content (≤20 s)
 - `<task-notification>` prompts (background command / agent / monitor done) are parsed into `task_notification` notices, never merged, and sent as a reply to the tool call that started the task when its message id is known
 
+**Rich message rules** (learned from Telegram rejections): separate blocks with blank lines — a bare newline is only a soft break, and a list item running straight into `<details>` is rejected (`RICH_MESSAGE_CONTENT_REQUIRED`). When Telegram still rejects a rich message, `send_rich` / `edit_rich` fall back to a classic MarkdownV2 message via `flatten_rich` (details unfolded), never raw markdown.
+
+**Interactive results**: a tool_result of AskUserQuestion / ExitPlanMode is `edit_only` — it edits the fallback tool_use message when there is one and is otherwise dropped (the question UI message already records the answer).
+
+**Scrolling pickers** (`/model`: "… +10 models"): bot windows are 80x24, so `tmux_manager.capture_pane_expanded` grows the window to 60 rows, captures and restores it. Claude draws at most 10 options; digits reach hidden ones, but never type a multi-digit number (the first digit selects at once) — options ≥10 are reached by walking the `❯` cursor with Down/Up.
+
 ## Status Message Handling
 
 **Conversion**: The status message is edited into the first content message, reducing message count:
