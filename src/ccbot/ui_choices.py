@@ -45,6 +45,7 @@ _ARROW_ANSWER_RE = re.compile(r"^\s*→\s+(.*)$")
 _DESCRIBED = {"AskUserQuestion"}
 # UIs where typing a digit is known to act on the option directly
 DIGIT_UIS = {
+    "EffortPicker",  # not digits: level buttons walk the slider (see interactive_ui)
     "AskUserQuestion",
     "PermissionPrompt",
     "BashApproval",
@@ -54,6 +55,40 @@ DIGIT_UIS = {
     "RestoreCheckpoint",
     "SwitchModel",
 }
+
+
+_LEVEL_RE = re.compile(r"\b(low|medium|high|xhigh|max)\b")
+_STATUS_LEVEL_RE = re.compile(r"[◐◑◒◓◔◕○●]\s*(low|medium|high|xhigh|max)\b")
+
+
+def _parse_effort(ui: InteractiveUIContent, pane_text: str | None) -> ChoiceView | None:
+    """The /effort slider as one button per level; the ▲ marker (or, when the
+    slider wraps, the status bar's "◐ medium") tells the current one."""
+    lines = ui.content.split("\n")
+    labels = next(
+        (m for ln in lines if len(m := list(_LEVEL_RE.finditer(ln))) >= 3), None
+    )
+    if not labels:
+        return None
+    marker = next((ln.index("▲") for ln in lines if "▲" in ln), None)
+    current = None
+    if marker is not None:
+        current = min(labels, key=lambda m: abs((m.start() + m.end()) / 2 - marker))
+        current_name = current.group(1)
+    else:
+        status = _STATUS_LEVEL_RE.search(pane_text or "")
+        current_name = status.group(1) if status else ""
+    view = ChoiceView(
+        ui_name="EffortPicker",
+        title="Effort",
+        question="How hard should Claude think?",
+    )
+    for i, m in enumerate(labels, 1):
+        name = m.group(1)
+        view.choices.append(
+            Choice(i, name, "current" if name == current_name else "", kind="level")
+        )
+    return view
 
 
 def has_hidden_options(pane_text: str) -> bool:
@@ -169,6 +204,8 @@ def parse_choices(
     header above their question; ``questions`` (the AskUserQuestion tool
     input) names the active question when the tab strip can't tell.
     """
+    if ui.name == "EffortPicker":
+        return _parse_effort(ui, pane_text)
     view = ChoiceView(ui_name=ui.name)
     lines = ui.content.split("\n")
     header: list[str] = []
@@ -308,6 +345,7 @@ _TITLE_ICON = {
     "BashApproval": "🔐",
     "ExitPlanMode": "📋",
     "RestoreCheckpoint": "⏪",
+    "EffortPicker": "🎚",
 }
 
 
@@ -335,6 +373,14 @@ def render_view(view: ChoiceView) -> str:
         )
         head += f"\n\n_{strip}_"
     out.append(head)
+    if view.ui_name == "EffortPicker":
+        scale = " · ".join(
+            f"**{c.label}**" if c.description == "current" else c.label
+            for c in view.choices
+        )
+        out.append(f"_Faster_  {scale}  _Smarter_")
+        out.append("_Applies to this session only._")
+        return "\n\n".join(out)
     if view.context:
         if view.ui_name in ("PermissionPrompt", "BashApproval"):
             out.append(_code("\n".join(view.context)))
@@ -374,6 +420,8 @@ def button_text(c: Choice, max_len: int = 30) -> str:
         return "✍️ Other…"
     if c.kind == "chat":
         return "💬 Chat about this"
+    if c.kind == "level":
+        return f"● {c.label}" if c.description == "current" else c.label
     label = c.label if len(c.label) <= max_len else c.label[: max_len - 1] + "…"
     if c.checked is not None:
         return f"{'☑' if c.checked else '☐'} {label}"

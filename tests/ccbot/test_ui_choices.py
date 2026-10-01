@@ -213,3 +213,16 @@ def test_no_next_button_on_the_submit_tab():
     assert "Next ›" not in texts("ask_submit_tab")
     assert "‹ Prev" in texts("ask_submit_tab")
     assert "Next ›" in texts("ask_multi_tab1")
+
+
+def test_effort_slider_becomes_level_buttons():
+    v = _view("effort_picker")
+    assert v.ui_name == "EffortPicker"
+    assert [c.label for c in v.choices] == ["low", "medium", "high", "xhigh", "max"]
+    assert [c.label for c in v.choices if c.description == "current"] == ["medium"]
+    text = render_view(v)
+    assert text.startswith("🎚 **Effort**")
+    assert "low · **medium** · high" in text
+    kb = _choice_keyboard("@1", v)
+    texts = [b.text for row in kb.inline_keyboard for b in row]
+    assert texts[:5] == ["low", "● medium", "high", "xhigh", "max"]

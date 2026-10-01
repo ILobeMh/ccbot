@@ -24,7 +24,7 @@ def env(monkeypatch):
         state["keys"].append(text)
         return True
 
-    async def capture_expanded(window_id, before=None, rows=60):
+    async def capture_expanded(window_id, before=None, rows=60, cols=0):
         # the enlarged capture (scripted by tests that need it), else as is
         scripted = state.get("expanded")
         if scripted:
@@ -191,3 +191,36 @@ async def test_unreachable_option_is_reported(env):
     env["expanded"] = [big, big]  # the cursor never moves
     toast = await iu.answer_choice(AsyncMock(), 1, 42, "@5", 10, _token(big, 10))
     assert "Keys" in toast and "Enter" not in env["keys"]
+
+
+def _effort_at(pane: str, level: str) -> str:
+    """The captured /effort slider with its ▲ under ``level``."""
+    lines = pane.split("\n")
+    row = next(i for i, ln in enumerate(lines) if "▲" in ln)
+    labels = next(ln for ln in lines if "xhigh" in ln)
+    col = labels.index(level) + len(level) // 2
+    bar = lines[row].replace("▲", "─")
+    lines[row] = bar[:col] + "▲" + bar[col + 1 :]
+    return "\n".join(lines)
+
+
+@pytest.mark.asyncio
+async def test_effort_level_walks_the_slider_then_applies_for_the_session(env):
+    base = _pane("effort_picker")  # medium
+    xhigh = _effort_at(base, "xhigh")
+    env["panes"] = [base, xhigh, IDLE]
+    env["expanded"] = [base, xhigh]
+    iu._interactive_msgs[(1, 42)] = 77
+    toast = await iu.answer_choice(AsyncMock(), 1, 42, "@5", 4, _token(base, 4))
+    assert env["keys"] == ["Right", "Right", "s"]  # medium → high → xhigh
+    assert toast == "✓ xhigh"
+    assert "Effort → xhigh" in env["edits"][-1][1].replace("\\", "")
+
+
+@pytest.mark.asyncio
+async def test_effort_not_applied_if_the_slider_did_not_move(env):
+    base = _pane("effort_picker")
+    env["panes"] = [base]
+    env["expanded"] = [base, base]
+    toast = await iu.answer_choice(AsyncMock(), 1, 42, "@5", 5, _token(base, 5))
+    assert "Keys" in toast and "s" not in env["keys"]

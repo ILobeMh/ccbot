@@ -106,6 +106,7 @@ logger = logging.getLogger(__name__)
 CAPTURE_TIMEOUT_SECONDS = 5.0
 # Rows a window is grown to while a scrolling picker is read (see capture_pane_expanded)
 EXPANDED_ROWS = 60
+EXPANDED_COLS = 140  # wide enough that the /effort slider does not wrap
 
 # Claude session IDs are UUIDs (JSONL filename stems)
 _UUID_RE = re.compile(
@@ -469,9 +470,13 @@ class TmuxManager:
         return stdout.decode("utf-8") if proc.returncode == 0 else None
 
     async def capture_pane_expanded(
-        self, window_id: str, before: str | None = None, rows: int = EXPANDED_ROWS
+        self,
+        window_id: str,
+        before: str | None = None,
+        rows: int = EXPANDED_ROWS,
+        cols: int = 0,
     ) -> str | None:
-        """Capture with the window temporarily ``rows`` tall.
+        """Capture with the window temporarily ``rows`` x ``cols`` at least.
 
         Claude Code's pickers draw only what fits ("… +10 models"); bot
         windows are 80x24, so /model would show two models. The window is
@@ -485,10 +490,11 @@ class TmuxManager:
             width, height = (int(x) for x in (size or "").split())
         except ValueError:
             return await self.capture_pane(window_id)
-        if height >= rows:
+        new_w, new_h = max(width, cols), max(height, rows)
+        if (new_w, new_h) == (width, height):
             return await self.capture_pane(window_id)
         grown = await self._tmux(
-            "resize-window", "-t", window_id, "-x", str(width), "-y", str(rows)
+            "resize-window", "-t", window_id, "-x", str(new_w), "-y", str(new_h)
         )
         if grown is None:
             return await self.capture_pane(window_id)

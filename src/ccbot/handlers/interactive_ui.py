@@ -26,7 +26,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 from ..config import config
 from ..session import session_manager
 from ..terminal_parser import extract_interactive_content, is_interactive_ui
-from ..tmux_manager import tmux_manager
+from ..tmux_manager import EXPANDED_COLS, tmux_manager
 from ..ui_choices import (
     DIGIT_UIS,
     Choice,
@@ -87,8 +87,20 @@ async def _capture_ui(window_id: str) -> str | None:
     """Pane text; for a picker that scrolls ("… +10 models") the window is
     briefly grown so more of its options are drawn."""
     pane = await tmux_manager.capture_pane(window_id)
-    if pane and has_hidden_options(pane) and is_interactive_ui(pane):
-        return await tmux_manager.capture_pane_expanded(window_id, before=pane) or pane
+    if pane and is_interactive_ui(pane):
+        if has_hidden_options(pane):
+            return (
+                await tmux_manager.capture_pane_expanded(window_id, before=pane) or pane
+            )
+        ui = extract_interactive_content(pane)
+        if ui is not None and ui.name == "EffortPicker":
+            # an 80-column window wraps the slider
+            return (
+                await tmux_manager.capture_pane_expanded(
+                    window_id, before=pane, rows=0, cols=EXPANDED_COLS
+                )
+                or pane
+            )
     return pane
 
 
@@ -468,7 +480,11 @@ async def _answer_choice(
             await clear_interactive_msg(user_id, bot, thread_id)
         return "That question has changed — showing the current one"
 
-    if number > 9:
+    if view.ui_name == "EffortPicker":
+        if not await _set_effort(window_id, view, choice):
+            return "Couldn't set it — use ⌨️ Keys"
+        await asyncio.sleep(0.4)
+    elif number > 9:
         # No single key: a typed "10" would pick option 1 first. Walk the
         # cursor there instead and confirm
         if not await _walk_cursor(window_id, number, pane or ""):
@@ -505,6 +521,28 @@ async def _answer_choice(
         if not await handle_interactive_ui(bot, user_id, window_id, thread_id):
             await _finalize(bot, user_id, thread_id, view, choice)
     return f"✓ {choice.label[:40]}"
+
+
+async def _set_effort(window_id: str, view: ChoiceView, choice: Choice) -> bool:
+    """Walk the /effort slider to ``choice`` with ←/→ and apply it with ``s``
+    (this session only)."""
+    now = next((c for c in view.choices if c.description == "current"), None)
+    if now is None:
+        return False
+    key = "Right" if choice.number > now.number else "Left"
+    for _ in range(abs(choice.number - now.number)):
+        await tmux_manager.send_keys(window_id, key, enter=False, literal=False)
+        await asyncio.sleep(0.1)
+    await asyncio.sleep(0.3)
+    pane = await _capture_ui(window_id)
+    ui = extract_interactive_content(pane) if pane else None
+    after = parse_choices(ui, pane) if ui else None
+    if after is None or not any(
+        c.label == choice.label and c.description == "current" for c in after.choices
+    ):
+        return False
+    await tmux_manager.send_keys(window_id, "s", enter=False, literal=True)
+    return True
 
 
 async def _walk_cursor(window_id: str, number: int, pane: str) -> bool:
