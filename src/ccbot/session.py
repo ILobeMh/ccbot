@@ -1272,7 +1272,12 @@ class SessionManager:
         ok, reason = await tmux_manager.clear_blocking_dialog(window.window_id)
         if not ok:
             return False, reason
-        success = await tmux_manager.send_keys(window.window_id, text)
+        # "!" (bash mode) and "/" (slash commands) need the keystroke path so the
+        # TUI switches mode / opens its menu; every other prompt is pasted verbatim.
+        if text.startswith(("!", "/")):
+            success = await tmux_manager.send_keys(window.window_id, text)
+        else:
+            success = await tmux_manager.send_prompt(window.window_id, text)
         if success:
             return True, f"Sent to {display}"
         return False, "Failed to send keys"

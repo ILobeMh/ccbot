@@ -663,3 +663,41 @@ class TestLoadSessionMapCache:
         await mgr.load_session_map()
         assert parses == [1]
         assert mgr.get_window_state("@4").session_id == "sid-2"
+
+
+class TestSendToWindow:
+    """Prompts are pasted verbatim; "!" and "/" keep the keystroke path."""
+
+    @staticmethod
+    def _patched(mgr: SessionManager):
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        window = MagicMock(window_id="@1", pane_current_command="claude")
+        tm = MagicMock()
+        tm.find_window_by_id = AsyncMock(return_value=window)
+        tm.clear_blocking_dialog = AsyncMock(return_value=(True, ""))
+        tm.send_keys = AsyncMock(return_value=True)
+        tm.send_prompt = AsyncMock(return_value=True)
+        return tm, patch("ccbot.session.tmux_manager", tm)
+
+    @pytest.mark.asyncio
+    async def test_plain_prompt_is_pasted_unchanged(self, mgr: SessionManager) -> None:
+        tm, patcher = self._patched(mgr)
+        text = "  -lead \n\tindented\n\ntrail  \n"
+        with patcher:
+            ok, _ = await mgr.send_to_window("@1", text)
+        assert ok
+        tm.send_prompt.assert_awaited_once_with("@1", text)
+        tm.send_keys.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("text", ["/clear", "!ls -la"])
+    async def test_slash_and_bang_are_typed(
+        self, mgr: SessionManager, text: str
+    ) -> None:
+        tm, patcher = self._patched(mgr)
+        with patcher:
+            ok, _ = await mgr.send_to_window("@1", text)
+        assert ok
+        tm.send_keys.assert_awaited_once_with("@1", text)
+        tm.send_prompt.assert_not_awaited()

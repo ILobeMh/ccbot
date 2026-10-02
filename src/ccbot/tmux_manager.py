@@ -791,6 +791,58 @@ class TmuxManager:
 
         return await asyncio.to_thread(_sync_send_keys)
 
+    async def send_prompt(self, window_id: str, text: str) -> bool:
+        """Deliver `text` to a window verbatim (bracketed paste), then press Enter.
+
+        Typing via `send-keys` turns newlines into Enter-ish keys and tabs into
+        Tab presses; a paste hands Claude Code the exact bytes — newlines,
+        leading/trailing whitespace, tabs and a leading `-` included.
+        """
+        buffer = f"ccbot-{os.getpid()}"
+        try:
+            load = await asyncio.create_subprocess_exec(
+                "tmux",
+                "load-buffer",
+                "-b",
+                buffer,
+                "-",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(
+                load.communicate(text.encode("utf-8")), timeout=CAPTURE_TIMEOUT_SECONDS
+            )
+            if load.returncode != 0:
+                logger.error("tmux load-buffer failed for window %s", window_id)
+                return False
+            # -p: bracketed paste when the app asked for it; -r: keep LF as LF
+            # (no LF→CR, which would submit mid-text if bracketing is off);
+            # -d: drop the buffer afterwards.
+            paste = await asyncio.create_subprocess_exec(
+                "tmux",
+                "paste-buffer",
+                "-p",
+                "-r",
+                "-d",
+                "-b",
+                buffer,
+                "-t",
+                window_id,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(paste.wait(), timeout=CAPTURE_TIMEOUT_SECONDS)
+            if paste.returncode != 0:
+                logger.error("tmux paste-buffer failed for window %s", window_id)
+                return False
+        except (asyncio.TimeoutError, OSError) as e:
+            logger.error("Failed to paste into window %s: %s", window_id, e)
+            return False
+        # Let the TUI ingest the paste before Enter (bigger pastes take longer).
+        await asyncio.sleep(0.5 + len(text) / 20000)
+        return await self.send_key(window_id, "Enter")
+
     async def rename_window(self, window_id: str, new_name: str) -> bool:
         """Rename a tmux window by its ID."""
 
