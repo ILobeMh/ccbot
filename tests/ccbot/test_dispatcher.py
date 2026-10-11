@@ -15,6 +15,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.types import (
     CallbackQuery,
     Chat,
+    Contact,
     Document,
     ForumTopicCreated,
     Message,
@@ -23,6 +24,7 @@ from aiogram.types import (
     Sticker,
     Update,
     User,
+    Video,
 )
 
 from ccbot import bot as bot_mod
@@ -75,7 +77,7 @@ class TestStructure:
             bot_mod.topic_edited_handler,
             bot_mod.forward_command_handler,
             bot_mod.text_handler,
-            bot_mod.photo_handler,
+            bot_mod.attachment_handler,
             bot_mod.voice_handler,
             bot_mod.unsupported_content_handler,
         ]
@@ -161,7 +163,7 @@ def recorded(monkeypatch):
         "start_command",
         "forward_command_handler",
         "text_handler",
-        "photo_handler",
+        "attachment_handler",
         "voice_handler",
         "topic_closed_handler",
         "unsupported_content_handler",
@@ -263,7 +265,7 @@ class TestFeedUpdate:
                         PhotoSize(file_id="f", file_unique_id="u", width=1, height=1)
                     ]
                 },
-                "photo_handler",
+                "attachment_handler",
             ),
             (
                 {
@@ -271,7 +273,7 @@ class TestFeedUpdate:
                         file_id="f", file_unique_id="u", mime_type="image/png"
                     )
                 },
-                "photo_handler",
+                "attachment_handler",
             ),
             (
                 {
@@ -279,7 +281,15 @@ class TestFeedUpdate:
                         file_id="f", file_unique_id="u", mime_type="application/pdf"
                     )
                 },
-                "unsupported_content_handler",
+                "attachment_handler",
+            ),
+            (
+                {
+                    "video": Video(
+                        file_id="f", file_unique_id="u", width=1, height=1, duration=1
+                    )
+                },
+                "attachment_handler",
             ),
             (
                 {
@@ -293,6 +303,10 @@ class TestFeedUpdate:
                         is_video=False,
                     )
                 },
+                "attachment_handler",
+            ),
+            (
+                {"contact": Contact(phone_number="1", first_name="x")},
                 "unsupported_content_handler",
             ),
             ({"forum_topic_closed": {}}, "topic_closed_handler"),

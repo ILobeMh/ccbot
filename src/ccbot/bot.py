@@ -10,14 +10,15 @@ Core responsibilities:
     interactive UI navigation, screenshot refresh.
   - Topic-based routing: each named topic binds to one tmux window.
     Unbound topics trigger the directory browser to create a new session.
-  - Photo handling: photos / image files (single or album) are downloaded
-    and forwarded to Claude Code as file paths in one prompt, together with
-    the caption (photo_handler).
+  - File handling: photos and files of any kind (documents, video, audio,
+    GIFs, stickers; single or album) are downloaded and forwarded to Claude
+    Code as @-mentions in one prompt, with the caption after them
+    (attachment_handler).
   - Voice handling: voice messages are transcribed via OpenAI API and
     forwarded as text (voice_handler).
   - Automatic cleanup: closing a topic kills the associated window
-    (topic_closed_handler). Unsupported content (stickers, etc.)
-    is rejected with a warning (unsupported_content_handler).
+    (topic_closed_handler). Content that is neither text, voice nor a file
+    (contacts, locations, polls, …) is rejected (unsupported_content_handler).
   - Bot lifecycle management: on_startup, on_shutdown, build_dispatcher
     (routers in PTB's old handler order), run() (long polling).
 
@@ -36,6 +37,8 @@ Key functions: build_dispatcher(), run(), handle_new_message().
 
 import asyncio
 import logging
+import mimetypes
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -61,7 +64,9 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InputMediaDocument,
     Message,
+    Sticker,
     User,
+    VideoNote,
 )
 
 from . import __version__, settings
@@ -1114,79 +1119,104 @@ async def forward_command_handler(message: Message, bot: Bot) -> None:
 
 
 async def unsupported_content_handler(message: Message) -> None:
-    """Reply to non-text messages (stickers, video, etc.)."""
+    """Reply to user content that is neither text, voice nor a file."""
     user = message.from_user
     if not user or not is_user_allowed(user.id):
         return
     logger.debug("Unsupported content from user %d", user.id)
     await safe_reply(
         message,
-        "⚠ Only text, photo, and voice messages are supported. Stickers, video, and other media cannot be forwarded to Claude Code.",
+        "⚠ Only text, voice and files (photos, videos, stickers, documents, …) "
+        "can be forwarded to Claude Code. Contacts, locations, polls and the like cannot.",
     )
 
 
-# --- Image directory for incoming photos ---
-_IMAGES_DIR = ccbot_dir() / "images"
-_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+# --- Upload directory for incoming files ---
+_UPLOADS_DIR = ccbot_dir() / "uploads"
+_UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
 # Telegram delivers an album (media group) as N separate updates that share a
 # media_group_id, with the caption attached to only one of them.  Buffer the
 # pieces per (user, thread, group) and flush once no new piece has arrived for
-# _ALBUM_FLUSH_DELAY seconds, so Claude Code gets ONE prompt with every image.
+# _ALBUM_FLUSH_DELAY seconds, so Claude Code gets ONE prompt with every file.
 _ALBUM_FLUSH_DELAY = 1.5
 _pending_albums: dict[tuple[int, int, str], dict[str, Any]] = {}
 
-_IMAGE_DOC_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tiff"}
+# The Bot API's getFile refuses anything larger than this.
+_MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
+
+_UNSAFE_FILENAME_CHARS = re.compile(r"[^\w.-]+")
 
 
-def build_image_prompt(caption: str, paths: list[Path]) -> str:
-    """Build the prompt that hands downloaded image(s) to Claude Code.
+def build_attachment_prompt(caption: str, paths: list[Path]) -> str:
+    """Build the prompt that hands downloaded file(s) to Claude Code.
 
-    Absolute paths are listed so Claude Code can view them with its Read
-    tool; the user's caption (if any) becomes the instruction, otherwise a
-    neutral "look at these" line is used so Claude opens them proactively.
+    Each file is an ``@<absolute path>`` mention on its own line, which makes
+    Claude Code attach it.  The caption, if any, follows the mentions on the
+    next line; without one, a neutral line asks Claude to look at the file(s).
     """
-    caption = caption.strip()
-    if len(paths) == 1:
-        attachment = f"(image attached: {paths[0]})"
-    else:
-        listing = "\n".join(f"- {p}" for p in paths)
-        attachment = f"({len(paths)} images attached:\n{listing})"
-    if caption:
-        return f"{caption}\n\n{attachment}"
-    noun = "image" if len(paths) == 1 else "images"
-    return f"Please look at the attached {noun}.\n\n{attachment}"
+    mentions = "\n".join(f"@{p}" for p in paths)
+    if caption.strip():
+        return f"{mentions}\n{caption}"
+    noun = "file" if len(paths) == 1 else "files"
+    return f"{mentions}\nPlease look at the attached {noun}."
 
 
-async def _download_image(message: Message, bot: Bot) -> Path | None:
-    """Download the photo or image document in *message* into _IMAGES_DIR."""
+def _attachment_media(message: Message) -> Any | None:
+    """The file-carrying object of *message* (largest photo size), or None."""
     if message.photo:
-        photo = message.photo[-1]  # highest resolution
-        file_id = photo.file_id
-        filename = f"{int(time.time())}_{photo.file_unique_id}.jpg"
-    elif message.document:
-        doc = message.document
-        ext = Path(doc.file_name or "").suffix.lower()
-        if ext not in _IMAGE_DOC_EXTENSIONS:
-            mime = doc.mime_type or ""
-            ext = "." + mime.split("/", 1)[1] if mime.startswith("image/") else ".img"
-        file_id = doc.file_id
-        filename = f"{int(time.time())}_{doc.file_unique_id}{ext}"
-    else:
-        return None
-    file_path = _IMAGES_DIR / filename
-    await bot.download(file_id, destination=file_path)
+        return message.photo[-1]
+    for field in ("document", "video", "audio", "animation", "video_note", "sticker"):
+        media = getattr(message, field)
+        if media is not None:
+            return media
+    return None
+
+
+def _is_attachment(message: Message) -> bool:
+    """A message carrying a file the bot can download (photo, document, video, …)."""
+    return _attachment_media(message) is not None
+
+
+def _default_extension(message: Message, media: Any) -> str:
+    """Extension for a file the sender gave no name (photos, stickers, …)."""
+    if message.photo:
+        return ".jpg"
+    if isinstance(media, Sticker):
+        if media.is_animated:
+            return ".tgs"
+        return ".webm" if media.is_video else ".webp"
+    if isinstance(media, VideoNote):
+        return ".mp4"
+    return mimetypes.guess_extension(media.mime_type or "") or ""
+
+
+def _attachment_filename(message: Message, media: Any) -> str:
+    """Unique, filesystem-safe name: ``<time>_<unique id>[_<sender's name>]``."""
+    stamp = f"{int(time.time())}_{media.file_unique_id}"
+    name = None if message.photo else getattr(media, "file_name", None)
+    if name:
+        # Path(...).name drops any directory the sender put in the name
+        safe = _UNSAFE_FILENAME_CHARS.sub("_", Path(name).name)[:120]
+        return f"{stamp}_{safe}"
+    return stamp + _default_extension(message, media)
+
+
+async def _download_attachment(message: Message, bot: Bot, media: Any) -> Path:
+    """Download *media* from *message* into _UPLOADS_DIR and return its path."""
+    file_path = _UPLOADS_DIR / _attachment_filename(message, media)
+    await bot.download(media.file_id, destination=file_path)
     return file_path
 
 
-# Images that have been downloaded but not yet handed to Claude Code.  The bot
-# never forwards images straight away: Telegram caps captions at 1024 chars, so
+# Files that have been downloaded but not yet handed to Claude Code.  The bot
+# never forwards them straight away: Telegram caps captions at 1024 chars, so
 # after staging it asks the user for the prompt text (next text message in the
-# topic), or Skip (send without text) / Cancel (discard the images).
-_pending_images: dict[tuple[int, int], dict[str, Any]] = {}
+# topic), or Skip (send without text) / Cancel (discard the files).
+_pending_attachments: dict[tuple[int, int], dict[str, Any]] = {}
 
 
-def _image_prompt_keyboard() -> InlineKeyboardMarkup:
+def _attachment_prompt_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -1199,10 +1229,10 @@ def _image_prompt_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def _image_prompt_text(pending: dict[str, Any]) -> str:
+def _attachment_prompt_text(pending: dict[str, Any]) -> str:
     n = len(pending["paths"])
-    noun = "image" if n == 1 else "images"
-    lines = [f"📷 {n} {noun} ready."]
+    noun = "file" if n == 1 else "files"
+    lines = [f"📎 {n} {noun} ready."]
     if pending["caption"]:
         lines.append("Caption will be included.")
     lines.append(
@@ -1212,7 +1242,7 @@ def _image_prompt_text(pending: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-async def _stage_images(
+async def _stage_attachments(
     message: Message,
     user_id: int,
     thread_id: int,
@@ -1220,9 +1250,9 @@ async def _stage_images(
     caption: str,
     paths: list[Path],
 ) -> None:
-    """Park downloaded images and ask the user for the accompanying text."""
+    """Park downloaded files and ask the user for the accompanying text."""
     key = (user_id, thread_id)
-    pending = _pending_images.setdefault(
+    pending = _pending_attachments.setdefault(
         key, {"paths": [], "caption": "", "wid": wid, "prompt_msg": None}
     )
     pending["paths"].extend(paths)
@@ -1232,19 +1262,19 @@ async def _stage_images(
             f"{pending['caption']}\n\n{caption}" if pending["caption"] else caption
         )
 
-    text = _image_prompt_text(pending)
-    keyboard = _image_prompt_keyboard()
+    text = _attachment_prompt_text(pending)
+    keyboard = _attachment_prompt_keyboard()
     prev = pending.get("prompt_msg")
     if prev is not None:
-        # More images arrived while waiting — drop the old prompt's buttons.
+        # More files arrived while waiting — drop the old prompt's buttons.
         try:
             await prev.edit_reply_markup(reply_markup=None)
         except Exception as e:
-            logger.debug("Could not clear old image prompt keyboard: %s", e)
+            logger.debug("Could not clear old attachment prompt keyboard: %s", e)
     pending["prompt_msg"] = await safe_reply(message, text, reply_markup=keyboard)
 
 
-async def _finish_image_prompt(pending: dict[str, Any], text: str) -> None:
+async def _finish_attachment_prompt(pending: dict[str, Any], text: str) -> None:
     """Replace the staging prompt's buttons with a final status line."""
     prev = pending.get("prompt_msg")
     if prev is None:
@@ -1252,26 +1282,26 @@ async def _finish_image_prompt(pending: dict[str, Any], text: str) -> None:
     try:
         await safe_edit(prev, text)
     except Exception as e:
-        logger.debug("Could not edit image prompt: %s", e)
+        logger.debug("Could not edit attachment prompt: %s", e)
 
 
-async def _deliver_pending_images(
+async def _deliver_pending_attachments(
     reply_to: Message,
     bot: Bot,
     user_id: int,
     thread_id: int,
     extra_text: str,
 ) -> bool:
-    """Send the staged images (plus caption/extra text) to the bound window.
+    """Send the staged files (plus caption/extra text) to the bound window.
 
-    Returns True when there were staged images for this topic (whether or
+    Returns True when there were staged files for this topic (whether or
     not delivery succeeded), so the caller knows the text was consumed.
     """
-    pending = _pending_images.pop((user_id, thread_id), None)
+    pending = _pending_attachments.pop((user_id, thread_id), None)
     if pending is None:
         return False
     caption_parts = [t for t in (pending["caption"], extra_text) if t.strip()]
-    text_to_send = build_image_prompt("\n\n".join(caption_parts), pending["paths"])
+    text_to_send = build_attachment_prompt("\n\n".join(caption_parts), pending["paths"])
     try:
         await _send_typing(bot, reply_to)
     except Exception as e:
@@ -1280,18 +1310,18 @@ async def _deliver_pending_images(
 
     success, err = await session_manager.send_to_window(pending["wid"], text_to_send)
     n = len(pending["paths"])
-    noun = "image" if n == 1 else "images"
+    noun = "file" if n == 1 else "files"
     if not success:
-        await _finish_image_prompt(pending, f"❌ {err}")
+        await _finish_attachment_prompt(pending, f"❌ {err}")
         await safe_reply(reply_to, f"❌ {err}")
         return True
-    await _finish_image_prompt(pending, f"📷 {n} {noun} sent to Claude Code.")
+    await _finish_attachment_prompt(pending, f"📎 {n} {noun} sent to Claude Code.")
     return True
 
 
-def _discard_pending_images(user_id: int, thread_id: int) -> int:
-    """Drop staged images for a topic and delete their files. Returns count."""
-    pending = _pending_images.pop((user_id, thread_id), None)
+def _discard_pending_attachments(user_id: int, thread_id: int) -> int:
+    """Drop staged files for a topic and delete them. Returns count."""
+    pending = _pending_attachments.pop((user_id, thread_id), None)
     if pending is None:
         return 0
     for p in pending["paths"]:
@@ -1303,13 +1333,13 @@ def _discard_pending_images(user_id: int, thread_id: int) -> int:
 
 
 async def _flush_album(key: tuple[int, int, str]) -> None:
-    """Wait for the album to settle, then deliver all its images as one prompt."""
+    """Wait for the album to settle, then stage all its files as one prompt."""
     await asyncio.sleep(_ALBUM_FLUSH_DELAY)
     album = _pending_albums.pop(key, None)
     if not album:
         return
     user_id, thread_id, _ = key
-    await _stage_images(
+    await _stage_attachments(
         album["message"],
         user_id,
         thread_id,
@@ -1319,18 +1349,20 @@ async def _flush_album(key: tuple[int, int, str]) -> None:
     )
 
 
-async def photo_handler(message: Message, bot: Bot) -> None:
-    """Handle photos / image files: download and stage them for Claude Code.
+async def attachment_handler(message: Message, bot: Bot) -> None:
+    """Handle photos and files (documents, video, audio, GIFs, stickers, …).
 
-    Albums are buffered by media_group_id.  Nothing is forwarded yet: the
-    user is asked for the prompt text (or Skip / Cancel) — see _stage_images.
+    Each file is downloaded into _UPLOADS_DIR.  Albums are buffered by
+    media_group_id.  Nothing is forwarded yet: the user is asked for the
+    prompt text (or Skip / Cancel) — see _stage_attachments.
     """
     user = message.from_user
     if not user or not is_user_allowed(user.id):
         await safe_reply(message, "You are not authorized to use this bot.")
         return
 
-    if not (message.photo or message.document):
+    media = _attachment_media(message)
+    if media is None:
         return
 
     chat = message.chat
@@ -1365,19 +1397,26 @@ async def photo_handler(message: Message, bot: Bot) -> None:
         )
         return
 
-    try:
-        file_path = await _download_image(message, bot)
-    except Exception as e:
-        logger.error("Image download failed (user=%d): %s", user.id, e)
-        await safe_reply(message, f"❌ Failed to download image: {e}")
+    size = getattr(media, "file_size", None)
+    if isinstance(size, int) and size > _MAX_DOWNLOAD_BYTES:
+        await safe_reply(
+            message,
+            f"❌ File is too big ({size / 1024 / 1024:.1f} MB). "
+            "Bots can only download files up to 20 MB.",
+        )
         return
-    if file_path is None:
+
+    try:
+        file_path = await _download_attachment(message, bot, media)
+    except Exception as e:
+        logger.error("File download failed (user=%d): %s", user.id, e)
+        await safe_reply(message, f"❌ Failed to download file: {e}")
         return
 
     caption = message.caption or ""
     group_id = message.media_group_id
     if not group_id:
-        await _stage_images(message, user.id, thread_id, wid, caption, [file_path])
+        await _stage_attachments(message, user.id, thread_id, wid, caption, [file_path])
         return
 
     # Album piece: accumulate and (re)start the settle timer.
@@ -1460,9 +1499,9 @@ async def voice_handler(message: Message, bot: Bot) -> None:
         return
 
     # A voice note can also be the prompt text for staged images.
-    if (user.id, thread_id) in _pending_images:
+    if (user.id, thread_id) in _pending_attachments:
         await safe_reply(message, f'🎤 "{text}"')
-        await _deliver_pending_images(message, bot, user.id, thread_id, text)
+        await _deliver_pending_attachments(message, bot, user.id, thread_id, text)
         return
 
     try:
@@ -1709,8 +1748,8 @@ async def _handle_text(
         user_data.pop("_pending_thread_text", None)
 
     # Staged images waiting for their prompt text — this message is it.
-    if thread_id is not None and (user.id, thread_id) in _pending_images:
-        await _deliver_pending_images(message, bot, user.id, thread_id, text)
+    if thread_id is not None and (user.id, thread_id) in _pending_attachments:
+        await _deliver_pending_attachments(message, bot, user.id, thread_id, text)
         return
 
     # Must be in a named topic
@@ -2298,7 +2337,7 @@ async def callback_handler(
         if cb_thread_id is None or not query.message:
             await query.answer("No topic")
             return
-        if (user.id, cb_thread_id) not in _pending_images:
+        if (user.id, cb_thread_id) not in _pending_attachments:
             await query.answer("Nothing pending")
             try:
                 await _query_message(query).edit_reply_markup(reply_markup=None)
@@ -2306,7 +2345,7 @@ async def callback_handler(
                 pass
             return
         if data == CB_IMG_CANCEL:
-            n = _discard_pending_images(user.id, cb_thread_id)
+            n = _discard_pending_attachments(user.id, cb_thread_id)
             await query.answer("Cancelled")
             noun = "image" if n == 1 else "images"
             try:
@@ -2317,7 +2356,7 @@ async def callback_handler(
         await query.answer("Sending…")
         msg = query.message
         if isinstance(msg, Message):
-            await _deliver_pending_images(msg, bot, user.id, cb_thread_id, "")
+            await _deliver_pending_attachments(msg, bot, user.id, cb_thread_id, "")
         return
 
     # History: older/newer pagination
@@ -3277,24 +3316,13 @@ def _is_bot_command(message: Message) -> bool:
     )
 
 
-def _is_image(message: Message) -> bool:
-    """A photo or an image file (PTB's filters.PHOTO | filters.Document.IMAGE)."""
-    if message.photo:
-        return True
-    doc = message.document
-    return bool(doc and (doc.mime_type or "").startswith("image/"))
-
-
 # User content that isn't text (PTB's ~COMMAND & ~TEXT & ~StatusUpdate.ALL,
 # minus service messages: those never get the "unsupported" reply)
 _USER_CONTENT_TYPES = frozenset(
     {
-        ContentType.ANIMATION,
-        ContentType.AUDIO,
         ContentType.CHECKLIST,
         ContentType.CONTACT,
         ContentType.DICE,
-        ContentType.DOCUMENT,
         ContentType.GAME,
         ContentType.GIVEAWAY,
         ContentType.GIVEAWAY_WINNERS,
@@ -3302,13 +3330,9 @@ _USER_CONTENT_TYPES = frozenset(
         ContentType.LIVE_PHOTO,
         ContentType.LOCATION,
         ContentType.PAID_MEDIA,
-        ContentType.PHOTO,
         ContentType.POLL,
-        ContentType.STICKER,
         ContentType.STORY,
         ContentType.VENUE,
-        ContentType.VIDEO,
-        ContentType.VIDEO_NOTE,
         ContentType.VOICE,
     }
 )
@@ -3373,11 +3397,11 @@ def build_dispatcher() -> Dispatcher:
     # Forward any other /command to Claude Code
     router.message.register(forward_command_handler, _is_bot_command)
     router.message.register(text_handler, F.text)
-    # Photos / image files (incl. albums): download and forward path(s) to Claude Code
-    router.message.register(photo_handler, _is_image)
+    # Photos and files of any kind (incl. albums): download, then forward as @-mentions
+    router.message.register(attachment_handler, _is_attachment)
     # Voice: transcribe via OpenAI and forward text to Claude Code
     router.message.register(voice_handler, F.voice)
-    # Catch-all: non-text content (stickers, video, etc.)
+    # Catch-all: other user content (contacts, locations, polls, …)
     router.message.register(unsupported_content_handler, _is_unsupported_content)
 
     dp.include_routers(special_router, router)
